@@ -1,4 +1,4 @@
-name: Run OAuth2 Hugging Face App
+name: Run KAN Emotional Character with LLaMA 3.1 8B Instruct
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - main
 
 jobs:
-  run-app:
+  run-kan-emotional-character:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
@@ -21,10 +21,18 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
+        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+        pip install git+https://github.com/huggingface/transformers
 
-    - name: Run OAuth2 script
+    - name: Run KAN Emotional Character script
       env:
         HF_CLIENT_ID: ${{ secrets.HF_CLIENT_ID }}
         HF_CLIENT_SECRET: ${{ secrets.HF_CLIENT_SECRET }}
       run: |
-        python oauth_app.py
+        python kan_emotional_character_llama_hf.py
+
+    - name: Upload logs
+      uses: actions/upload-artifact@v2
+      with:
+        name: kan-emotional-character-logs
+        path: kan_emotional_character.log
