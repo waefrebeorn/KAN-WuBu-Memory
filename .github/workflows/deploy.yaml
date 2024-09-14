@@ -1,0 +1,30 @@
+name: Run OAuth2 Hugging Face App
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  run-app:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run OAuth2 script
+      env:
+        HF_CLIENT_ID: ${{ secrets.HF_CLIENT_ID }}
+        HF_CLIENT_SECRET: ${{ secrets.HF_CLIENT_SECRET }}
+      run: |
+        python oauth_app.py

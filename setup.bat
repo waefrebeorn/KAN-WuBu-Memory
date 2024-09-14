@@ -21,8 +21,14 @@ call venv\Scripts\activate
 :: Upgrade pip
 python -m pip install --upgrade pip
 
-:: Install requirements
+:: Install PyTorch with CUDA support
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+:: Install other requirements
 pip install -r requirements.txt
+
+:: Install Hugging Face transformers from source (for latest LLaMA support)
+pip install git+https://github.com/huggingface/transformers
 
 echo Setup completed successfully. You can now run the script using run.bat.
 pause
