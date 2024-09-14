@@ -96,7 +96,7 @@ class AdvancedMemory:
             self.importance_scores[memory] += delta
 
 class KANEmotionalCharacter:
-    def __init__(self, model_name="microsoft/phi-3", device="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, model_name="microsoft/Phi-3-medium-128k-instruct", device="cuda" if torch.cuda.is_available() else "cpu"):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
         self.device = device
