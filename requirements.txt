@@ -3,6 +3,11 @@ torchvision
 torchaudio
 transformers
 numpy
+scikit-learn
+hnswlib
 pynvml
 requests
 requests_oauthlib
+huggingface_hub
+scipy
+tqdm
