@@ -70,6 +70,8 @@ echo    - model-00003-of-00004.safetensors
 echo    - model-00004-of-00004.safetensors
 echo    - tokenizer.json
 echo    - tokenizer_config.json
+echo    - generation_config.json
+echo    - special_tokens_map.json
 echo 4. Place these files in the 'models\Meta-Llama-3.1-8B-Instruct' directory.
 echo.
 echo Press any key when you have completed this step...
@@ -79,6 +81,23 @@ pause > nul
 if not exist "models\Meta-Llama-3.1-8B-Instruct" (
     echo Creating model directory...
     mkdir "models\Meta-Llama-3.1-8B-Instruct"
+)
+
+:: Check if all required files are present
+set "required_files=config.json model-00001-of-00004.safetensors model-00002-of-00004.safetensors model-00003-of-00004.safetensors model-00004-of-00004.safetensors tokenizer.json tokenizer_config.json generation_config.json special_tokens_map.json"
+set "missing_files="
+
+for %%f in (%required_files%) do (
+    if not exist "models\Meta-Llama-3.1-8B-Instruct\%%f" (
+        set "missing_files=!missing_files! %%f"
+    )
+)
+
+if not "!missing_files!"=="" (
+    echo The following required files are missing:!missing_files!
+    echo Please download these files and place them in the 'models\Meta-Llama-3.1-8B-Instruct' directory.
+    echo Then run this script again.
+    exit /b 1
 )
 
 :: Run the main script

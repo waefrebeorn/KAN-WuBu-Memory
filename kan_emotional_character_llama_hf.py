@@ -8,6 +8,7 @@ import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
 import math
+import json 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from scipy.interpolate import BSpline
 
@@ -125,9 +126,23 @@ class AdvancedMemory:
         return [self.memories[i] for i in sorted_indices]
 
 class KANEmotionalCharacter(nn.Module):
-    def __init__(self, model_name="Meta-Llama-3.1-8B-Instruct", max_memory=None, device='cuda'):
+    def __init__(self, model_name="Meta-Llama-3.1-8B-Instruct", max_memory=None, device=None):
         super(KANEmotionalCharacter, self).__init__()
+        
+        # Check CUDA availability
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
+            if device is None or device == 'cuda':
+                device = 'cuda'
+            elif device == 'cpu':
+                logging.warning("CUDA is available but CPU was explicitly specified. Using CPU.")
+        else:
+            if device == 'cuda':
+                logging.warning("CUDA is not available. Falling back to CPU.")
+            device = 'cpu'
+        
         self.device = torch.device(device)
+        logging.info(f"Using device: {self.device}")
         
         try:
             self.model_name = model_name
@@ -145,13 +160,46 @@ class KANEmotionalCharacter(nn.Module):
                 pbar.update(1)
                 logging.info("Model config loaded")
 
+                # Load generation config
+                generation_config_path = self.model_path / "generation_config.json"
+                if generation_config_path.exists():
+                    with open(generation_config_path, "r") as f:
+                        self.generation_config = json.load(f)
+                    logging.info("Generation config loaded")
+                else:
+                    logging.warning("Generation config not found. Using default settings.")
+                    self.generation_config = {}
+
+                # Load special tokens map
+                special_tokens_map_path = self.model_path / "special_tokens_map.json"
+                if special_tokens_map_path.exists():
+                    with open(special_tokens_map_path, "r") as f:
+                        self.special_tokens_map = json.load(f)
+                    logging.info("Special tokens map loaded")
+                else:
+                    logging.warning("Special tokens map not found. Using default settings.")
+                    self.special_tokens_map = {}
+
+                # Set special tokens
+                if 'bos_token' in self.special_tokens_map:
+                    self.tokenizer.bos_token = self.special_tokens_map["bos_token"]["content"]
+                if 'eos_token' in self.special_tokens_map:
+                    self.tokenizer.eos_token = self.special_tokens_map["eos_token"]["content"]
+                if 'bos_token_id' in self.generation_config:
+                    self.tokenizer.bos_token_id = self.generation_config["bos_token_id"]
+                if 'eos_token_id' in self.generation_config:
+                    self.tokenizer.eos_token_id = self.generation_config["eos_token_id"][0]  # Using the first eos token ID
+
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
                     logging.info("Pad token not found. Setting pad_token to eos_token.")
 
                 if max_memory is None:
-                    total_memory = torch.cuda.get_device_properties(self.device).total_memory
-                    max_memory = int(total_memory * 0.9)
+                    if cuda_available:
+                        total_memory = torch.cuda.get_device_properties(self.device).total_memory
+                        max_memory = int(total_memory * 0.9)
+                    else:
+                        max_memory = 4 * 1024 * 1024 * 1024  # 4GB default for CPU
 
                 max_memory_str = f"{max_memory / (1024**3):.1f}GB"
                 logging.info(f"Using max memory: {max_memory_str}")
@@ -159,12 +207,13 @@ class KANEmotionalCharacter(nn.Module):
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_path,
                     config=config,
-                    device_map="auto",
-                    torch_dtype=torch.float16,
+                    device_map="auto" if cuda_available else None,
+                    torch_dtype=torch.float16 if cuda_available else torch.float32,
                     low_cpu_mem_usage=True,
-                    max_memory={0: max_memory_str},
-                    offload_folder="offload"
+                    max_memory={0: max_memory_str} if cuda_available else None,
+                    offload_folder="offload" if cuda_available else None
                 )
+                self.model.to(self.device)
                 pbar.update(1)
                 logging.info("Model loaded successfully")
 
@@ -307,18 +356,48 @@ class KANEmotionalCharacter(nn.Module):
     
                 modified_logits = logits + self.output_modifier(kan_output[:, -1, :])
     
-                next_token = torch.argmax(modified_logits, dim=-1)
+                # Apply temperature
+                modified_logits = modified_logits / self.generation_config["temperature"]
+    
+                # Apply top-p sampling
+                if self.generation_config["do_sample"]:
+                    filtered_logits = top_k_top_p_filtering(modified_logits, top_p=self.generation_config["top_p"])
+                    probs = F.softmax(filtered_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+                else:
+                    next_token = torch.argmax(modified_logits, dim=-1)
+    
                 input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
                 attention_mask = torch.cat([attention_mask, attention_mask.new_ones((batch_size, 1))], dim=-1)
     
-            if next_token.item() == self.tokenizer.eos_token_id:
+            if next_token.item() in self.generation_config["eos_token_id"]:
                 break
     
         self.clear_cuda_cache()
         return input_ids
-
+    
+    def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf"), min_tokens_to_keep=1):
+        top_k = min(top_k, logits.size(-1))  # Safety check
+        if top_k > 0:
+            # Remove all tokens with a probability less than the last token of the top-k
+            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits[indices_to_remove] = filter_value
+    
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+    
+            # Remove tokens with cumulative probability above the threshold
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift the indices to the right to keep also the first token above the threshold
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+    
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            logits[indices_to_remove] = filter_value
         self.clear_cuda_cache()
-        return input_ids
+        return logits
+
 
     def prepare_context(self, user_input, current_emotion):
         with tqdm(total=3, desc="Preparing context", leave=False) as pbar:
