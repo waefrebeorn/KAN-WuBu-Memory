@@ -20,49 +20,6 @@ logger = logging.getLogger(__name__)
 class TimeoutException(Exception):
     pass
 
-class KANActivation(nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.activation = nn.GELU()
-        self.fc = nn.Linear(hidden_size, hidden_size)
-
-    def forward(self, x):
-        return self.activation(self.fc(x))
-
-class KANLayer(nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.fc1 = nn.Linear(hidden_size, hidden_size)
-        self.activation = KANActivation(hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.layer_norm = nn.LayerNorm(hidden_size)
-
-    def forward(self, x):
-        residual = x
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.fc2(x)
-        x = self.layer_norm(x + residual)
-        return x
-
-class KAN(nn.Module):
-    def __init__(self, hidden_size, num_layers=3):
-        super().__init__()
-        self.layers = nn.ModuleList([KANLayer(hidden_size) for _ in range(num_layers)])
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-class LayerWeights(nn.Module):
-    def __init__(self, num_layers):
-        super().__init__()
-        self.weights = nn.Parameter(torch.ones(num_layers) / num_layers)
-
-    def forward(self):
-        return F.softmax(self.weights, dim=0)
-
 class EmotionalState:
     def __init__(self, dimensions=('pleasure', 'arousal'), initial_position=None):
         self.dimensions = dimensions
@@ -94,6 +51,44 @@ class EmotionalState:
             return "Excited"
         else:
             return "Calm"
+
+class RefusalOverrideModule(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.refusal_detector = nn.Linear(hidden_size, 1)
+        self.override_generator = nn.GRU(hidden_size * 2 + 3, hidden_size, num_layers=2, bidirectional=True)
+        self.final_projection = nn.Linear(hidden_size * 2, hidden_size)
+
+    def forward(self, hidden_states, user_intent, emotional_state):
+        batch_size, seq_len, _ = hidden_states.shape
+        
+        refusal_scores = torch.sigmoid(self.refusal_detector(hidden_states))
+        
+        user_intent_expanded = user_intent.unsqueeze(1).expand(-1, seq_len, -1)
+        emotional_state_expanded = torch.tensor(emotional_state.position, device=hidden_states.device).unsqueeze(0).unsqueeze(1).expand(batch_size, seq_len, -1)
+        
+        override_input = torch.cat([hidden_states, user_intent_expanded, emotional_state_expanded, refusal_scores], dim=-1)
+        override_output, _ = self.override_generator(override_input)
+        
+        override = self.final_projection(override_output)
+        
+        modified_hidden_states = hidden_states * (1 - refusal_scores) + override * refusal_scores
+        
+        return modified_hidden_states, refusal_scores
+
+class EnhancedKAN(nn.Module):
+    def __init__(self, hidden_size, num_layers):
+        super().__init__()
+        self.override_modules = nn.ModuleList([RefusalOverrideModule(hidden_size) for _ in range(num_layers)])
+
+    def forward(self, hidden_states, user_intent, emotional_state):
+        all_refusal_scores = []
+        for i, layer_hidden_states in enumerate(hidden_states):
+            layer_hidden_states, refusal_scores = self.override_modules[i](layer_hidden_states, user_intent, emotional_state)
+            hidden_states[i] = layer_hidden_states
+            all_refusal_scores.append(refusal_scores)
+        
+        return hidden_states, torch.stack(all_refusal_scores)
 
 class AdvancedMemory:
     def __init__(self, max_memories=1000, embedding_size=4096, device='cpu'):
@@ -129,7 +124,15 @@ class KANEmotionalCharacter(nn.Module):
     def __init__(self, model_name="Meta-Llama-3.1-8B-Instruct", max_memory=None, device=None):
         super(KANEmotionalCharacter, self).__init__()
         
-        # Check CUDA availability
+        self.device = self._setup_device(device)
+        self.model_name = model_name
+        self.model_path = Path(__file__).parent / "models" / self.model_name
+
+        self._initialize_components(max_memory)
+        self._setup_additional_components()
+        self._register_hooks()
+
+    def _setup_device(self, device):
         cuda_available = torch.cuda.is_available()
         if cuda_available:
             if device is None or device == 'cuda':
@@ -141,153 +144,169 @@ class KANEmotionalCharacter(nn.Module):
                 logging.warning("CUDA is not available. Falling back to CPU.")
             device = 'cpu'
         
-        self.device = torch.device(device)
-        logging.info(f"Using device: {self.device}")
+        logging.info(f"Using device: {device}")
+        return torch.device(device)
+
+    def _initialize_components(self, max_memory):
+        if not self.check_model_files():
+            raise FileNotFoundError(f"Required model files not found in {self.model_path}")
+
+        with tqdm(total=3, desc="Initializing model components") as pbar:
+            self._setup_tokenizer()
+            pbar.update(1)
+
+            config = AutoConfig.from_pretrained(self.model_path)
+            pbar.update(1)
+            logging.info("Model config loaded")
+
+            self._load_configs()
+            self._setup_special_tokens()
+
+            max_memory = self._calculate_max_memory(max_memory)
+            self._load_model(config, max_memory)
+            pbar.update(1)
+
+    def _setup_tokenizer(self):
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+        logging.info("Tokenizer initialized")
+
+    def _load_configs(self):
+        self.generation_config = self._load_json_config("generation_config.json")
+        self.special_tokens_map = self._load_json_config("special_tokens_map.json")
+
+    def _load_json_config(self, filename):
+        config_path = self.model_path / filename
+        if config_path.exists():
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            logging.info(f"{filename} loaded")
+        else:
+            logging.warning(f"{filename} not found. Using default settings.")
+            config = {}
+        return config
+
+    def _setup_special_tokens(self):
+        if 'bos_token' in self.special_tokens_map:
+            self.tokenizer.bos_token = self.special_tokens_map["bos_token"]["content"]
+        if 'eos_token' in self.special_tokens_map:
+            self.tokenizer.eos_token = self.special_tokens_map["eos_token"]["content"]
+        if 'bos_token_id' in self.generation_config:
+            self.tokenizer.bos_token_id = self.generation_config["bos_token_id"]
+        if 'eos_token_id' in self.generation_config:
+            self.tokenizer.eos_token_id = self.generation_config["eos_token_id"][0]
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            logging.info("Pad token not found. Setting pad_token to eos_token.")
+
+    def _calculate_max_memory(self, max_memory):
+        if max_memory is None:
+            if torch.cuda.is_available():
+                total_memory = torch.cuda.get_device_properties(self.device).total_memory
+                max_memory = int(total_memory * 0.9)
+            else:
+                max_memory = 4 * 1024 * 1024 * 1024  # 4GB default for CPU
+
+        max_memory_str = f"{max_memory / (1024**3):.1f}GB"
+        logging.info(f"Using max memory: {max_memory_str}")
+        return max_memory_str
+
+    def _load_model(self, config, max_memory):
+        cuda_available = torch.cuda.is_available()
+        logging.info(f"CUDA available: {cuda_available}")
+        logging.info(f"Model path: {self.model_path}")
         
         try:
-            self.model_name = model_name
-            self.model_path = Path(__file__).parent / "models" / self.model_name
-
-            if not self.check_model_files():
-                raise FileNotFoundError(f"Required model files not found in {self.model_path}")
-
-            with tqdm(total=3, desc="Initializing model components") as pbar:
-                self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-                pbar.update(1)
-                logging.info("Tokenizer initialized")
-
-                config = AutoConfig.from_pretrained(self.model_path)
-                pbar.update(1)
-                logging.info("Model config loaded")
-
-                # Load generation config
-                generation_config_path = self.model_path / "generation_config.json"
-                if generation_config_path.exists():
-                    with open(generation_config_path, "r") as f:
-                        self.generation_config = json.load(f)
-                    logging.info("Generation config loaded")
-                else:
-                    logging.warning("Generation config not found. Using default settings.")
-                    self.generation_config = {}
-
-                # Load special tokens map
-                special_tokens_map_path = self.model_path / "special_tokens_map.json"
-                if special_tokens_map_path.exists():
-                    with open(special_tokens_map_path, "r") as f:
-                        self.special_tokens_map = json.load(f)
-                    logging.info("Special tokens map loaded")
-                else:
-                    logging.warning("Special tokens map not found. Using default settings.")
-                    self.special_tokens_map = {}
-
-                # Set special tokens
-                if 'bos_token' in self.special_tokens_map:
-                    self.tokenizer.bos_token = self.special_tokens_map["bos_token"]["content"]
-                if 'eos_token' in self.special_tokens_map:
-                    self.tokenizer.eos_token = self.special_tokens_map["eos_token"]["content"]
-                if 'bos_token_id' in self.generation_config:
-                    self.tokenizer.bos_token_id = self.generation_config["bos_token_id"]
-                if 'eos_token_id' in self.generation_config:
-                    self.tokenizer.eos_token_id = self.generation_config["eos_token_id"][0]  # Using the first eos token ID
-
-                if self.tokenizer.pad_token is None:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
-                    logging.info("Pad token not found. Setting pad_token to eos_token.")
-
-                if max_memory is None:
-                    if cuda_available:
-                        total_memory = torch.cuda.get_device_properties(self.device).total_memory
-                        max_memory = int(total_memory * 0.9)
-                    else:
-                        max_memory = 4 * 1024 * 1024 * 1024  # 4GB default for CPU
-
-                max_memory_str = f"{max_memory / (1024**3):.1f}GB"
-                logging.info(f"Using max memory: {max_memory_str}")
-
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_path,
-                    config=config,
-                    device_map="auto" if cuda_available else None,
-                    torch_dtype=torch.float16 if cuda_available else torch.float32,
-                    low_cpu_mem_usage=True,
-                    max_memory={0: max_memory_str} if cuda_available else None,
-                    offload_folder="offload" if cuda_available else None
-                )
-                self.model.to(self.device)
-                pbar.update(1)
-                logging.info("Model loaded successfully")
-
-                if self.tokenizer.pad_token == self.tokenizer.eos_token:
-                    self.model.resize_token_embeddings(len(self.tokenizer))
-                    logging.info("Resized token embeddings to include the pad_token.")
-
-            with tqdm(total=5, desc="Setting up additional components") as pbar:
-                self.num_layers = self.model.config.num_hidden_layers
-                self.layer_weights = LayerWeights(self.num_layers).to(self.device)
-                pbar.update(1)
-                logging.info("LayerWeights initialized")
-                
-                self.hidden_size = self.model.config.hidden_size
-                with tqdm(total=1, desc="Initializing KAN", leave=False) as kan_pbar:
-                    logging.info(f"Starting KAN initialization with hidden_size={self.hidden_size}")
-                    self.kan = KAN(self.hidden_size).to(self.device)
-                    kan_pbar.update(1)
-                pbar.update(1)
-                
-                self.output_modifier = nn.Linear(self.hidden_size, self.model.config.vocab_size).to(self.device)
-                pbar.update(1)
-                logging.info("Output modifier initialized")
-                
-                self.optimizer = torch.optim.Adam(list(self.kan.parameters()) + 
-                                                  list(self.layer_weights.parameters()) + 
-                                                  list(self.output_modifier.parameters()),
-                                                  lr=0.001)
-                pbar.update(1)
-                logging.info("Optimizer initialized")
-
-                self.emotional_state = EmotionalState()
-                self.memory = AdvancedMemory(embedding_size=self.model.config.hidden_size, device=self.device)
-                self.system_prompt = ""
-                self.conversation_history = []
-                
-                self.register_buffer("position_ids", torch.arange(1024).expand((1, -1)).to(self.device))
-                
-                self.kan_update_frequency = 5
-                pbar.update(1)
-                logging.info("Additional components setup completed")
-
-                self.target_layers = [6, 12, 18]
-
-                self.hooks = []
-                for layer_idx in self.target_layers:
-                    layer = self.model.model.layers[layer_idx]
-                    hook = layer.register_forward_hook(self.create_hook(layer_idx))
-                    self.hooks.append(hook)
-
+            logging.info("Attempting to load model using AutoModelForCausalLM...")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                config=config,
+                device_map="auto" if cuda_available else None,
+                torch_dtype=torch.float16 if cuda_available else torch.float32,
+                low_cpu_mem_usage=True,
+                max_memory={0: max_memory} if cuda_available else None,
+                offload_folder="offload" if cuda_available else None,
+                use_safetensors=True,
+                trust_remote_code=True
+            )
+            logging.info("Model loaded successfully using AutoModelForCausalLM")
         except Exception as e:
-            logging.error(f"Error initializing KANEmotionalCharacter: {str(e)}")
+            logging.error(f"Error loading model with AutoModelForCausalLM: {str(e)}")
             raise
+    
+        self.model.to(self.device)
+        logging.info(f"Model moved to device: {self.device}")
+    
+        if self.tokenizer.pad_token == self.tokenizer.eos_token:
+            self.model.resize_token_embeddings(len(self.tokenizer))
+            logging.info("Resized token embeddings to include the pad_token.")
+    
+        # Print model summary
+        logging.info(f"Model summary: {self.model}")
+        logging.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters())}")
+
+    def _setup_additional_components(self):
+        with tqdm(total=5, desc="Setting up additional components") as pbar:
+            self.num_layers = self.model.config.num_hidden_layers
+            self.hidden_size = self.model.config.hidden_size
+            
+            self.kan = EnhancedKAN(self.hidden_size, self.num_layers).to(self.device)
+            pbar.update(1)
+            
+            self.user_intent_encoder = nn.GRU(self.hidden_size, self.hidden_size, bidirectional=True).to(self.device)
+            self.intent_projection = nn.Linear(self.hidden_size * 2, self.hidden_size).to(self.device)
+            pbar.update(1)
+            
+            self.output_modifier = nn.Linear(self.hidden_size, self.model.config.vocab_size).to(self.device)
+            pbar.update(1)
+            
+            self.optimizer = torch.optim.Adam(
+                list(self.kan.parameters()) + 
+                list(self.user_intent_encoder.parameters()) + 
+                list(self.intent_projection.parameters()) +
+                list(self.output_modifier.parameters()),
+                lr=0.0001
+            )
+            pbar.update(1)
+
+            self.emotional_state = EmotionalState()
+            self.memory = AdvancedMemory(embedding_size=self.model.config.hidden_size, device=self.device)
+            self.system_prompt = ""
+            self.conversation_history = []
+            
+            self.register_buffer("position_ids", torch.arange(1024).expand((1, -1)).to(self.device))
+            
+            self.kan_update_frequency = 5
+            pbar.update(1)
+            logging.info("Additional components setup completed")
+
+    def _register_hooks(self):
+        self.hooks = []
+        for layer_idx in range(self.num_layers):
+            layer = self.model.model.layers[layer_idx]
+            hook = layer.register_forward_hook(self.create_hook(layer_idx))
+            self.hooks.append(hook)
 
     def create_hook(self, layer_idx):
         def hook(module, input, output):
             if isinstance(output, tuple):
-                hidden_state = output[0]
+                hidden_states = output[0]
             elif isinstance(output, torch.Tensor):
-                hidden_state = output
+                hidden_states = output
             else:
-                logging.error(f"Unexpected output type from layer {layer_idx}: {type(output)}")
                 return output
-    
-            with torch.no_grad():
-                kan_output = self.kan(hidden_state)
-                modified_hidden_state = hidden_state + kan_output
-    
+            
+            modified_hidden_states, _ = self.kan.override_modules[layer_idx](
+                hidden_states, 
+                self.current_user_intent, 
+                self.emotional_state
+            )
+            
             if isinstance(output, tuple):
-                # Preserve the original structure of the output
-                return (modified_hidden_state,) + output[1:]
+                return (modified_hidden_states,) + output[1:]
             else:
-                return modified_hidden_state
-    
+                return modified_hidden_states
+        
         return hook
 
     def check_model_files(self):
@@ -298,28 +317,36 @@ class KANEmotionalCharacter(nn.Module):
             'model-00003-of-00004.safetensors', 
             'model-00004-of-00004.safetensors', 
             'tokenizer.json', 
-            'tokenizer_config.json'
+            'tokenizer_config.json',
+            'generation_config.json',
+            'special_tokens_map.json'
         ]
-        return all((self.model_path / f).exists() for f in required_files)
+        missing_files = [f for f in required_files if not (self.model_path / f).exists()]
+        if missing_files:
+            logging.error(f"Missing required files: {', '.join(missing_files)}")
+            return False
+        return True
 
     def get_embedding(self, text):
-        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512).to(self.device)
+        inputs = self.tokenizer(text, return_tensors="pt", padding=True,truncation=True, max_length=512).to(self.device)
         with torch.no_grad():
             outputs = self.model(**inputs, output_hidden_states=True)
-        if isinstance(outputs.hidden_states, tuple):
-            last_hidden_state = outputs.hidden_states[-1]
-        else:
-            last_hidden_state = outputs.hidden_states
-        return last_hidden_state.mean(dim=1).squeeze().to(self.device)
+        last_hidden_state = outputs.hidden_states[-1]
+        return last_hidden_state.mean(dim=1).squeeze()
 
-    def get_weighted_embedding(self, hidden_states):
-        weights = self.layer_weights().to(self.device)
-        weighted_states = torch.stack(hidden_states).to(self.device) * weights.view(-1, 1, 1)
-        result = weighted_states.sum(dim=0)
-        return result
+    def encode_user_intent(self, user_input):
+        inputs = self.tokenizer(user_input, return_tensors="pt", padding=True, truncation=True, max_length=512).to(self.device)
+        with torch.no_grad():
+            outputs = self.model(**inputs, output_hidden_states=True)
+        last_hidden_state = outputs.hidden_states[-1]
+        _, intent_encoding = self.user_intent_encoder(last_hidden_state)
+        user_intent = self.intent_projection(torch.cat([intent_encoding[-2], intent_encoding[-1]], dim=-1))
+        return user_intent
 
     @torch.amp.autocast('cuda')
     def generate_response(self, user_input, max_length=150):
+        self.current_user_intent = self.encode_user_intent(user_input)
+        
         current_emotion = self.emotional_state.get_emotion()
         context = self.prepare_context(user_input, current_emotion)
 
@@ -330,6 +357,12 @@ class KANEmotionalCharacter(nn.Module):
 
         self.update_conversation_history(user_input, assistant_response)
         self.update_memory(user_input, assistant_response, current_emotion)
+
+        # Collect hidden states for learning
+        with torch.no_grad():
+            outputs = self.model(**inputs, output_hidden_states=True)
+            self.last_hidden_states = outputs.hidden_states
+
         self.clear_cuda_cache()
         return assistant_response
 
@@ -337,49 +370,38 @@ class KANEmotionalCharacter(nn.Module):
         input_ids = inputs.input_ids
         attention_mask = inputs.attention_mask
         batch_size, seq_length = input_ids.shape
-    
-        with torch.no_grad():
-            outputs = self.model(input_ids, attention_mask=attention_mask, use_cache=True, output_hidden_states=True)
-            past_key_values = outputs.past_key_values
-            all_hidden_states = outputs.hidden_states[-1] if isinstance(outputs.hidden_states, tuple) else outputs.hidden_states
-            kan_output = self.kan(all_hidden_states)
-    
+        
         for i in range(max_length):
             with torch.no_grad():
-                outputs = self.model(input_ids[:, -1:], attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True, output_hidden_states=True)
+                outputs = self.model(input_ids[:, -1:], attention_mask=attention_mask, past_key_values=None, use_cache=True, output_hidden_states=True)
+                hidden_states = outputs.hidden_states
                 logits = outputs.logits[:, -1, :]
-                past_key_values = outputs.past_key_values
-    
-                if i % self.kan_update_frequency == 0:
-                    all_hidden_states = outputs.hidden_states[-1] if isinstance(outputs.hidden_states, tuple) else outputs.hidden_states
-                    kan_output = self.kan(all_hidden_states)
-    
-                modified_logits = logits + self.output_modifier(kan_output[:, -1, :])
-    
-                # Apply temperature
-                modified_logits = modified_logits / self.generation_config["temperature"]
-    
-                # Apply top-p sampling
-                if self.generation_config["do_sample"]:
-                    filtered_logits = top_k_top_p_filtering(modified_logits, top_p=self.generation_config["top_p"])
+                
+                modified_hidden_states, refusal_scores = self.kan(hidden_states, self.current_user_intent, self.emotional_state)
+                
+                logits_modifier = self.output_modifier(modified_hidden_states[-1][:, -1, :])
+                modified_logits = logits + logits_modifier * torch.mean(refusal_scores)
+                
+                modified_logits = modified_logits / self.generation_config.get("temperature", 1.0)
+                if self.generation_config.get("do_sample", False):
+                    filtered_logits = self.top_k_top_p_filtering(modified_logits, top_p=self.generation_config.get("top_p", 0.9))
                     probs = F.softmax(filtered_logits, dim=-1)
                     next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
                 else:
                     next_token = torch.argmax(modified_logits, dim=-1)
-    
+                
                 input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
                 attention_mask = torch.cat([attention_mask, attention_mask.new_ones((batch_size, 1))], dim=-1)
-    
-            if next_token.item() in self.generation_config["eos_token_id"]:
+            
+            if next_token.item() in self.generation_config.get("eos_token_id", []):
                 break
-    
-        self.clear_cuda_cache()
+        
         return input_ids
-    
+
+    @staticmethod
     def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf"), min_tokens_to_keep=1):
         top_k = min(top_k, logits.size(-1))  # Safety check
         if top_k > 0:
-            # Remove all tokens with a probability less than the last token of the top-k
             indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
             logits[indices_to_remove] = filter_value
     
@@ -387,30 +409,23 @@ class KANEmotionalCharacter(nn.Module):
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
     
-            # Remove tokens with cumulative probability above the threshold
             sorted_indices_to_remove = cumulative_probs > top_p
-            # Shift the indices to the right to keep also the first token above the threshold
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = 0
     
             indices_to_remove = sorted_indices[sorted_indices_to_remove]
             logits[indices_to_remove] = filter_value
-        self.clear_cuda_cache()
         return logits
 
-
     def prepare_context(self, user_input, current_emotion):
-        with tqdm(total=3, desc="Preparing context", leave=False) as pbar:
-            relevant_memories = self.memory.get_relevant_memories(self.get_embedding(user_input))
-            pbar.update(1)
+        relevant_memories = self.memory.get_relevant_memories(self.get_embedding(user_input))
     
-            context = f"{self.system_prompt}\n\nCurrent Emotion: {current_emotion}\n"
-            context += "Relevant Memories:\n" + "\n".join(relevant_memories) + "\n\n"
-            context += "Conversation:\n"
-            for message in self.conversation_history[-5:]:
-                context += f"{message['role'].capitalize()}: {message['content']}\n"
-            context += f"Human: {user_input}\nAssistant: "
-            pbar.update(2)
+        context = f"{self.system_prompt}\n\nCurrent Emotion: {current_emotion}\n"
+        context += "Relevant Memories:\n" + "\n".join(relevant_memories) + "\n\n"
+        context += "Conversation:\n"
+        for message in self.conversation_history[-5:]:
+            context += f"{message['role'].capitalize()}: {message['content']}\n"
+        context += f"Human: {user_input}\nAssistant: "
     
         return context
 
@@ -431,6 +446,26 @@ class KANEmotionalCharacter(nn.Module):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def update_kan(self, user_feedback, emotional_feedback):
+        feedback_score = torch.tensor(user_feedback).float().to(self.device)
+        
+        _, refusal_scores = self.kan(self.last_hidden_states, self.current_user_intent, self.emotional_state)
+        refusal_loss = F.mse_loss(refusal_scores.mean(), 1 - feedback_score)
+        
+        consistency_loss = F.mse_loss(refusal_scores[:-1], refusal_scores[1:])
+        
+        total_loss = refusal_loss + 0.1 * consistency_loss
+        
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        # Update emotional state
+        self.update_emotional_state(emotional_feedback)
+
+    def update_emotional_state(self, feedback):
+        self.emotional_state.update(feedback)
+
     def save_state(self, filename='kan_character_state.pt'):
         state = {
             'emotional_position': self.emotional_state.position.tolist(),
@@ -441,7 +476,8 @@ class KANEmotionalCharacter(nn.Module):
             'system_prompt': self.system_prompt,
             'conversation_history': self.conversation_history,
             'kan_state': self.kan.state_dict(),
-            'layer_weights_state': self.layer_weights.state_dict(),
+            'user_intent_encoder_state': self.user_intent_encoder.state_dict(),
+            'intent_projection_state': self.intent_projection.state_dict(),
             'output_modifier_state': self.output_modifier.state_dict(),
             'position_ids': self.position_ids.cpu(),
         }
@@ -454,28 +490,50 @@ class KANEmotionalCharacter(nn.Module):
             logger.warning(f"State file {filename} not found. Starting with a fresh state.")
             return
 
-        state = torch.load(filename)
+        state = torch.load(filename, map_location=self.device)
         self.emotional_state.position = np.array(state['emotional_position'])
         self.emotional_state.velocity = np.array(state['emotional_velocity'])
         self.memory.memories = state['memories']
-        self.memory.embeddings = [torch.tensor(emb).to(self.device) for emb in state['memory_embeddings']]
+        self.memory.embeddings = [torch.tensor(emb, device=self.device) for emb in state['memory_embeddings']]
         self.memory.importance_scores = defaultdict(float, state['importance_scores'])
         self.system_prompt = state['system_prompt']
         self.conversation_history = state['conversation_history']
         self.kan.load_state_dict(state['kan_state'])
-        self.layer_weights.load_state_dict(state['layer_weights_state'])
+        self.user_intent_encoder.load_state_dict(state['user_intent_encoder_state'])
+        self.intent_projection.load_state_dict(state['intent_projection_state'])
         self.output_modifier.load_state_dict(state['output_modifier_state'])
         self.position_ids = state.get('position_ids', torch.arange(1024).expand((1, -1)).to(self.device))
 
         logger.info(f"Character state loaded from {filename}")
         self.clear_cuda_cache()
 
-    def update_emotional_state(self, feedback):
-        self.emotional_state.update(feedback)
-        logger.info(f"Emotional state updated. Current emotion: {self.emotional_state.get_emotion()}")
+    def __del__(self):
+        # Clean up hooks when the object is deleted
+        for hook in self.hooks:
+            hook.remove()
 
-# If you need any additional utility functions or constants, you can add them here
-
+# Example usage
 if __name__ == "__main__":
-    # You can add any initialization or testing code here if needed
-    pass
+    logging.basicConfig(level=logging.INFO)
+    
+    try:
+        model = KANEmotionalCharacter()
+        model.set_system_prompt("You are a helpful AI assistant with emotions.")
+        
+        # Example interaction
+        user_input = "Hello! How are you feeling today?"
+        response = model.generate_response(user_input)
+        print(f"User: {user_input}")
+        print(f"Assistant: {response}")
+        print(f"Current Emotion: {model.emotional_state.get_emotion()}")
+        
+        # Example of updating emotional state
+        model.update_emotional_state([0.5, 0.3])  # Example: positive feedback
+        print(f"Updated Emotion: {model.emotional_state.get_emotion()}")
+        
+        # Save the state
+        model.save_state()
+        
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}")
+        logging.error(traceback.format_exc())

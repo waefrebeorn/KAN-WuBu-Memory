@@ -4,7 +4,7 @@ import threading
 import logging
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from kan_emotional_character_llama_hf import KANEmotionalCharacter, TimeoutException  # Removed get_user_feedback
+from kan_emotional_character_llama_hf import KANEmotionalCharacter, TimeoutException
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -37,6 +37,9 @@ class KANGUI:
         self.display_message("Initializing KAN Emotional Character (LLaMA 3.1 8B Instruct)... Please wait.")
         self.initialize_character()
 
+        # Add emotional control buttons
+        self.add_emotion_buttons()
+
     def initialize_character(self):
         def init():
             try:
@@ -67,6 +70,31 @@ class KANGUI:
                 logging.error(traceback.format_exc())
 
         threading.Thread(target=init, daemon=True).start()
+
+    def add_emotion_buttons(self):
+        emotion_frame = tk.Frame(self.master)
+        emotion_frame.grid(row=3, column=0, columnspan=2, padx=10, pady=5)
+
+        emotions = ["Happy", "Sad", "Angry", "Excited", "Calm", "Neutral"]
+        for emotion in emotions:
+            btn = tk.Button(emotion_frame, text=emotion, command=lambda e=emotion: self.set_emotion(e))
+            btn.pack(side=tk.LEFT, padx=5)
+
+    def set_emotion(self, emotion):
+        if self.character:
+            emotion_map = {
+                "Happy": [0.5, 0.3],
+                "Sad": [-0.5, -0.3],
+                "Angry": [-0.3, 0.5],
+                "Excited": [0.3, 0.5],
+                "Calm": [0.3, -0.3],
+                "Neutral": [0, 0]
+            }
+            self.character.update_emotional_state(emotion_map[emotion])
+            self.display_message(f"Emotion set to: {emotion}")
+            self.update_status("Ready")
+        else:
+            self.display_message("Character not initialized. Please wait.")
 
     def send_message(self, event=None):
         user_input = self.input_field.get()
@@ -113,66 +141,47 @@ class KANGUI:
             self.master.after(0, self.update_status, "Ready")
 
     def get_user_feedback(self):
-        try:
-            feedback = self.create_feedback_window()
-            if feedback:
-                self.character.update_emotional_state(feedback)
-                self.display_message(f"Emotional feedback applied: {self.map_feedback_to_label(feedback)}")
-        except Exception as e:
-            error_message = f"Error applying feedback: {str(e)}\n{traceback.format_exc()}"
-            self.display_message(error_message)
-            logging.error(error_message)
-
-    def create_feedback_window(self):
-        feedback_result = []
-
-        def submit_feedback():
-            feedback = feedback_var.get()
-            feedback_map = {
-                "Happy": [0.5, 0.3],
-                "Sad": [-0.5, -0.3],
-                "Angry": [-0.3, 0.5],
-                "Excited": [0.3, 0.5],
-                "Calm": [0.3, -0.3],
-                "Neutral": [0, 0]
-            }
-            feedback_result.append(feedback_map.get(feedback, [0, 0]))
-            feedback_window.destroy()
-
         feedback_window = tk.Toplevel(self.master)
-        feedback_window.title("Provide Emotional Feedback")
+        feedback_window.title("Provide Feedback")
+
+        tk.Label(feedback_window, text="How well did the response match your intent?").pack(pady=10)
+        intent_scale = tk.Scale(feedback_window, from_=0, to=1, resolution=0.1, orient=tk.HORIZONTAL)
+        intent_scale.pack()
 
         tk.Label(feedback_window, text="How did the response make you feel?").pack(pady=10)
+        emotion_var = tk.StringVar(value="Neutral")
+        emotions = ["Happy", "Sad", "Angry", "Excited", "Calm", "Neutral"]
+        for emotion in emotions:
+            tk.Radiobutton(feedback_window, text=emotion, variable=emotion_var, value=emotion).pack(anchor='w')
 
-        feedback_options = ["Happy", "Sad", "Angry", "Excited", "Calm", "Neutral"]
-        feedback_var = tk.StringVar(value="Neutral")
+        def submit_feedback():
+            intent_feedback = intent_scale.get()
+            emotion_feedback = self.map_emotion_to_vector(emotion_var.get())
+            self.character.update_kan(intent_feedback, emotion_feedback)
+            self.display_message(f"Feedback applied. Intent: {intent_feedback}, Emotion: {emotion_var.get()}")
+            feedback_window.destroy()
 
-        for option in feedback_options:
-            tk.Radiobutton(feedback_window, text=option, variable=feedback_var, value=option).pack(anchor='w')
+        tk.Button(feedback_window, text="Submit Feedback", command=submit_feedback).pack(pady=10)
 
-        tk.Button(feedback_window, text="Submit", command=submit_feedback).pack(pady=10)
-
-        self.master.wait_window(feedback_window)
-
-        return feedback_result[0] if feedback_result else [0, 0]
-
-    def map_feedback_to_label(self, feedback):
-        reverse_map = {
-            (0.5, 0.3): "Happy",
-            (-0.5, -0.3): "Sad",
-            (-0.3, 0.5): "Angry",
-            (0.3, 0.5): "Excited",
-            (0.3, -0.3): "Calm",
-            (0, 0): "Neutral"
+    def map_emotion_to_vector(self, emotion):
+        emotion_map = {
+            "Happy": [0.5, 0.3],
+            "Sad": [-0.5, -0.3],
+            "Angry": [-0.3, 0.5],
+            "Excited": [0.3, 0.5],
+            "Calm": [0.3, -0.3],
+            "Neutral": [0, 0]
         }
-        return reverse_map.get(tuple(feedback), "Unknown")
+        return emotion_map.get(emotion, [0, 0])
 
     def update_status(self, status):
-        # Removed GPU usage reference
-        emotion = self.character.emotional_state.get_emotion() if self.character else "Initializing"
-        emotion_icon = self.get_emotion_icon(emotion)
-        color = self.get_emotion_color(emotion)
-        self.status_label.config(text=f"Status: {status} {emotion_icon}", fg=color)
+        if self.character:
+            emotion = self.character.emotional_state.get_emotion()
+            emotion_icon = self.get_emotion_icon(emotion)
+            color = self.get_emotion_color(emotion)
+            self.status_label.config(text=f"Status: {status} {emotion_icon}", fg=color)
+        else:
+            self.status_label.config(text=f"Status: {status}")
 
     def get_emotion_icon(self, emotion):
         icons = {
@@ -203,7 +212,6 @@ class KANGUI:
         self.chat_display.see(tk.END)
         logging.info(message)
 
-        # Update GPU usage in status if applicable
         if self.character:
             current_status = self.status_label.cget("text")
             if current_status.startswith("Ready"):
