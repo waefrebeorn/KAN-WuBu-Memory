@@ -222,14 +222,13 @@ class KANEmotionalCharacter(nn.Module):
         if pytorch_bin_path.exists():
             logging.info("Found existing PyTorch bin file. Loading model...")
             try:
+                # Load the model entirely into GPU memory
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_path,
                     config=config,
-                    device_map="auto",
                     torch_dtype=torch.float16,
+                    device_map="cuda:0",  # Force loading on a single GPU
                     low_cpu_mem_usage=True,
-                    max_memory={0: max_memory},
-                    offload_folder="offload"
                 )
                 logging.info("Model loaded successfully from PyTorch bin file")
             except Exception as e:
@@ -238,16 +237,14 @@ class KANEmotionalCharacter(nn.Module):
         else:
             logging.info("PyTorch bin file not found. Attempting to load from safetensors...")
             try:
+                # Load the model entirely into GPU memory
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_path,
                     config=config,
-                    device_map="auto",
                     torch_dtype=torch.float16,
+                    device_map="cuda:0",  # Force loading on a single GPU
                     low_cpu_mem_usage=True,
-                    max_memory={0: max_memory},
-                    offload_folder="offload",
                     use_safetensors=True,
-                    trust_remote_code=True
                 )
                 logging.info("Model loaded successfully using safetensors")
             except Exception as e:
@@ -257,12 +254,12 @@ class KANEmotionalCharacter(nn.Module):
                     state_dict = self.merge_safetensors()
                     self.model = AutoModelForCausalLM.from_config(config)
                     self.model.load_state_dict(state_dict, strict=False)
+                    self.model.to("cuda:0")  # Move the entire model to GPU
                     logging.info("Model loaded successfully by merging safetensors")
                 except Exception as e:
                     logging.error(f"Error merging safetensors: {str(e)}")
                     raise
     
-        self.model.to(self.device)
         logging.info(f"Model moved to device: {self.device}")
     
         if self.tokenizer.pad_token == self.tokenizer.eos_token:
@@ -271,7 +268,16 @@ class KANEmotionalCharacter(nn.Module):
     
         logging.info(f"Model summary: {self.model}")
         logging.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters())}")
-
+    
+        # Verify that all parameters are on GPU
+        for name, param in self.model.named_parameters():
+            if param.device.type != 'cuda':
+                logging.warning(f"Parameter {name} is not on CUDA device")
+    
+        # Check if any part of the model is on CPU or meta device
+        if any(p.device.type != 'cuda' for p in self.model.parameters()):
+            logging.warning("Some parts of the model are not on the GPU. This may impact performance.")
+        
     def merge_safetensors(self):
         logging.info("Merging safetensors files...")
         merged_state_dict = {}
