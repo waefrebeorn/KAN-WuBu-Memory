@@ -92,7 +92,7 @@ class EnhancedKAN(nn.Module):
         return hidden_states, torch.stack(all_refusal_scores)
 
 class AdvancedMemory:
-    def __init__(self, max_memories=1000, embedding_size=4096, device='cpu'):
+    def __init__(self, max_memories=1000, embedding_size=4096, device='cuda'):
         self.memories = []
         self.max_memories = max_memories
         self.importance_scores = defaultdict(float)
@@ -217,33 +217,50 @@ class KANEmotionalCharacter(nn.Module):
         logging.info(f"CUDA available: {cuda_available}")
         logging.info(f"Model path: {self.model_path}")
         
-        try:
-            logging.info("Attempting to load model using AutoModelForCausalLM...")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                config=config,
-                device_map="auto" if cuda_available else None,
-                torch_dtype=torch.float16 if cuda_available else torch.float32,
-                low_cpu_mem_usage=True,
-                max_memory={0: max_memory} if cuda_available else None,
-                offload_folder="offload" if cuda_available else None,
-                use_safetensors=True,
-                trust_remote_code=True
-            )
-            logging.info("Model loaded successfully using AutoModelForCausalLM")
-        except Exception as e:
-            logging.error(f"Error loading model with AutoModelForCausalLM: {str(e)}")
-            logging.info("Attempting to load model manually using safetensors...")
-            
+        pytorch_bin_path = self.model_path / "pytorch_model.bin"
+        
+        if pytorch_bin_path.exists():
+            logging.info("Found existing PyTorch bin file. Loading model...")
             try:
-                # Manually load the model using safetensors
-                state_dict = self.merge_safetensors()
-                self.model = AutoModelForCausalLM.from_config(config)
-                self.model.load_state_dict(state_dict, strict=False)
-                logging.info("Model loaded successfully using manual safetensors loading")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_path,
+                    config=config,
+                    device_map="auto",
+                    torch_dtype=torch.float16,
+                    low_cpu_mem_usage=True,
+                    max_memory={0: max_memory},
+                    offload_folder="offload"
+                )
+                logging.info("Model loaded successfully from PyTorch bin file")
             except Exception as e:
-                logging.error(f"Error loading model manually: {str(e)}")
+                logging.error(f"Error loading model from PyTorch bin: {str(e)}")
                 raise
+        else:
+            logging.info("PyTorch bin file not found. Attempting to load from safetensors...")
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_path,
+                    config=config,
+                    device_map="auto",
+                    torch_dtype=torch.float16,
+                    low_cpu_mem_usage=True,
+                    max_memory={0: max_memory},
+                    offload_folder="offload",
+                    use_safetensors=True,
+                    trust_remote_code=True
+                )
+                logging.info("Model loaded successfully using safetensors")
+            except Exception as e:
+                logging.error(f"Error loading model with safetensors: {str(e)}")
+                logging.info("Attempting to merge safetensors files...")
+                try:
+                    state_dict = self.merge_safetensors()
+                    self.model = AutoModelForCausalLM.from_config(config)
+                    self.model.load_state_dict(state_dict, strict=False)
+                    logging.info("Model loaded successfully by merging safetensors")
+                except Exception as e:
+                    logging.error(f"Error merging safetensors: {str(e)}")
+                    raise
     
         self.model.to(self.device)
         logging.info(f"Model moved to device: {self.device}")
@@ -252,7 +269,6 @@ class KANEmotionalCharacter(nn.Module):
             self.model.resize_token_embeddings(len(self.tokenizer))
             logging.info("Resized token embeddings to include the pad_token.")
     
-        # Print model summary
         logging.info(f"Model summary: {self.model}")
         logging.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters())}")
 
@@ -267,7 +283,6 @@ class KANEmotionalCharacter(nn.Module):
             state_dict = load_file(file_path)
             merged_state_dict.update(state_dict)
         
-        # Save the merged state dict as a PyTorch bin file
         output_bin_path = self.model_path / "pytorch_model.bin"
         torch.save(merged_state_dict, output_bin_path)
         logging.info(f"Merged PyTorch model saved to {output_bin_path}")
@@ -303,8 +318,7 @@ class KANEmotionalCharacter(nn.Module):
             self.system_prompt = ""
             self.conversation_history = []
             
-            self.register_buffer("position_ids", torch.arange(1024).expand((1, -1)).to(self.device))
-            
+            self.register_buffer("position_ids", torch.arange(1024).expand((1, -1)))
             self.kan_update_frequency = 5
             pbar.update(1)
             logging.info("Additional components setup completed")
@@ -357,7 +371,7 @@ class KANEmotionalCharacter(nn.Module):
         return True
 
     def get_embedding(self, text):
-        inputs = self.tokenizer(text, return_tensors="pt", padding=True,truncation=True, max_length=512).to(self.device)
+        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512).to(self.device)
         with torch.no_grad():
             outputs = self.model(**inputs, output_hidden_states=True)
         last_hidden_state = outputs.hidden_states[-1]
@@ -392,7 +406,6 @@ class KANEmotionalCharacter(nn.Module):
             outputs = self.model(**inputs, output_hidden_states=True)
             self.last_hidden_states = outputs.hidden_states
 
-        self.clear_cuda_cache()
         return assistant_response
 
     def custom_generate(self, inputs, max_length):
@@ -471,10 +484,6 @@ class KANEmotionalCharacter(nn.Module):
         memory_entry = f"Emotion: {current_emotion}, Interaction: {user_input} -> {assistant_response}"
         self.memory.add_memory(memory_entry, embedding)
 
-    def clear_cuda_cache(self):
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
     def update_kan(self, user_feedback, emotional_feedback):
         feedback_score = torch.tensor(user_feedback).float().to(self.device)
         
@@ -512,7 +521,6 @@ class KANEmotionalCharacter(nn.Module):
         }
         torch.save(state, filename)
         logger.info(f"Character state saved to {filename}")
-        self.clear_cuda_cache()
 
     def load_state(self, filename='kan_character_state.pt'):
         if not os.path.exists(filename):
@@ -534,7 +542,6 @@ class KANEmotionalCharacter(nn.Module):
         self.position_ids = state.get('position_ids', torch.arange(1024).expand((1, -1)).to(self.device))
 
         logger.info(f"Character state loaded from {filename}")
-        self.clear_cuda_cache()
 
     def __del__(self):
         # Clean up hooks when the object is deleted
