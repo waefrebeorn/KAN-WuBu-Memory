@@ -11,6 +11,7 @@ import math
 import json 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from scipy.interpolate import BSpline
+from safetensors.torch import load_file
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -232,7 +233,17 @@ class KANEmotionalCharacter(nn.Module):
             logging.info("Model loaded successfully using AutoModelForCausalLM")
         except Exception as e:
             logging.error(f"Error loading model with AutoModelForCausalLM: {str(e)}")
-            raise
+            logging.info("Attempting to load model manually using safetensors...")
+            
+            try:
+                # Manually load the model using safetensors
+                state_dict = self.merge_safetensors()
+                self.model = AutoModelForCausalLM.from_config(config)
+                self.model.load_state_dict(state_dict, strict=False)
+                logging.info("Model loaded successfully using manual safetensors loading")
+            except Exception as e:
+                logging.error(f"Error loading model manually: {str(e)}")
+                raise
     
         self.model.to(self.device)
         logging.info(f"Model moved to device: {self.device}")
@@ -244,6 +255,24 @@ class KANEmotionalCharacter(nn.Module):
         # Print model summary
         logging.info(f"Model summary: {self.model}")
         logging.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters())}")
+
+    def merge_safetensors(self):
+        logging.info("Merging safetensors files...")
+        merged_state_dict = {}
+        safetensors_files = sorted([f for f in os.listdir(self.model_path) if f.endswith('.safetensors')])
+        
+        for file in safetensors_files:
+            file_path = self.model_path / file
+            logging.info(f"Loading {file}...")
+            state_dict = load_file(file_path)
+            merged_state_dict.update(state_dict)
+        
+        # Save the merged state dict as a PyTorch bin file
+        output_bin_path = self.model_path / "pytorch_model.bin"
+        torch.save(merged_state_dict, output_bin_path)
+        logging.info(f"Merged PyTorch model saved to {output_bin_path}")
+        
+        return merged_state_dict
 
     def _setup_additional_components(self):
         with tqdm(total=5, desc="Setting up additional components") as pbar:
