@@ -43,11 +43,10 @@ class KANGUI:
     def initialize_character(self):
         def init():
             try:
-                max_memory = 6 * 1024 * 1024 * 1024  # 6GB
                 timeout_duration = 300  # 5 minutes
 
                 with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(KANEmotionalCharacter, max_memory=max_memory)
+                    future = executor.submit(KANEmotionalCharacter)
                     try:
                         self.character = future.result(timeout=timeout_duration)
                         self.master.after(0, self.display_message, "KAN Emotional Character (LLaMA 3.1 8B Instruct) initialized successfully.")

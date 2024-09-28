@@ -131,6 +131,7 @@ class KANEmotionalCharacter(nn.Module):
         self.device = torch.device("cuda")
         self.model_name = model_name
         self.model_path = Path(__file__).parent / "models" / self.model_name
+        self.hooks = []  # Initialize hooks here
 
         self._initialize_components()
         self._setup_additional_components()
@@ -270,7 +271,6 @@ class KANEmotionalCharacter(nn.Module):
             logging.info("Additional components setup completed")
 
     def _register_hooks(self):
-        self.hooks = []
         for layer_idx in range(self.num_layers):
             layer = self.model.model.layers[layer_idx]
             hook = layer.register_forward_hook(self.create_hook(layer_idx))
@@ -332,7 +332,7 @@ class KANEmotionalCharacter(nn.Module):
         user_intent = self.intent_projection(torch.cat([intent_encoding[-2], intent_encoding[-1]], dim=-1))
         return user_intent
 
-    @torch.cuda.amp.autocast()
+    @torch.amp.autocast(device_type='cuda')
     def generate_response(self, user_input, max_length=150):
         self.current_user_intent = self.encode_user_intent(user_input)
         
