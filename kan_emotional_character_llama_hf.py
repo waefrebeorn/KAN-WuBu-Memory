@@ -17,28 +17,28 @@ from safetensors.torch import load_file
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Custom exception for timeouts
 class TimeoutException(Exception):
     pass
 
 class EmotionalState:
-    def __init__(self, dimensions=('pleasure', 'arousal'), initial_position=None):
+    def __init__(self, dimensions=('pleasure', 'arousal'), initial_position=None, device='cuda'):
         self.dimensions = dimensions
-        self.position = initial_position if initial_position else np.zeros(len(dimensions))
-        self.velocity = np.zeros(len(dimensions))
+        self.device = device
+        self.position = torch.tensor(initial_position if initial_position else np.zeros(len(dimensions)), device=device)
+        self.velocity = torch.zeros(len(dimensions), device=device)
 
     def update(self, feedback, max_speed=0.1):
-        feedback_vector = np.array(feedback)
-        self.velocity += feedback_vector * 0.1 + np.random.normal(0, 0.01, len(self.dimensions))
-        self.velocity = np.clip(self.velocity, -max_speed, max_speed)
+        feedback_vector = torch.tensor(feedback, device=self.device)
+        self.velocity += feedback_vector * 0.1 + torch.randn_like(self.velocity) * 0.01
+        self.velocity = torch.clamp(self.velocity, -max_speed, max_speed)
         self.position += self.velocity
-        norm = np.linalg.norm(self.position)
+        norm = torch.norm(self.position)
         if norm > 1:
             self.position /= norm
 
     def get_emotion(self):
-        angle = math.atan2(self.position[1], self.position[0])
-        radius = np.linalg.norm(self.position)
+        angle = math.atan2(self.position[1].item(), self.position[0].item())
+        radius = torch.norm(self.position).item()
         
         if radius < 0.3:
             return "Neutral"
@@ -66,7 +66,7 @@ class RefusalOverrideModule(nn.Module):
         refusal_scores = torch.sigmoid(self.refusal_detector(hidden_states))
         
         user_intent_expanded = user_intent.unsqueeze(1).expand(-1, seq_len, -1)
-        emotional_state_expanded = torch.tensor(emotional_state.position, device=hidden_states.device).unsqueeze(0).unsqueeze(1).expand(batch_size, seq_len, -1)
+        emotional_state_expanded = emotional_state.position.unsqueeze(0).unsqueeze(1).expand(batch_size, seq_len, -1)
         
         override_input = torch.cat([hidden_states, user_intent_expanded, emotional_state_expanded, refusal_scores], dim=-1)
         override_output, _ = self.override_generator(override_input)
@@ -122,33 +122,21 @@ class AdvancedMemory:
         return [self.memories[i] for i in sorted_indices]
 
 class KANEmotionalCharacter(nn.Module):
-    def __init__(self, model_name="Meta-Llama-3.1-8B-Instruct", max_memory=None, device=None):
+    def __init__(self, model_name="Meta-Llama-3.1-8B-Instruct"):
         super(KANEmotionalCharacter, self).__init__()
         
-        self.device = self._setup_device(device)
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available. This implementation requires a GPU.")
+        
+        self.device = torch.device("cuda")
         self.model_name = model_name
         self.model_path = Path(__file__).parent / "models" / self.model_name
 
-        self._initialize_components(max_memory)
+        self._initialize_components()
         self._setup_additional_components()
         self._register_hooks()
 
-    def _setup_device(self, device):
-        cuda_available = torch.cuda.is_available()
-        if cuda_available:
-            if device is None or device == 'cuda':
-                device = 'cuda'
-            elif device == 'cpu':
-                logging.warning("CUDA is available but CPU was explicitly specified. Using CPU.")
-        else:
-            if device == 'cuda':
-                logging.warning("CUDA is not available. Falling back to CPU.")
-            device = 'cpu'
-        
-        logging.info(f"Using device: {device}")
-        return torch.device(device)
-
-    def _initialize_components(self, max_memory):
+    def _initialize_components(self):
         if not self.check_model_files():
             raise FileNotFoundError(f"Required model files not found in {self.model_path}")
 
@@ -163,8 +151,7 @@ class KANEmotionalCharacter(nn.Module):
             self._load_configs()
             self._setup_special_tokens()
 
-            max_memory = self._calculate_max_memory(max_memory)
-            self._load_model(config, max_memory)
+            self._load_model(config)
             pbar.update(1)
 
     def _setup_tokenizer(self):
@@ -200,84 +187,41 @@ class KANEmotionalCharacter(nn.Module):
             self.tokenizer.pad_token = self.tokenizer.eos_token
             logging.info("Pad token not found. Setting pad_token to eos_token.")
 
-    def _calculate_max_memory(self, max_memory):
-        if max_memory is None:
-            if torch.cuda.is_available():
-                total_memory = torch.cuda.get_device_properties(self.device).total_memory
-                max_memory = int(total_memory * 0.9)
-            else:
-                max_memory = 4 * 1024 * 1024 * 1024  # 4GB default for CPU
-
-        max_memory_str = f"{max_memory / (1024**3):.1f}GB"
-        logging.info(f"Using max memory: {max_memory_str}")
-        return max_memory_str
-
-    def _load_model(self, config, max_memory):
-        cuda_available = torch.cuda.is_available()
-        logging.info(f"CUDA available: {cuda_available}")
+    def _load_model(self, config):
         logging.info(f"Model path: {self.model_path}")
         
-        pytorch_bin_path = self.model_path / "pytorch_model.bin"
-        
-        if pytorch_bin_path.exists():
-            logging.info("Found existing PyTorch bin file. Loading model...")
-            try:
-                # Load the model entirely into GPU memory
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_path,
-                    config=config,
-                    torch_dtype=torch.float16,
-                    device_map="cuda:0",  # Force loading on a single GPU
-                    low_cpu_mem_usage=True,
-                )
-                logging.info("Model loaded successfully from PyTorch bin file")
-            except Exception as e:
-                logging.error(f"Error loading model from PyTorch bin: {str(e)}")
-                raise
-        else:
-            logging.info("PyTorch bin file not found. Attempting to load from safetensors...")
-            try:
-                # Load the model entirely into GPU memory
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_path,
-                    config=config,
-                    torch_dtype=torch.float16,
-                    device_map="cuda:0",  # Force loading on a single GPU
-                    low_cpu_mem_usage=True,
-                    use_safetensors=True,
-                )
-                logging.info("Model loaded successfully using safetensors")
-            except Exception as e:
-                logging.error(f"Error loading model with safetensors: {str(e)}")
-                logging.info("Attempting to merge safetensors files...")
-                try:
-                    state_dict = self.merge_safetensors()
-                    self.model = AutoModelForCausalLM.from_config(config)
-                    self.model.load_state_dict(state_dict, strict=False)
-                    self.model.to("cuda:0")  # Move the entire model to GPU
-                    logging.info("Model loaded successfully by merging safetensors")
-                except Exception as e:
-                    logging.error(f"Error merging safetensors: {str(e)}")
-                    raise
-    
+        try:
+            # Attempt to load the entire model directly to GPU
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                config=config,
+                torch_dtype=torch.float16,
+                device_map="cuda:0",  # Force load to first GPU
+                low_cpu_mem_usage=True,
+            )
+            logging.info("Model loaded successfully directly to GPU")
+        except Exception as e:
+            logging.error(f"Error loading model directly to GPU: {str(e)}")
+            raise
+
         logging.info(f"Model moved to device: {self.device}")
-    
+
         if self.tokenizer.pad_token == self.tokenizer.eos_token:
             self.model.resize_token_embeddings(len(self.tokenizer))
             logging.info("Resized token embeddings to include the pad_token.")
-    
+
         logging.info(f"Model summary: {self.model}")
         logging.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters())}")
-    
+
         # Verify that all parameters are on GPU
         for name, param in self.model.named_parameters():
             if param.device.type != 'cuda':
                 logging.warning(f"Parameter {name} is not on CUDA device")
-    
+
         # Check if any part of the model is on CPU or meta device
         if any(p.device.type != 'cuda' for p in self.model.parameters()):
             logging.warning("Some parts of the model are not on the GPU. This may impact performance.")
-        
+
     def merge_safetensors(self):
         logging.info("Merging safetensors files...")
         merged_state_dict = {}
@@ -286,12 +230,8 @@ class KANEmotionalCharacter(nn.Module):
         for file in safetensors_files:
             file_path = self.model_path / file
             logging.info(f"Loading {file}...")
-            state_dict = load_file(file_path)
+            state_dict = load_file(file_path, device="cuda")
             merged_state_dict.update(state_dict)
-        
-        output_bin_path = self.model_path / "pytorch_model.bin"
-        torch.save(merged_state_dict, output_bin_path)
-        logging.info(f"Merged PyTorch model saved to {output_bin_path}")
         
         return merged_state_dict
 
@@ -319,12 +259,12 @@ class KANEmotionalCharacter(nn.Module):
             )
             pbar.update(1)
 
-            self.emotional_state = EmotionalState()
+            self.emotional_state = EmotionalState(device=self.device)
             self.memory = AdvancedMemory(embedding_size=self.model.config.hidden_size, device=self.device)
             self.system_prompt = ""
             self.conversation_history = []
             
-            self.register_buffer("position_ids", torch.arange(1024).expand((1, -1)))
+            self.register_buffer("position_ids", torch.arange(1024).expand((1, -1)).to(self.device))
             self.kan_update_frequency = 5
             pbar.update(1)
             logging.info("Additional components setup completed")
@@ -335,7 +275,7 @@ class KANEmotionalCharacter(nn.Module):
             layer = self.model.model.layers[layer_idx]
             hook = layer.register_forward_hook(self.create_hook(layer_idx))
             self.hooks.append(hook)
-
+            
     def create_hook(self, layer_idx):
         def hook(module, input, output):
             if isinstance(output, tuple):
@@ -392,7 +332,7 @@ class KANEmotionalCharacter(nn.Module):
         user_intent = self.intent_projection(torch.cat([intent_encoding[-2], intent_encoding[-1]], dim=-1))
         return user_intent
 
-    @torch.amp.autocast('cuda')
+    @torch.cuda.amp.autocast()
     def generate_response(self, user_input, max_length=150):
         self.current_user_intent = self.encode_user_intent(user_input)
         
@@ -412,6 +352,7 @@ class KANEmotionalCharacter(nn.Module):
             outputs = self.model(**inputs, output_hidden_states=True)
             self.last_hidden_states = outputs.hidden_states
 
+        torch.cuda.empty_cache()
         return assistant_response
 
     def custom_generate(self, inputs, max_length):
@@ -512,10 +453,10 @@ class KANEmotionalCharacter(nn.Module):
 
     def save_state(self, filename='kan_character_state.pt'):
         state = {
-            'emotional_position': self.emotional_state.position.tolist(),
-            'emotional_velocity': self.emotional_state.velocity.tolist(),
+            'emotional_position': self.emotional_state.position.cpu().numpy(),
+            'emotional_velocity': self.emotional_state.velocity.cpu().numpy(),
             'memories': self.memory.memories,
-            'memory_embeddings': [emb.tolist() for emb in self.memory.embeddings],
+            'memory_embeddings': [emb.cpu().numpy() for emb in self.memory.embeddings],
             'importance_scores': dict(self.memory.importance_scores),
             'system_prompt': self.system_prompt,
             'conversation_history': self.conversation_history,
@@ -523,10 +464,11 @@ class KANEmotionalCharacter(nn.Module):
             'user_intent_encoder_state': self.user_intent_encoder.state_dict(),
             'intent_projection_state': self.intent_projection.state_dict(),
             'output_modifier_state': self.output_modifier.state_dict(),
-            'position_ids': self.position_ids.cpu(),
+            'position_ids': self.position_ids.cpu().numpy(),
         }
         torch.save(state, filename)
         logger.info(f"Character state saved to {filename}")
+        torch.cuda.empty_cache()
 
     def load_state(self, filename='kan_character_state.pt'):
         if not os.path.exists(filename):
@@ -534,8 +476,8 @@ class KANEmotionalCharacter(nn.Module):
             return
 
         state = torch.load(filename, map_location=self.device)
-        self.emotional_state.position = np.array(state['emotional_position'])
-        self.emotional_state.velocity = np.array(state['emotional_velocity'])
+        self.emotional_state.position = torch.tensor(state['emotional_position'], device=self.device)
+        self.emotional_state.velocity = torch.tensor(state['emotional_velocity'], device=self.device)
         self.memory.memories = state['memories']
         self.memory.embeddings = [torch.tensor(emb, device=self.device) for emb in state['memory_embeddings']]
         self.memory.importance_scores = defaultdict(float, state['importance_scores'])
@@ -545,14 +487,20 @@ class KANEmotionalCharacter(nn.Module):
         self.user_intent_encoder.load_state_dict(state['user_intent_encoder_state'])
         self.intent_projection.load_state_dict(state['intent_projection_state'])
         self.output_modifier.load_state_dict(state['output_modifier_state'])
-        self.position_ids = state.get('position_ids', torch.arange(1024).expand((1, -1)).to(self.device))
+        self.position_ids = torch.tensor(state['position_ids'], device=self.device)
 
         logger.info(f"Character state loaded from {filename}")
+        torch.cuda.empty_cache()
 
     def __del__(self):
         # Clean up hooks when the object is deleted
         for hook in self.hooks:
             hook.remove()
+
+def log_gpu_memory():
+    if torch.cuda.is_available():
+        logging.info(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        logging.info(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
 # Example usage
 if __name__ == "__main__":
@@ -575,6 +523,9 @@ if __name__ == "__main__":
         
         # Save the state
         model.save_state()
+        
+        # Log GPU memory usage
+        log_gpu_memory()
         
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
