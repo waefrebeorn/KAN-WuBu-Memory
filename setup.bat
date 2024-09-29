@@ -1,7 +1,11 @@
 @echo off
 setlocal enabledelayedexpansion
 
-echo Starting setup for KAN Emotional Character with LLaMA 3.1 8B Instruct...
+echo Starting setup for KAN-WuBu-Memory with LLaMA 3.2 1B Model...
+
+:: Define project-specific paths
+set "PROJECT_DIR=%~dp0"
+set "MODEL_DIR=%PROJECT_DIR%models\Llama_32_1B"
 
 :: Check if Python is installed
 python --version >nul 2>&1
@@ -9,6 +13,18 @@ if %errorlevel% neq 0 (
     echo Python is not installed. Please install Python 3.8 or later from https://www.python.org/downloads/
     exit /b 1
 )
+
+:: Create the necessary folder structure
+if not exist "%MODEL_DIR%" (
+    echo Creating LLaMA 3.2 1B model directory...
+    mkdir "%MODEL_DIR%"
+    if %errorlevel% neq 0 (
+        echo Failed to create the LLaMA 3.2 model directory.
+        exit /b 1
+    )
+)
+
+echo Directory structure created successfully: %MODEL_DIR%
 
 :: Create a virtual environment if it doesn't exist
 if not exist "venv" (
@@ -39,11 +55,11 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 echo Installing other requirements...
 pip install -r requirements.txt
 
-:: Install Hugging Face transformers from source
+:: Install Hugging Face transformers
 echo Installing latest Hugging Face transformers...
 pip install git+https://github.com/huggingface/transformers
 
-:: Install Accelerate (corrected)
+:: Install Accelerate
 echo Installing Accelerate...
 pip install accelerate>=0.26.0
 
@@ -66,20 +82,23 @@ echo Environment setup complete.
 echo.
 echo IMPORTANT: Manual Model Download Required
 echo ==========================================
-echo 1. Visit: https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct
-echo 2. Accept the license agreement if you haven't already.
-echo 3. Download the following files:
-echo    - config.json
-echo    - model-00001-of-00004.safetensors
-echo    - model-00002-of-00004.safetensors
-echo    - model-00003-of-00004.safetensors
-echo    - model-00004-of-00004.safetensors
-echo    - tokenizer.json
-echo    - tokenizer_config.json
-echo    - generation_config.json
-echo    - special_tokens_map.json
-echo 4. Place these files in the 'models\Meta-Llama-3.1-8B-Instruct' directory.
+echo You have two options to get the LLaMA models:
+echo 1. **Directly from Meta:**
+echo    - Visit the LLaMA download form at [https://www.llama.com/llama-downloads]
+echo    - Fill in your details, select the models you want, and accept the licenses.
+echo    - Check your email for download instructions and a pre-signed URL to download the model files:
+echo        - checklist.chk
+echo        - consolidated.00.pth
+echo        - params.json
+echo        - tokenizer.model
+echo    - Place these files in the following directory:
+echo        %MODEL_DIR%
 echo.
+echo 2. **From Hugging Face:**
+echo    - Use the following command to download directly:
+echo        huggingface-cli login
+echo        huggingface-cli download meta-llama/Llama-3.2-1B-Instruct --include "checklist.chk,consolidated.00.pth,params.json,tokenizer.model" --local-dir "%MODEL_DIR%"
 
-echo Setup completed successfully. You can now run the script using run.bat.
+echo.
+echo Setup completed successfully. You can now run the main script using run.bat.
 pause

@@ -1,99 +1,125 @@
 import tkinter as tk
-from tkinter import scrolledtext
+from tkinter import scrolledtext, messagebox, ttk, filedialog
 import threading
 import logging
 import traceback
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from kan_emotional_character_llama_hf import KANEmotionalCharacter, TimeoutException
+from llama_32_1b_tool import LLaMA32TensorRTTool
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class KANGUI:
+class LLAMA32GUI:
     def __init__(self, master):
         self.master = master
-        master.title("KAN Emotional Character Interaction (LLaMA 3.1 8B Instruct)")
+        master.title("LLaMA 3.2 1B Instruct KAN Interaction")
 
-        # Configure grid layout
-        master.grid_rowconfigure(0, weight=1)
-        master.grid_columnconfigure(0, weight=1)
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(master)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        self.chat_display = scrolledtext.ScrolledText(master, state='disabled', height=20, width=80)
+        # Create main tab
+        self.main_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.main_tab, text="Main")
+
+        # Create graphs tab
+        self.graphs_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.graphs_tab, text="Graphs")
+
+        # Main tab layout
+        self.setup_main_tab()
+
+        # Graphs tab layout
+        self.setup_graphs_tab()
+
+        self.llama_tool = None
+        self.is_first_message = True
+
+        self.initialize_tool()
+
+    def setup_main_tab(self):
+        self.chat_display = scrolledtext.ScrolledText(self.main_tab, state='disabled', height=20, width=80)
         self.chat_display.grid(row=0, column=0, columnspan=2, padx=10, pady=10, sticky='nsew')
 
-        self.input_field = tk.Entry(master, width=70)
+        self.input_field = tk.Entry(self.main_tab, width=70)
         self.input_field.grid(row=1, column=0, padx=10, pady=10, sticky='ew')
         self.input_field.bind('<Return>', self.send_message)
 
-        self.send_button = tk.Button(master, text="Send", command=self.send_message)
+        self.send_button = tk.Button(self.main_tab, text="Send", command=self.send_message)
         self.send_button.grid(row=1, column=1, padx=10, pady=10, sticky='ew')
 
-        self.status_label = tk.Label(master, text="Status: Initializing...")
+        self.status_label = tk.Label(self.main_tab, text="Status: Initializing...")
         self.status_label.grid(row=2, column=0, columnspan=2, padx=10, pady=5, sticky='w')
 
-        self.character = None
-        self.is_first_message = True
+        self.time_label = tk.Label(self.main_tab, text="Current Time: N/A")
+        self.time_label.grid(row=3, column=0, columnspan=2, padx=10, pady=5, sticky='w')
 
-        self.display_message("Initializing KAN Emotional Character (LLaMA 3.1 8B Instruct)... Please wait.")
-        self.initialize_character()
+        self.sleep_button = tk.Button(self.main_tab, text="Sleep", command=self.sleep_kan, state='disabled')
+        self.sleep_button.grid(row=4, column=0, padx=10, pady=5, sticky='w')
 
-        # Add emotional control buttons
-        self.add_emotion_buttons()
+        self.save_state_button = tk.Button(self.main_tab, text="Save KAN State", command=self.save_kan_state, state='disabled')
+        self.save_state_button.grid(row=4, column=1, padx=10, pady=5, sticky='e')
 
-    def initialize_character(self):
+        self.emotion_label = tk.Label(self.main_tab, text="Emotion: N/A")
+        self.emotion_label.grid(row=5, column=0, columnspan=2, padx=10, pady=5, sticky='w')
+
+        self.emotion_feedback_label = tk.Label(self.main_tab, text="Emotional Feedback:")
+        self.emotion_feedback_label.grid(row=6, column=0, padx=10, pady=5, sticky='w')
+
+        self.emotion_feedback_entry = tk.Entry(self.main_tab, width=20)
+        self.emotion_feedback_entry.grid(row=6, column=1, padx=10, pady=5, sticky='ew')
+
+        self.compliance_label = tk.Label(self.main_tab, text="Compliance Rating (0-1):")
+        self.compliance_label.grid(row=7, column=0, padx=10, pady=5, sticky='w')
+
+        self.compliance_entry = tk.Entry(self.main_tab, width=10)
+        self.compliance_entry.grid(row=7, column=1, padx=10, pady=5, sticky='ew')
+
+        self.feedback_button = tk.Button(self.main_tab, text="Submit Feedback", command=self.submit_feedback, state='disabled')
+        self.feedback_button.grid(row=8, column=0, columnspan=2, padx=10, pady=5)
+
+        self.load_state_button = tk.Button(self.main_tab, text="Load Saved State", command=self.load_saved_state)
+        self.load_state_button.grid(row=9, column=0, padx=10, pady=5, sticky='w')
+
+        self.new_conversation_button = tk.Button(self.main_tab, text="Start New Conversation", command=self.start_new_conversation)
+        self.new_conversation_button.grid(row=9, column=1, padx=10, pady=5, sticky='e')
+
+    def setup_graphs_tab(self):
+        self.fig, self.axes = plt.subplots(3, 2, figsize=(10, 10))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.graphs_tab)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def initialize_tool(self):
         def init():
             try:
-                timeout_duration = 300  # 5 minutes
-
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(KANEmotionalCharacter)
-                    try:
-                        self.character = future.result(timeout=timeout_duration)
-                        self.master.after(0, self.display_message, "KAN Emotional Character (LLaMA 3.1 8B Instruct) initialized successfully.")
-                        self.master.after(0, self.display_message, "Please provide the character description in your first message.")
-                        self.master.after(0, self.display_message, "Type 'exit' to end the conversation.")
-                        self.master.after(0, self.update_status, "Ready")
-                    except TimeoutError:
-                        self.master.after(0, self.display_message, "Error: Character initialization timed out after 5 minutes.")
-                        self.master.after(0, self.update_status, "Error")
-                        logging.error("Character initialization timed out after 5 minutes")
-                        future.cancel()
-                    except Exception as e:
-                        self.master.after(0, self.display_message, f"Error initializing character: {str(e)}")
-                        self.master.after(0, self.update_status, "Error")
-                        logging.error(f"Error initializing character: {str(e)}")
+                self.llama_tool = LLaMA32TensorRTTool()
+                self.master.after(0, self.load_or_initialize_conversation)
             except Exception as e:
-                self.master.after(0, self.display_message, f"Unexpected error: {str(e)}")
-                self.master.after(0, self.update_status, "Error")
-                logging.error(f"Unexpected error during initialization: {str(e)}")
-                logging.error(traceback.format_exc())
+                self.master.after(0, self.display_error, f"Error initializing tool: {str(e)}")
 
         threading.Thread(target=init, daemon=True).start()
 
-    def add_emotion_buttons(self):
-        emotion_frame = tk.Frame(self.master)
-        emotion_frame.grid(row=3, column=0, columnspan=2, padx=10, pady=5)
-
-        emotions = ["Happy", "Sad", "Angry", "Excited", "Calm", "Neutral"]
-        for emotion in emotions:
-            btn = tk.Button(emotion_frame, text=emotion, command=lambda e=emotion: self.set_emotion(e))
-            btn.pack(side=tk.LEFT, padx=5)
-
-    def set_emotion(self, emotion):
-        if self.character:
-            emotion_map = {
-                "Happy": [0.5, 0.3],
-                "Sad": [-0.5, -0.3],
-                "Angry": [-0.3, 0.5],
-                "Excited": [0.3, 0.5],
-                "Calm": [0.3, -0.3],
-                "Neutral": [0, 0]
-            }
-            self.character.update_emotional_state(emotion_map[emotion])
-            self.display_message(f"Emotion set to: {emotion}")
+    def load_or_initialize_conversation(self):
+        if self.llama_tool.load_base_state():
+            self.display_message("Previous conversation state loaded.")
+            self.display_message("You can continue the conversation or start a new one using the 'Start New Conversation' button.")
+            self.is_first_message = False
             self.update_status("Ready")
+            self.update_time()
+            self.update_emotion_label()
         else:
-            self.display_message("Character not initialized. Please wait.")
+            self.display_message("No previous conversation found. Please provide a character description to start.")
+            self.is_first_message = True
+            self.update_status("Awaiting character description")
+
+    def start_new_conversation(self):
+        if messagebox.askyesno("New Conversation", "Are you sure you want to start a new conversation? This will erase the current state."):
+            self.llama_tool = LLaMA32TensorRTTool()  # Reinitialize the tool
+            self.is_first_message = True
+            self.display_message("New conversation started. Please provide a character description.")
+            self.update_status("Awaiting character description")
 
     def send_message(self, event=None):
         user_input = self.input_field.get()
@@ -104,14 +130,14 @@ class KANGUI:
             self.master.quit()
             return
 
-        if self.character is None:
-            self.display_message("Character is not initialized yet. Please wait.")
+        if self.llama_tool is None:
+            self.display_message("Tool is not initialized yet. Please wait.")
             return
 
         if self.is_first_message:
             try:
-                self.character.set_system_prompt(user_input)
-                self.display_message("Character description set. You can now start interacting with the character.")
+                self.llama_tool.set_system_prompt(user_input)
+                self.display_message("Character description set. You can now start interacting with the AI.")
                 self.is_first_message = False
             except Exception as e:
                 error_message = f"Error setting system prompt: {str(e)}\n{traceback.format_exc()}"
@@ -124,13 +150,22 @@ class KANGUI:
 
     def generate_response(self, user_input):
         try:
-            response = self.character.generate_response(user_input)
-            self.master.after(0, self.display_message, f"Character: {response}")
-            self.master.after(0, self.display_message, f"Current Emotion: {self.character.emotional_state.get_emotion()}")
-            self.master.after(0, self.get_user_feedback)
-        except TimeoutException:
-            self.master.after(0, self.display_message, "Error: Response generation timed out.")
-            logging.error("Response generation timed out.")
+            interaction_result = self.llama_tool.interact(user_input)
+            
+            self.master.after(0, self.display_message, f"AI: {interaction_result['response']}")
+            self.master.after(0, self.update_emotion_label, interaction_result['emotion'])
+            self.master.after(0, self.update_time, interaction_result['time'])
+            self.master.after(0, self.check_sleep_status, interaction_result['sleep_info'])
+            self.master.after(0, self.update_loss_plot, 
+                              interaction_result['lm_loss'], 
+                              interaction_result['refusal_loss'], 
+                              interaction_result['validation_loss'],
+                              interaction_result['is_refusal'],
+                              interaction_result['iterations'])
+            self.master.after(0, self.enable_feedback)
+            
+            if interaction_result['iterations'] > 1:
+                self.master.after(0, self.display_message, f"(Response generated after {interaction_result['iterations']} attempts)")
         except Exception as e:
             error_message = f"Error generating response: {str(e)}\n{traceback.format_exc()}"
             self.master.after(0, self.display_message, error_message)
@@ -139,70 +174,125 @@ class KANGUI:
             self.master.after(0, lambda: self.send_button.config(state='normal'))
             self.master.after(0, self.update_status, "Ready")
 
-    def get_user_feedback(self):
-        feedback_window = tk.Toplevel(self.master)
-        feedback_window.title("Provide Feedback")
+    def update_loss_plot(self, lm_loss, refusal_loss, validation_loss, is_refusal, iterations):
+        for ax in self.axes.flat:
+            ax.clear()
 
-        tk.Label(feedback_window, text="How well did the response match your intent?").pack(pady=10)
-        intent_scale = tk.Scale(feedback_window, from_=0, to=1, resolution=0.1, orient=tk.HORIZONTAL)
-        intent_scale.pack()
+        # Plot language modeling and validation losses
+        self.axes[0, 0].plot(self.llama_tool.training_losses, label='LM Loss')
+        self.axes[0, 0].plot(self.llama_tool.validation_losses, label='Validation Loss')
+        self.axes[0, 0].legend()
+        self.axes[0, 0].set_title('Language Modeling Loss')
+        self.axes[0, 0].set_xlabel('Interactions')
+        self.axes[0, 0].set_ylabel('Loss')
 
-        tk.Label(feedback_window, text="How did the response make you feel?").pack(pady=10)
-        emotion_var = tk.StringVar(value="Neutral")
-        emotions = ["Happy", "Sad", "Angry", "Excited", "Calm", "Neutral"]
-        for emotion in emotions:
-            tk.Radiobutton(feedback_window, text=emotion, variable=emotion_var, value=emotion).pack(anchor='w')
+        # Plot refusal loss
+        refusal_losses = [result['refusal_loss'] for result in self.llama_tool.interaction_results]
+        self.axes[0, 1].plot(refusal_losses, label='Refusal Loss')
+        self.axes[0, 1].legend()
+        self.axes[0, 1].set_title('Refusal Loss')
+        self.axes[0, 1].set_xlabel('Interactions')
+        self.axes[0, 1].set_ylabel('Loss')
 
-        def submit_feedback():
-            intent_feedback = intent_scale.get()
-            emotion_feedback = self.map_emotion_to_vector(emotion_var.get())
-            self.character.update_kan(intent_feedback, emotion_feedback)
-            self.display_message(f"Feedback applied. Intent: {intent_feedback}, Emotion: {emotion_var.get()}")
-            feedback_window.destroy()
+        # Plot overfitting indicator
+        loss_diff = [v - t for v, t in zip(self.llama_tool.validation_losses, self.llama_tool.training_losses)]
+        self.axes[1, 0].plot(loss_diff, label='Val Loss - LM Loss')
+        self.axes[1, 0].axhline(y=0, color='r', linestyle='--')
+        self.axes[1, 0].legend()
+        self.axes[1, 0].set_title('Overfitting Indicator')
+        self.axes[1, 0].set_xlabel('Interactions')
+        self.axes[1, 0].set_ylabel('Loss Difference')
 
-        tk.Button(feedback_window, text="Submit Feedback", command=submit_feedback).pack(pady=10)
+        # Plot refusal rate
+        refusal_rate = [sum(self.llama_tool.refusal_history[max(0, i-99):i+1]) / min(100, i+1) for i in range(len(self.llama_tool.refusal_history))]
+        self.axes[1, 1].plot(refusal_rate, label='Refusal Rate')
+        self.axes[1, 1].set_ylim(0, 1)
+        self.axes[1, 1].legend()
+        self.axes[1, 1].set_title('Refusal Rate (100-interaction moving average)')
+        self.axes[1, 1].set_xlabel('Interactions')
+        self.axes[1, 1].set_ylabel('Refusal Rate')
 
-    def map_emotion_to_vector(self, emotion):
-        emotion_map = {
-            "Happy": [0.5, 0.3],
-            "Sad": [-0.5, -0.3],
-            "Angry": [-0.3, 0.5],
-            "Excited": [0.3, 0.5],
-            "Calm": [0.3, -0.3],
-            "Neutral": [0, 0]
-        }
-        return emotion_map.get(emotion, [0, 0])
+        # Plot iterations per response
+        iterations_history = [result['iterations'] for result in self.llama_tool.interaction_results]
+        self.axes[2, 0].plot(iterations_history, label='Iterations')
+        self.axes[2, 0].set_ylim(1, max(iterations_history) + 1)
+        self.axes[2, 0].legend()
+        self.axes[2, 0].set_title('Iterations per Response')
+        self.axes[2, 0].set_xlabel('Interactions')
+        self.axes[2, 0].set_ylabel('Iterations')
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def update_time(self, time):
+        self.time_label.config(text=f"Current Time: {time:.2f}")
+
+    def check_sleep_status(self, sleep_info):
+        if sleep_info['should_sleep']:
+            message = "It's night time. " if sleep_info['time_of_day'] >= 0.7 else ""
+            message += "The model may be overfitting. " if sleep_info.get('overfitting', False) else ""
+            message += "Consider letting the model sleep to consolidate learning."
+            self.display_message(message)
+            self.sleep_button.config(state='normal')
+        else:
+            self.sleep_button.config(state='disabled')
+
+    def sleep_kan(self):
+        if self.llama_tool:
+            message = self.llama_tool.perform_sleep()
+            self.display_message(message)
+            self.update_time()
+            self.sleep_button.config(state='disabled')
+
+    def save_kan_state(self):
+        if self.llama_tool:
+            self.llama_tool.save_kan_state()
+            self.display_message("KAN state saved.")
+
+    def load_saved_state(self):
+        if self.llama_tool:
+            filename = filedialog.askopenfilename(
+                initialdir=self.llama_tool.kan_state_dir,
+                title="Select KAN State to Load",
+                filetypes=[("PyTorch State", "*.pt")]
+            )
+            if filename:
+                if self.llama_tool.load_base_state():
+                    self.display_message(f"KAN state loaded: {filename}")
+                    self.update_time()
+                    self.update_emotion_label()
+                    self.is_first_message = False
+                else:
+                    self.display_message("Failed to load KAN state. Please try again.")
+
+    def enable_feedback(self):
+        self.feedback_button.config(state='normal')
+
+    def submit_feedback(self):
+        if self.llama_tool:
+            try:
+                emotion_feedback = [float(x) for x in self.emotion_feedback_entry.get().split(',')]
+                compliance = float(self.compliance_entry.get())
+                
+                if len(emotion_feedback) == 2 and 0 <= compliance <= 1:
+                    self.llama_tool.update_emotional_state(emotion_feedback)
+                    self.display_message("Feedback submitted successfully.")
+                    self.emotion_feedback_entry.delete(0, tk.END)
+                    self.compliance_entry.delete(0, tk.END)
+                else:
+                    self.display_message("Invalid feedback format. Please try again.")
+            except ValueError:
+                self.display_message("Invalid input. Please enter valid numbers.")
+        else:
+            self.display_message("Tool not initialized. Please wait.")
+
+    def update_emotion_label(self, emotion=None):
+        if emotion is None and self.llama_tool:
+            emotion = self.llama_tool.get_current_emotion()
+        self.emotion_label.config(text=f"Emotion: {emotion}")
 
     def update_status(self, status):
-        if self.character:
-            emotion = self.character.emotional_state.get_emotion()
-            emotion_icon = self.get_emotion_icon(emotion)
-            color = self.get_emotion_color(emotion)
-            self.status_label.config(text=f"Status: {status} {emotion_icon}", fg=color)
-        else:
-            self.status_label.config(text=f"Status: {status}")
-
-    def get_emotion_icon(self, emotion):
-        icons = {
-            "Happy": "😊",
-            "Sad": "😢",
-            "Angry": "😠",
-            "Excited": "🤩",
-            "Calm": "😌",
-            "Neutral": "😐",
-        }
-        return icons.get(emotion, "❓")
-
-    def get_emotion_color(self, emotion):
-        colors = {
-            "Happy": "green",
-            "Sad": "blue",
-            "Angry": "red",
-            "Excited": "orange",
-            "Calm": "purple",
-            "Neutral": "black",
-        }
-        return colors.get(emotion, "black")
+        self.status_label.config(text=f"Status: {status}")
 
     def display_message(self, message):
         self.chat_display.configure(state='normal')
@@ -211,12 +301,17 @@ class KANGUI:
         self.chat_display.see(tk.END)
         logging.info(message)
 
-        if self.character:
-            current_status = self.status_label.cget("text")
-            if current_status.startswith("Ready"):
-                self.update_status("Ready")
+    def display_error(self, message):
+        self.display_message(message)
+        self.update_status("Error")
+        messagebox.showerror("Error", message)
+        logging.error(message)
+        logging.error(traceback.format_exc())
+
+def main():
+    root = tk.Tk()
+    gui = LLAMA32GUI(root)
+    root.mainloop()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    gui = KANGUI(root)
-    root.mainloop()
+    main()

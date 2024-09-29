@@ -1,13 +1,35 @@
+# Core dependencies
 torch
-torchvision
-torchaudio
 transformers
 numpy
-scikit-learn
-hnswlib
-pynvml
-requests
-requests_oauthlib
-huggingface_hub
-scipy
-tqdm
+matplotlib
+
+# GUI
+tk
+
+# Logging and error handling
+logging
+
+# File handling
+pathlib
+
+
+# Date and time handling
+datetime
+
+# NVIDIA GPU support (make sure you have the appropriate CUDA version installed)
+# Note: The specific CUDA version should match your GPU driver
+
+# Optional: for better performance on CPU
+# intel-openmp
+# mkl
+
+# Development tools (optional)
+# pytest
+# black
+# isort
+# flake8
+
+# Documentation (optional)
+# sphinx
+# sphinx-rtd-theme
