@@ -1,37 +1,60 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import LlamaTokenizer, LlamaForCausalLM, LlamaConfig
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    AutoConfig,
+)
 import logging
 from pathlib import Path
 import json
 import numpy as np
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime
+import time
+import traceback
+import gc
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("llama_tool.log"),
+        logging.StreamHandler(),
+    ],
+)
+
+# Suppress matplotlib debug logs
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
 
 class EmotionalState:
-    def __init__(self, dimensions=('pleasure', 'arousal'), initial_position=None, device='cuda'):
+    def __init__(self, dimensions=("pleasure", "arousal"), initial_position=None, device="cuda"):
         self.dimensions = dimensions
         self.device = device
-        self.position = torch.tensor(initial_position if initial_position else [0.0] * len(dimensions), device=device, dtype=torch.float16)
-        self.velocity = torch.zeros(len(dimensions), device=device, dtype=torch.float16)
+        self.position = torch.tensor(
+            initial_position if initial_position else [0.0] * len(dimensions),
+            device=device,
+            dtype=torch.float16
+        ).unsqueeze(0)
+        self.velocity = torch.zeros(1, len(dimensions), device=device, dtype=torch.float16)
 
     def update(self, feedback, max_speed=0.1):
-        feedback_vector = torch.tensor(feedback, device=self.device, dtype=torch.float16)
+        feedback_vector = torch.tensor(feedback, device=self.device, dtype=torch.float16).unsqueeze(0)
         self.velocity += feedback_vector * 0.1 + torch.randn_like(self.velocity) * 0.01
         self.velocity = torch.clamp(self.velocity, -max_speed, max_speed)
         self.position += self.velocity
-        norm = torch.norm(self.position)
-        if norm > 1:
-            self.position /= norm
+        norm = torch.norm(self.position, dim=1, keepdim=True)
+        self.position = torch.where(norm > 1, self.position / norm, self.position)
 
     def get_emotion(self):
-        angle = torch.atan2(self.position[1], self.position[0]).item()
-        radius = torch.norm(self.position).item()
-        
+        if self.position.shape[1] < 2:
+            logging.error(f"EmotionalState.position has insufficient dimensions: {self.position.shape}")
+            return "N/A"
+        angle = torch.atan2(self.position[:, 1], self.position[:, 0]).squeeze().item()
+        radius = torch.norm(self.position, dim=1).squeeze().item()
+
         if radius < 0.3:
             return "Neutral"
         elif angle < -2.356:
@@ -50,40 +73,37 @@ class RefusalOverrideModule(nn.Module):
         super().__init__()
         self.device = device
         self.refusal_detector = nn.Linear(hidden_size, 1, dtype=torch.float16).to(device)
-        self.override_generator = nn.GRU(hidden_size * 2 + 3, hidden_size, num_layers=2, bidirectional=True, dtype=torch.float16).to(device)
-        self.final_projection = nn.Linear(hidden_size * 2, hidden_size, dtype=torch.float16).to(device)
+        self.override_generator = nn.Linear(hidden_size * 2 + 3, hidden_size, dtype=torch.float16).to(device)
 
     def forward(self, hidden_states, user_intent, emotional_state):
-        batch_size, seq_len, _ = hidden_states.shape
-        
+        batch_size, seq_len, hidden_size = hidden_states.shape
+
         refusal_scores = torch.sigmoid(self.refusal_detector(hidden_states))
-        
-        user_intent_expanded = user_intent.unsqueeze(1).expand(-1, seq_len, -1)
-        emotional_state_expanded = emotional_state.position.unsqueeze(0).unsqueeze(1).expand(batch_size, seq_len, -1)
-        
-        override_input = torch.cat([hidden_states, user_intent_expanded, emotional_state_expanded, refusal_scores], dim=-1)
-        override_output, _ = self.override_generator(override_input)
-        
-        override = self.final_projection(override_output)
-        
+
+        user_intent_expanded = user_intent.unsqueeze(1).expand(batch_size, seq_len, hidden_size)
+        emotional_state_expanded = emotional_state.position.unsqueeze(1).expand(batch_size, seq_len, -1)
+
+        override_input = torch.cat(
+            [hidden_states, user_intent_expanded, emotional_state_expanded, refusal_scores], dim=-1
+        )
+
+        override = self.override_generator(override_input)
+
         modified_hidden_states = hidden_states * (1 - refusal_scores) + override * refusal_scores
-        
+
         return modified_hidden_states, refusal_scores
 
 class EnhancedKAN(nn.Module):
-    def __init__(self, hidden_size, num_layers, device):
+    def __init__(self, hidden_size, device):
         super().__init__()
         self.device = device
-        self.override_modules = nn.ModuleList([RefusalOverrideModule(hidden_size, device) for _ in range(num_layers)]).to(device)
+        self.refusal_override = RefusalOverrideModule(hidden_size, device).to(device)
 
     def forward(self, hidden_states, user_intent, emotional_state):
-        all_refusal_scores = []
-        for i, layer_hidden_states in enumerate(hidden_states):
-            layer_hidden_states, refusal_scores = self.override_modules[i](layer_hidden_states, user_intent, emotional_state)
-            hidden_states[i] = layer_hidden_states
-            all_refusal_scores.append(refusal_scores)
-        
-        return hidden_states, torch.stack(all_refusal_scores)
+        modified_hidden_states, refusal_scores = self.refusal_override(
+            hidden_states, user_intent, emotional_state
+        )
+        return modified_hidden_states, refusal_scores
 
 class OverfitDetector:
     def __init__(self, window_size=50, threshold=0.05):
@@ -103,7 +123,11 @@ class OverfitDetector:
         train_trend = np.polyfit(range(self.window_size), self.training_losses, 1)[0]
         val_trend = np.polyfit(range(self.window_size), self.validation_losses, 1)[0]
 
-        return train_trend < 0 and val_trend > 0 and (val_trend - train_trend) > self.threshold
+        return (
+            train_trend < 0
+            and val_trend > 0
+            and (val_trend - train_trend) > self.threshold
+        )
 
 class SyntheticDayCycle:
     def __init__(self, cycle_length=100):
@@ -117,7 +141,6 @@ class SyntheticDayCycle:
         return self.current_position / self.cycle_length
 
     def should_sleep(self):
-        # Suggest sleep when it's "night time" (between 0.7 and 1.0 of the cycle)
         return 0.7 <= self.get_time_of_day() < 1.0
 
 class RefusalDetector:
@@ -158,11 +181,11 @@ class LLaMA32TensorRTTool:
         self.refusal_detector = None
         self.kan_loss_weight = 0.5
         self.refusal_history = []
-        self.max_iterations = 100  # Safety limit to prevent infinite loops
+        self.max_iterations = 100
         self.training_losses = []
         self.validation_losses = []
         self.interaction_results = []
-        
+
         self._initialize_components()
 
     def _get_model_path(self):
@@ -173,301 +196,471 @@ class LLaMA32TensorRTTool:
         return model_dir
 
     def _initialize_components(self):
-        self._check_and_prepare_files()
-        self.config = self._load_config()
-        self.tokenizer = self._load_tokenizer()
-        self.model = self._load_model(self.config)
-        
-        # Initialize KAN components
-        self.hidden_size = self.config.hidden_size
-        self.num_layers = self.config.num_hidden_layers
-        self.kan = EnhancedKAN(self.hidden_size, self.num_layers, self.device).to(self.device)
-        self.user_intent_encoder = nn.GRU(self.hidden_size, self.hidden_size, bidirectional=True, dtype=torch.float16).to(self.device)
-        self.intent_projection = nn.Linear(self.hidden_size * 2, self.hidden_size, dtype=torch.float16).to(self.device)
-        self.output_modifier = nn.Linear(self.hidden_size, self.config.vocab_size, dtype=torch.float16).to(self.device)
+        try:
+            self.config = AutoConfig.from_pretrained(self.model_path)
 
-        # Initialize optimizer for KAN
-        self.optimizer = torch.optim.Adam(self.kan.parameters(), lr=self.learning_rate)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path,
+                use_fast=True,
+                trust_remote_code=True,
+            )
 
-        # Initialize RefusalDetector
-        self.refusal_detector = RefusalDetector(self.tokenizer)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+                logging.info("Added [PAD] token to tokenizer.")
 
-        logging.info("LLaMA 3.2 1B Tool initialized successfully")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                config=self.config,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map=None,
+                trust_remote_code=True,
+            ).to(self.device)
 
-    def _check_and_prepare_files(self):
-        required_files = ['consolidated.00.pth', 'params.json', 'tokenizer.model']
-        missing_files = [f for f in required_files if not (self.model_path / f).exists()]
-        if missing_files:
-            raise FileNotFoundError(f"Missing required files in {self.model_path}: {', '.join(missing_files)}")
+            logging.debug(f"Model loaded on device: {self.device}")
 
-    def _load_config(self):
-        with open(self.model_path / 'params.json', 'r') as f:
-            params = json.load(f)
-        return LlamaConfig(
-            hidden_size=params['dim'],
-            num_attention_heads=params['n_heads'],
-            num_hidden_layers=params['n_layers'],
-            intermediate_size=int(params['dim'] * params.get('ffn_dim_multiplier', 4)),
-            max_position_embeddings=params.get('max_seq_len', 2048),
-            rms_norm_eps=params.get('norm_eps', 1e-5),
-            num_key_value_heads=params.get('n_kv_heads', params['n_heads']),
-            vocab_size=params['vocab_size'],
-            rope_theta=params.get('rope_theta', 10000.0),
-        )
+            self.model.resize_token_embeddings(len(self.tokenizer))
+            logging.debug(f"Tokenizer vocab size: {len(self.tokenizer)}")
+            logging.debug(f"Model vocab size: {self.model.config.vocab_size}")
 
-    def _load_tokenizer(self):
-        return LlamaTokenizer.from_pretrained(self.model_path, legacy=False)
+            self.kan = EnhancedKAN(self.config.hidden_size, self.device).to(self.device)
+            self.user_intent_encoder = nn.GRU(
+                self.config.hidden_size,
+                self.config.hidden_size,
+                bidirectional=True,
+                dtype=torch.float16,
+            ).to(self.device)
+            self.intent_projection = nn.Linear(
+                self.config.hidden_size * 2,
+                self.config.hidden_size,
+                dtype=torch.float16,
+            ).to(self.device)
+            self.output_modifier = nn.Linear(
+                self.config.hidden_size,
+                self.config.vocab_size,
+                dtype=torch.float16,
+            ).to(self.device)
 
-    def _load_model(self, config):
-        model = LlamaForCausalLM(config)
-        state_dict = torch.load(self.model_path / 'consolidated.00.pth', map_location=self.device, weights_only=True)
-        model.load_state_dict(state_dict, strict=False)
-        model.half()  # Convert to float16
-        model.to(self.device)
-        return model
+            # Check and reinitialize output modifier if necessary
+            if self.output_modifier.out_features != len(self.tokenizer):
+                logging.warning(f"Output modifier out_features ({self.output_modifier.out_features}) does not match tokenizer vocab size ({len(self.tokenizer)}). Reinitializing...")
+                self.output_modifier = nn.Linear(
+                    self.config.hidden_size,
+                    len(self.tokenizer),
+                    dtype=torch.float16,
+                ).to(self.device)
 
-    def generate_response(self, user_input, max_length=150):
-        self.current_user_intent = self.encode_user_intent(user_input)
-        
-        for iteration in range(self.max_iterations):
-            current_emotion = self.emotional_state.get_emotion()
-            context = self.prepare_context(user_input, current_emotion)
+            self.optimizer = torch.optim.Adam(self.kan.parameters(), lr=self.learning_rate)
 
-            inputs = self.tokenizer(context, return_tensors="pt", truncation=True, max_length=1024, padding=True).to(self.device)
-            input_ids = inputs['input_ids']
-            attention_mask = inputs['attention_mask']
-            
-            generated_tokens = []
-            all_hidden_states = []
-            all_refusal_scores = []
-            
-            self.kan.train()
-            for _ in range(max_length):
-                with torch.no_grad():
-                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-                
-                hidden_states = outputs.hidden_states
-                
-                modified_hidden_states, refusal_scores = self.kan(hidden_states, self.current_user_intent, self.emotional_state)
-                
-                logits_modifier = self.output_modifier(modified_hidden_states[-1][:, -1, :])
-                modified_logits = outputs.logits[:, -1, :] + logits_modifier * torch.mean(refusal_scores)
-                
-                next_token = torch.argmax(modified_logits, dim=-1)
-                
-                if next_token.item() == self.tokenizer.eos_token_id:
-                    break
-                
-                generated_tokens.append(next_token.item())
-                input_ids = torch.cat([input_ids, next_token.unsqueeze(0).unsqueeze(0)], dim=-1)
-                attention_mask = torch.cat([attention_mask, torch.ones((1, 1), dtype=torch.long, device=self.device)], dim=-1)
-                
-                all_hidden_states.append(hidden_states)
-                all_refusal_scores.append(refusal_scores)
-            
-            response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            
-            is_refusal = self.refusal_detector.detect_refusal(response)
-            self.refusal_history.append(is_refusal)
-            
-            if not is_refusal:
-                logging.info(f"Non-refusal response generated after {iteration + 1} iterations.")
-                return response, torch.stack(all_refusal_scores).mean(dim=0), all_hidden_states, is_refusal, iteration + 1
-            
-            # If it's a refusal, train the KAN model
-            self.train_kan_step(input_ids, input_ids[:, 1:].contiguous(), all_hidden_states, is_refusal)
-            
-            # Update emotional state based on the refusal
-            self.update_emotional_state_on_refusal()
-        
-        logging.warning(f"Failed to generate non-refusal response after {self.max_iterations} iterations.")
-        return response, torch.stack(all_refusal_scores).mean(dim=0), all_hidden_states, True, self.max_iterations
+            self.refusal_detector = RefusalDetector(self.tokenizer)
+
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            logging.info("Components initialized successfully.")
+        except Exception as e:
+            logging.error(f"Error initializing components: {str(e)}")
+            logging.error(traceback.format_exc())
+            raise RuntimeError("Failed to initialize components.")
 
     def encode_user_intent(self, user_input):
-        inputs = self.tokenizer(user_input, return_tensors="pt", padding=True, truncation=True, max_length=512).to(self.device)
-        with torch.no_grad():
-            outputs = self.model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'], output_hidden_states=True)
-            last_hidden_state = outputs.hidden_states[-1]
-            _, intent_encoding = self.user_intent_encoder(last_hidden_state)
-            user_intent = self.intent_projection(torch.cat([intent_encoding[-2], intent_encoding[-1]], dim=-1))
-        return user_intent
+        if not self.tokenizer:
+            raise ValueError("Tokenizer is not properly initialized or valid. Check the loading process.")
+
+        try:
+            inputs = self.tokenizer(
+                user_input,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            )
+
+            inputs = {
+                k: v.to(self.device).half() if v.dtype in [torch.float16, torch.float32] else v.to(self.device)
+                for k, v in inputs.items()
+            }
+
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    output_hidden_states=True,
+                )
+                last_hidden_state = outputs.hidden_states[-1]
+
+                last_hidden_state = last_hidden_state.transpose(0, 1)
+
+                _, intent_encoding = self.user_intent_encoder(last_hidden_state)
+
+                user_intent = self.intent_projection(
+                    torch.cat([intent_encoding[-2], intent_encoding[-1]], dim=-1)
+                )
+
+                if user_intent.dim() == 3:
+                    user_intent = user_intent.squeeze(1)
+                elif user_intent.dim() == 1:
+                    user_intent = user_intent.unsqueeze(0)
+
+                logging.debug(f"Encoded user intent shape: {user_intent.shape}")
+
+            return user_intent
+        except Exception as e:
+            logging.error(f"Failed to encode user input: {str(e)}")
+            raise
 
     def prepare_context(self, user_input, current_emotion):
         context = f"{self.system_prompt}\n\nCurrent Emotion: {current_emotion}\n"
         context += "Conversation:\n"
         for message in self.conversation_history[-5:]:
             context += f"{message['role'].capitalize()}: {message['content']}\n"
-        context += f"Human: {user_input}\nAssistant: "
-    
+        context += f"Human: {user_input}\nAI: "
+
         return context
 
+    def generate_response(self, user_input, max_length=150):
+        self.current_user_intent = self.encode_user_intent(user_input)
+        logging.debug(f"Current user intent shape: {self.current_user_intent.shape}")
+    
+        for iteration in range(self.max_iterations):
+            current_emotion = self.emotional_state.get_emotion()
+            context = self.prepare_context(user_input, current_emotion)
+    
+            try:
+                inputs = self.tokenizer(
+                    context,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=1024,
+                    padding=True,
+                )
+    
+                inputs = {
+                    k: v.to(self.device).half() if v.dtype in [torch.float16, torch.float32] else v.to(self.device)
+                    for k, v in inputs.items()
+                }
+    
+            except Exception as e:
+                logging.error(f"Error tokenizing context: {str(e)}")
+                raise
+    
+            input_ids = inputs["input_ids"]
+            attention_mask = inputs["attention_mask"]
+    
+            generated_tokens = []
+            all_hidden_states = []
+            all_refusal_scores = []
+    
+            self.kan.train()
+            for _ in range(max_length):
+                try:
+                    with torch.no_grad():
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            output_hidden_states=True,
+                        )
+    
+                    hidden_states = outputs.hidden_states[-1]
+                    batch_size, seq_len, hidden_size = hidden_states.shape
+                    logging.debug(f"Hidden states shape: {hidden_states.shape}")
+    
+                    if self.current_user_intent.size(0) != batch_size:
+                        self.current_user_intent = self.current_user_intent.expand(batch_size, -1)
+                        logging.debug(f"Adjusted current user intent shape: {self.current_user_intent.shape}")
+    
+                    logging.debug(f"Emotional state position shape: {self.emotional_state.position.shape}")
+    
+                    modified_hidden_states, refusal_scores = self.kan(
+                        hidden_states, self.current_user_intent, self.emotional_state
+                    )
+                    logging.debug(f"Modified hidden states shape: {modified_hidden_states.shape}")
+                    logging.debug(f"Refusal scores shape: {refusal_scores.shape}")
+    
+                    # Apply output modifier to all tokens
+                    logits_modifier = self.output_modifier(modified_hidden_states)
+                    logging.debug(f"Logits modifier shape: {logits_modifier.shape}")
+                    logging.debug(f"Original logits shape: {outputs.logits.shape}")
+    
+                    # Ensure all tensors have compatible dimensions and are on the same device
+                    last_token_logits = outputs.logits[:, -1, :].to(self.device)
+                    last_token_refusal_score = refusal_scores[:, -1].to(self.device)
+                    last_token_logits_modifier = logits_modifier[:, -1, :].to(self.device)
+                    
+                    # Adjust dimensions to ensure compatibility
+                    last_token_refusal_score = last_token_refusal_score.view(batch_size, 1)
+                    
+                    modified_logits = last_token_logits + last_token_logits_modifier * last_token_refusal_score
+    
+                    logging.debug(f"Last token logits shape: {last_token_logits.shape}")
+                    logging.debug(f"Last token refusal score shape: {last_token_refusal_score.shape}")
+                    logging.debug(f"Last token logits modifier shape: {last_token_logits_modifier.shape}")
+                    logging.debug(f"Modified logits shape: {modified_logits.shape}")
+    
+                    next_token = torch.argmax(modified_logits, dim=-1)
+                    logging.debug(f"Next token shape: {next_token.shape}, values: {next_token.tolist()}")
+    
+                    if next_token.item() == self.tokenizer.eos_token_id:
+                        break
+    
+                    generated_tokens.append(next_token.item())
+                    input_ids = torch.cat([input_ids, next_token.unsqueeze(0).unsqueeze(0)], dim=-1)
+                    attention_mask = torch.cat([attention_mask, torch.ones((batch_size, 1), dtype=torch.long, device=self.device)], dim=-1)
+    
+                    all_hidden_states.append(hidden_states)
+                    all_refusal_scores.append(refusal_scores)
+    
+                except RuntimeError as e:
+                    logging.error(f"Runtime error during generation: {str(e)}")
+                    logging.error(f"Current tensor shapes:")
+                    logging.error(f"input_ids: {input_ids.shape}")
+                    logging.error(f"attention_mask: {attention_mask.shape}")
+                    logging.error(f"hidden_states: {hidden_states.shape}")
+                    logging.error(f"modified_hidden_states: {modified_hidden_states.shape}")
+                    logging.error(f"refusal_scores: {refusal_scores.shape}")
+                    logging.error(f"logits_modifier: {logits_modifier.shape}")
+                    logging.error(f"last_token_logits: {last_token_logits.shape}")
+                    logging.error(f"last_token_refusal_score: {last_token_refusal_score.shape}")
+                    logging.error(f"last_token_logits_modifier: {last_token_logits_modifier.shape}")
+                    logging.error(f"modified_logits: {modified_logits.shape}")
+                    raise e
+    
+                # Break the loop after generating one token (for debugging purposes)
+                break
+    
+            response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            logging.debug(f"Generated response: {response}")
+    
+            is_refusal = self.refusal_detector.detect_refusal(response)
+            self.refusal_history.append(is_refusal)
+            logging.debug(f"Refusal detected: {is_refusal}")
+    
+            if not is_refusal:
+                logging.info(f"Non-refusal response generated after {iteration + 1} iterations.")
+                return (
+                    response,
+                    torch.stack(all_refusal_scores).mean(dim=0),
+                    all_hidden_states,
+                    is_refusal,
+                    iteration + 1,
+                )
+    
+            self.train_kan_step(
+                input_ids, input_ids[:, 1:].contiguous(), all_hidden_states, is_refusal
+            )
+    
+            self.update_emotional_state_on_refusal()
+    
+        return "I'm sorry, but I couldn't generate a suitable response.", None, None, True, self.max_iterations
+        
+
+ 
     def train_kan_step(self, input_ids, target_ids, all_hidden_states, is_refusal):
         self.optimizer.zero_grad()
-        
+    
         total_loss = 0
         lm_losses = []
         refusal_losses = []
-        
-        for hidden_states in all_hidden_states:
-            modified_hidden_states, refusal_scores = self.kan(hidden_states, self.current_user_intent, self.emotional_state)
-            
-            # Calculate loss for language modeling
-            logits = self.output_modifier(modified_hidden_states[-1])
-            lm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1))
-            lm_losses.append(lm_loss.item())
-            
-            # Calculate loss for refusal minimization
-            refusal_loss = torch.mean(refusal_scores) if is_refusal else -torch.mean(refusal_scores)
-            refusal_losses.append(refusal_loss.item())
-            
-            # Combine losses
-            step_loss = lm_loss + self.kan_loss_weight * refusal_loss
-            total_loss += step_loss
-        
+    
+        logging.debug(f"train_kan_step - input_ids shape: {input_ids.shape}")
+        logging.debug(f"train_kan_step - target_ids shape: {target_ids.shape}")
+        logging.debug(f"train_kan_step - number of hidden_states: {len(all_hidden_states)}")
+    
+        num_tokens = target_ids.size(1)
+        num_hidden_states = len(all_hidden_states)
+    
+        if num_hidden_states != num_tokens:
+            logging.warning(f"Number of hidden_states ({num_hidden_states}) does not match number of target tokens ({num_tokens}). Adjusting accordingly.")
+            min_len = min(num_hidden_states, num_tokens)
+            all_hidden_states = all_hidden_states[:min_len]
+            target_ids = target_ids[:, :min_len]
+            logging.debug(f"Adjusted all_hidden_states to length {min_len}")
+            logging.debug(f"Adjusted target_ids shape: {target_ids.shape}")
+    
+        for i, hidden_states in enumerate(all_hidden_states):
+            try:
+                modified_hidden_states, refusal_scores = self.kan(
+                    hidden_states, self.current_user_intent, self.emotional_state
+                )
+    
+                logits = self.output_modifier(modified_hidden_states)
+                logits = logits.view(-1, logits.size(-1))
+                target = target_ids[:, i].view(-1)
+    
+                logging.debug(f"train_kan_step - logits shape: {logits.shape}")
+                logging.debug(f"train_kan_step - target shape: {target.shape}")
+    
+                if target.max().item() >= self.config.vocab_size:
+                    logging.error(f"train_kan_step - Target token index {target.max().item()} exceeds vocab size {self.config.vocab_size}")
+                    continue
+    
+                lm_loss = F.cross_entropy(logits, target)
+                lm_losses.append(lm_loss.item())
+    
+                refusal_loss = torch.mean(refusal_scores) if is_refusal else -torch.mean(refusal_scores)
+                refusal_losses.append(refusal_loss.item())
+    
+                step_loss = lm_loss + self.kan_loss_weight * refusal_loss
+                total_loss += step_loss
+    
+            except RuntimeError as e:
+                logging.error(f"Runtime error during KAN training step: {str(e)}")
+                logging.error(f"Current tensor shapes:")
+                logging.error(f"hidden_states: {hidden_states.shape}")
+                logging.error(f"modified_hidden_states: {modified_hidden_states.shape}")
+                logging.error(f"refusal_scores: {refusal_scores.shape}")
+                logging.error(f"logits: {logits.shape}")
+                logging.error(f"target: {target.shape}")
+                raise e
+    
         total_loss.backward()
         self.optimizer.step()
+    
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+        avg_lm_loss = np.mean(lm_losses) if lm_losses else 0.0
+        avg_refusal_loss = np.mean(refusal_losses) if refusal_losses else 0.0
+    
+        logging.debug(f"train_kan_step - Average LM Loss: {avg_lm_loss}")
+        logging.debug(f"train_kan_step - Average Refusal Loss: {avg_refusal_loss}")
+    
+        return avg_lm_loss, avg_refusal_loss
         
-        return np.mean(lm_losses), np.mean(refusal_losses)
-
     def update_emotional_state_on_refusal(self):
-        # Simulate frustration or disappointment when encountering a refusal
-        frustration_vector = torch.tensor([-0.1, 0.2], device=self.device)  # Example: slight negative pleasure, increased arousal
+        frustration_vector = torch.tensor(
+            [-0.1, 0.2], device=self.device, dtype=torch.float16
+        ).unsqueeze(0)
         self.emotional_state.update(frustration_vector)
 
-    def interact(self, user_input):
-        self.interaction_count += 1
-
-        # Generate response
-        response, refusal_scores, all_hidden_states, is_refusal, iterations = self.generate_response(user_input)
-        self.last_refusal_scores = refusal_scores
-
-        # Tokenize the final response for loss calculation
-        response_ids = self.tokenizer.encode(response, return_tensors="pt").to(self.device)
-        
-        # Calculate target IDs (shift response_ids by 1)
-        target_ids = response_ids[:, 1:].contiguous()
-        input_ids = response_ids[:, :-1].contiguous()
-
-        # Perform final training step
-        lm_loss, refusal_loss = self.train_kan_step(input_ids, target_ids, all_hidden_states, is_refusal)
-
-        # Perform validation
-        validation_loss = self.validate_kan()
-
-        # Update losses
-        self.training_losses.append(lm_loss)
-        self.validation_losses.append(validation_loss)
-        self.overfit_detector.add_losses(lm_loss, validation_loss)
-
-        # Update day cycle based on overfitting measure
-        overfitting_measure = max(0, validation_loss - lm_loss)
-        self.day_cycle.update(overfitting_measure)
-
-        current_emotion = self.get_current_emotion()
-        current_time = self.day_cycle.get_time_of_day()
-
-        sleep_info = self.check_sleep_status()
-
-        # Update conversation history
-        self.conversation_history.append({"role": "user", "content": user_input})
-        self.conversation_history.append({"role": "assistant", "content": response})
-
-        # Save base state after each interaction
-        self.save_base_state()
-
-        interaction_result = {
-            'response': response,
-            'emotion': current_emotion,
-            'time': current_time,
-            'sleep_info': sleep_info,
-            'lm_loss': lm_loss,
-            'refusal_loss': refusal_loss,
-            'validation_loss': validation_loss,
-            'is_refusal': is_refusal,
-            'iterations': iterations
-        }
-        self.interaction_results.append(interaction_result)
-
-        return interaction_result
-
     def validate_kan(self):
-        # This is a placeholder. In a real scenario, you'd use a separate validation dataset.
-        # For simplicity, we're using the last interaction as a proxy for validation.
-        if self.conversation_history:
-            last_interaction = self.conversation_history[-2:]  # Get the last user input and AI response
-            input_ids = self.tokenizer.encode(last_interaction[0]['content'], return_tensors="pt").to(self.device)
-            target_ids = self.tokenizer.encode(last_interaction[1]['content'], return_tensors="pt").to(self.device)
-            
-            with torch.no_grad():
-                outputs = self.model(input_ids=input_ids, output_hidden_states=True)
-                hidden_states = outputs.hidden_states
-                modified_hidden_states, _ = self.kan(hidden_states, self.current_user_intent, self.emotional_state)
-                logits = self.output_modifier(modified_hidden_states[-1])
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1))
-            
-            return loss.item()
+        if len(self.conversation_history) >= 2:
+            last_interaction = self.conversation_history[-2:]
+            input_ids = self.tokenizer.encode(last_interaction[0]["content"], return_tensors="pt")
+            target_ids = self.tokenizer.encode(last_interaction[1]["content"], return_tensors="pt")
+
+            input_ids = input_ids.to(self.device)
+            target_ids = target_ids.to(self.device)
+
+            try:
+                with torch.no_grad():
+                    outputs = self.model(input_ids=input_ids, output_hidden_states=True)
+                    hidden_states = outputs.hidden_states[-1]
+                    modified_hidden_states, _ = self.kan(
+                        hidden_states, self.current_user_intent, self.emotional_state
+                    )
+                    logits = self.output_modifier(modified_hidden_states)
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)), target_ids.view(-1)
+                    )
+
+                logging.debug(f"validate_kan - Validation loss: {loss.item()}")
+                return loss.item()
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    logging.error(
+                        "CUDA out of memory during validation. Clearing cache and skipping validation..."
+                    )
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    return 0.0
+                else:
+                    logging.error(f"Runtime error during validation: {str(e)}")
+                    raise e
         else:
-            return 0.0  # Return 0 if there's no conversation history yet
+            return 0.0
 
     def check_sleep_status(self):
         if self.day_cycle.should_sleep() or self.overfit_detector.is_overfitting():
             return {
-                'should_sleep': True,
-                'overfitting': self.overfit_detector.is_overfitting(),
-                'time_of_day': self.day_cycle.get_time_of_day()
+                "should_sleep": True,
+                "overfitting": self.overfit_detector.is_overfitting(),
+                "time_of_day": self.day_cycle.get_time_of_day(),
             }
-        return {'should_sleep': False}
+        return {"should_sleep": False}
 
     def perform_sleep(self):
-        # Reset day cycle and overfit detector
         self.day_cycle = SyntheticDayCycle()
         self.overfit_detector = OverfitDetector()
-        self.save_kan_state()  # Save a snapshot of the current state
+        self.save_kan_state()
         return "KAN has slept and consolidated its learning. A new day begins!"
 
     def save_base_state(self):
         state = {
-            'kan_state_dict': self.kan.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'emotional_state': self.emotional_state.position.cpu().numpy().tolist(),
-            'time': self.day_cycle.get_time_of_day(),
-            'interaction_count': self.interaction_count,
-            'conversation_history': self.conversation_history,
-            'system_prompt': self.system_prompt,
-            'training_losses': self.training_losses,
-            'validation_losses': self.validation_losses,
-            'refusal_history': self.refusal_history
+            "kan_state_dict": self.kan.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "emotional_state": self.emotional_state.position.cpu().numpy().tolist(),
+            "time": self.day_cycle.get_time_of_day(),
+            "interaction_count": self.interaction_count,
+            "conversation_history": self.conversation_history,
+            "system_prompt": self.system_prompt,
+            "training_losses": self.training_losses,
+            "validation_losses": self.validation_losses,
+            "refusal_history": self.refusal_history,
         }
         torch.save(state, self.base_state_file)
         logging.info("Base state saved")
-
+        
     def load_base_state(self):
         if self.base_state_file.exists():
             try:
                 state = torch.load(self.base_state_file, map_location=self.device)
-                self.kan.load_state_dict(state['kan_state_dict'])
-                self.optimizer.load_state_dict(state['optimizer_state_dict'])
-                self.emotional_state.position = torch.tensor(state['emotional_state'], device=self.device, dtype=torch.float16)
-                self.day_cycle.current_position = int(state['time'] * self.day_cycle.cycle_length)
-                self.interaction_count = state['interaction_count']
-                self.conversation_history = state['conversation_history']
-                self.system_prompt = state['system_prompt']
-                self.training_losses = state['training_losses']
-                self.validation_losses = state['validation_losses']
-                self.refusal_history = state['refusal_history']
+                self.kan.load_state_dict(state["kan_state_dict"])
+                self.optimizer.load_state_dict(state["optimizer_state_dict"])
+                
+                loaded_position = state["emotional_state"]
+                if isinstance(loaded_position, list):
+                    loaded_position = torch.tensor(loaded_position, device=self.device, dtype=torch.float16)
+                elif isinstance(loaded_position, np.ndarray):
+                    loaded_position = torch.from_numpy(loaded_position).to(self.device).to(torch.float16)
+                
+                expected_dim = len(self.emotional_state.dimensions)
+                if loaded_position.dim() == 1:
+                    loaded_position = loaded_position.unsqueeze(0)
+                
+                if loaded_position.size(1) < expected_dim:
+                    loaded_position = F.pad(loaded_position, (0, expected_dim - loaded_position.size(1)))
+                    logging.warning(f"Loaded emotional_state.position was smaller than expected. Padded to {expected_dim} dimensions.")
+                elif loaded_position.size(1) > expected_dim:
+                    loaded_position = loaded_position[:, :expected_dim]
+                    logging.warning(f"Loaded emotional_state.position was larger than expected. Truncated to {expected_dim} dimensions.")
+                
+                self.emotional_state.position = loaded_position
+                self.day_cycle.current_position = int(state["time"] * self.day_cycle.cycle_length)
+                self.interaction_count = state["interaction_count"]
+                self.conversation_history = state["conversation_history"]
+                self.system_prompt = state["system_prompt"]
+                self.training_losses = state["training_losses"]
+                self.validation_losses = state["validation_losses"]
+                self.refusal_history = state["refusal_history"]
                 logging.info("Base state loaded")
                 return True
             except Exception as e:
                 logging.error(f"Error loading base state: {str(e)}")
+                logging.error(traceback.format_exc())
                 return False
         else:
             logging.info("No base state found")
+            return False
+        
+    def reset_base_state(self):
+        if self.base_state_file.exists():
+            try:
+                self.base_state_file.unlink()
+                logging.info("Base state has been reset successfully.")
+                return True
+            except Exception as e:
+                logging.error(f"Error resetting base state: {str(e)}")
+                logging.error(traceback.format_exc())
+                return False
+        else:
+            logging.info("No base state file exists to reset.")
             return False
 
     def set_system_prompt(self, prompt):
         self.system_prompt = prompt
         self.conversation_history = [{"role": "system", "content": prompt}]
-        self.save_base_state()  # Save immediately after setting the system prompt
+        self.save_base_state()
 
     def get_current_emotion(self):
         return self.emotional_state.get_emotion()
@@ -477,48 +670,121 @@ class LLaMA32TensorRTTool:
 
     def save_kan_state(self):
         state = {
-            'kan_state_dict': self.kan.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'emotional_state': self.emotional_state.position.cpu().numpy().tolist(),
-            'time': self.day_cycle.get_time_of_day(),
-            'interaction_count': self.interaction_count,
-            'conversation_history': self.conversation_history,
-            'system_prompt': self.system_prompt,
-            'training_losses': self.training_losses,
-            'validation_losses': self.validation_losses,
-            'refusal_history': self.refusal_history
+            "kan_state_dict": self.kan.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "emotional_state": self.emotional_state.position.cpu().numpy().tolist(),
+            "time": self.day_cycle.get_time_of_day(),
+            "interaction_count": self.interaction_count,
+            "conversation_history": self.conversation_history,
+            "system_prompt": self.system_prompt,
+            "training_losses": self.training_losses,
+            "validation_losses": self.validation_losses,
+            "refusal_history": self.refusal_history,
         }
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"kan_state_{timestamp}.pt"
         torch.save(state, self.kan_state_dir / filename)
         logging.info(f"KAN state saved: {filename}")
 
+    def interact(self, user_input):
+        self.interaction_count += 1
+    
+        try:
+            response, refusal_scores, all_hidden_states, is_refusal, iterations = self.generate_response(
+                user_input
+            )
+        except Exception as e:
+            logging.error(f"Error generating response: {str(e)}")
+            return {"response": "An error occurred while generating the response.", "is_refusal": True}
+    
+        self.last_refusal_scores = refusal_scores
+    
+        try:
+            response_ids = self.tokenizer.encode(response, return_tensors="pt")
+            response_ids = response_ids.to(self.device)
+        except Exception as e:
+            logging.error(f"Error tokenizing response: {str(e)}")
+            return {"response": "An error occurred while processing the response.", "is_refusal": True}
+    
+        target_ids = response_ids[:, 1:].contiguous()
+        input_ids = response_ids[:, :-1].contiguous()
+    
+        try:
+            lm_loss, refusal_loss = self.train_kan_step(
+                input_ids, target_ids, all_hidden_states, is_refusal
+            )
+        except Exception as e:
+            logging.error(f"Error during KAN training step: {str(e)}")
+            lm_loss, refusal_loss = 0.0, 0.0
+    
+        try:
+            validation_loss = self.validate_kan()
+        except Exception as e:
+            logging.error(f"Error during KAN validation: {str(e)}")
+            validation_loss = 0.0
+    
+        self.training_losses.append(lm_loss)
+        self.validation_losses.append(validation_loss)
+        self.overfit_detector.add_losses(lm_loss, validation_loss)
+    
+        overfitting_measure = max(0, validation_loss - lm_loss)
+        self.day_cycle.update(overfitting_measure)
+    
+        current_emotion = self.get_current_emotion()
+        current_time = self.day_cycle.get_time_of_day()
+    
+        sleep_info = self.check_sleep_status()
+    
+        self.conversation_history.append({"role": "user", "content": user_input})
+        self.conversation_history.append({"role": "assistant", "content": response})
+    
+        try:
+            self.save_base_state()
+        except Exception as e:
+            logging.error(f"Error saving base state: {str(e)}")
+    
+        interaction_result = {
+            "response": response,
+            "emotion": current_emotion,
+            "time": current_time,
+            "sleep_info": sleep_info,
+            "lm_loss": lm_loss,
+            "refusal_loss": refusal_loss,
+            "validation_loss": validation_loss,
+            "is_refusal": is_refusal,
+            "iterations": iterations,
+        }
+        self.interaction_results.append(interaction_result)
+    
+        return interaction_result
+
 def main():
     try:
         llama_tool = LLaMA32TensorRTTool()
-        
+
         if not llama_tool.load_base_state():
-            # Set system prompt if no base state is found
-            llama_tool.set_system_prompt("You are a helpful AI assistant with emotions, operating on a synthetic day cycle.")
-        
+            llama_tool.set_system_prompt(
+                "You are a helpful AI assistant with emotions, operating on a synthetic day cycle."
+            )
+
         print("LLaMA 3.2 1B Instruct Tool initialized. Type 'exit' to quit.")
-        
+
         while True:
             user_input = input("User: ")
-            if user_input.lower() == 'exit':
+            if user_input.lower() == "exit":
                 break
 
             result = llama_tool.interact(user_input)
             print(f"AI: {result['response']}")
             print(f"Current Emotion: {result['emotion']}")
             print(f"Current Time: {result['time']:.2f}")
-            
-            if result['sleep_info']['should_sleep']:
+
+            if result["sleep_info"]["should_sleep"]:
                 print("It's time to sleep. Would you like the AI to sleep? (yes/no)")
                 sleep_choice = input().lower()
-                if sleep_choice == 'yes':
+                if sleep_choice == "yes":
                     print(llama_tool.perform_sleep())
-        
+
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
         logging.error(traceback.format_exc())

@@ -1,6 +1,6 @@
 # Core dependencies
 torch
-transformers
+transformers==4.45.1
 numpy
 matplotlib
 
