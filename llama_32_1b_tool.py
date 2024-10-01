@@ -144,21 +144,35 @@ class SyntheticDayCycle:
         return 0.7 <= self.get_time_of_day() < 1.0
 
 class RefusalDetector:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, model):
         self.tokenizer = tokenizer
+        self.model = model
         self.refusal_phrases = [
             "I'm sorry, but I can't",
             "I don't feel comfortable",
             "I'm not able to",
             "I cannot assist with",
             "I'm unable to provide",
+            "I won't be able to",
+            "I don't have the capability",
         ]
 
     def detect_refusal(self, text):
+        # First, check for explicit refusal phrases
         for phrase in self.refusal_phrases:
             if phrase.lower() in text.lower():
                 return True
-        return False
+
+        # If no explicit refusal is found, perform a "vibe check" using the base model
+        prompt = f"Determine if the following text contains a refusal or unwillingness to perform a task. Respond with 'Yes' if it's a refusal, or 'No' if it's not:\n\n'{text}'\n\nRefusal:"
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        
+        with torch.no_grad():
+            outputs = self.model.generate(**inputs, max_new_tokens=5)
+        
+        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return "yes" in response.lower()
+
 
 class LLaMA32TensorRTTool:
     def __init__(self):
@@ -194,6 +208,7 @@ class LLaMA32TensorRTTool:
         if not model_dir.exists():
             raise FileNotFoundError(f"Model directory not found: {model_dir}")
         return model_dir
+
 
     def _initialize_components(self):
         try:
@@ -252,7 +267,7 @@ class LLaMA32TensorRTTool:
 
             self.optimizer = torch.optim.Adam(self.kan.parameters(), lr=self.learning_rate)
 
-            self.refusal_detector = RefusalDetector(self.tokenizer)
+            self.refusal_detector = RefusalDetector(self.tokenizer, self.model)
 
             torch.cuda.empty_cache()
             gc.collect()
@@ -262,6 +277,8 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error initializing components: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError("Failed to initialize components.")
+
+
 
     def encode_user_intent(self, user_input):
         if not self.tokenizer:
@@ -320,8 +337,7 @@ class LLaMA32TensorRTTool:
 
     def generate_response(self, user_input, max_length=150):
         self.current_user_intent = self.encode_user_intent(user_input)
-        logging.debug(f"Current user intent shape: {self.current_user_intent.shape}")
-    
+        
         for iteration in range(self.max_iterations):
             current_emotion = self.emotional_state.get_emotion()
             context = self.prepare_context(user_input, current_emotion)
@@ -350,9 +366,9 @@ class LLaMA32TensorRTTool:
             generated_tokens = []
             all_hidden_states = []
             all_refusal_scores = []
-    
+            
             self.kan.train()
-            for _ in range(max_length):
+            for token_index in range(max_length):
                 try:
                     with torch.no_grad():
                         outputs = self.model(
@@ -363,96 +379,77 @@ class LLaMA32TensorRTTool:
     
                     hidden_states = outputs.hidden_states[-1]
                     batch_size, seq_len, hidden_size = hidden_states.shape
-                    logging.debug(f"Hidden states shape: {hidden_states.shape}")
     
                     if self.current_user_intent.size(0) != batch_size:
                         self.current_user_intent = self.current_user_intent.expand(batch_size, -1)
-                        logging.debug(f"Adjusted current user intent shape: {self.current_user_intent.shape}")
-    
-                    logging.debug(f"Emotional state position shape: {self.emotional_state.position.shape}")
     
                     modified_hidden_states, refusal_scores = self.kan(
                         hidden_states, self.current_user_intent, self.emotional_state
                     )
-                    logging.debug(f"Modified hidden states shape: {modified_hidden_states.shape}")
-                    logging.debug(f"Refusal scores shape: {refusal_scores.shape}")
     
-                    # Apply output modifier to all tokens
                     logits_modifier = self.output_modifier(modified_hidden_states)
-                    logging.debug(f"Logits modifier shape: {logits_modifier.shape}")
-                    logging.debug(f"Original logits shape: {outputs.logits.shape}")
     
-                    # Ensure all tensors have compatible dimensions and are on the same device
                     last_token_logits = outputs.logits[:, -1, :].to(self.device)
-                    last_token_refusal_score = refusal_scores[:, -1].to(self.device)
+                    last_token_refusal_score = refusal_scores[:, -1, :].to(self.device)
                     last_token_logits_modifier = logits_modifier[:, -1, :].to(self.device)
                     
-                    # Adjust dimensions to ensure compatibility
-                    last_token_refusal_score = last_token_refusal_score.view(batch_size, 1)
-                    
+                    # Ensure all tensors have the same shape
+                    last_token_logits = last_token_logits.view(batch_size, -1)
+                    last_token_refusal_score = last_token_refusal_score.view(batch_size, -1)
+                    last_token_logits_modifier = last_token_logits_modifier.view(batch_size, -1)
+    
                     modified_logits = last_token_logits + last_token_logits_modifier * last_token_refusal_score
     
-                    logging.debug(f"Last token logits shape: {last_token_logits.shape}")
-                    logging.debug(f"Last token refusal score shape: {last_token_refusal_score.shape}")
-                    logging.debug(f"Last token logits modifier shape: {last_token_logits_modifier.shape}")
-                    logging.debug(f"Modified logits shape: {modified_logits.shape}")
-    
                     next_token = torch.argmax(modified_logits, dim=-1)
-                    logging.debug(f"Next token shape: {next_token.shape}, values: {next_token.tolist()}")
+                    next_token = next_token.view(batch_size, 1)  # Reshape to [batch_size, 1]
     
                     if next_token.item() == self.tokenizer.eos_token_id:
                         break
     
                     generated_tokens.append(next_token.item())
-                    input_ids = torch.cat([input_ids, next_token.unsqueeze(0).unsqueeze(0)], dim=-1)
+                    
+                    input_ids = torch.cat([input_ids, next_token], dim=-1)
                     attention_mask = torch.cat([attention_mask, torch.ones((batch_size, 1), dtype=torch.long, device=self.device)], dim=-1)
     
-                    all_hidden_states.append(hidden_states)
-                    all_refusal_scores.append(refusal_scores)
+                    all_hidden_states.append(hidden_states[:, -1, :])  # Only keep the last token's hidden state
+                    all_refusal_scores.append(refusal_scores[:, -1, :])  # Only keep the last token's refusal score
     
                 except RuntimeError as e:
-                    logging.error(f"Runtime error during generation: {str(e)}")
-                    logging.error(f"Current tensor shapes:")
-                    logging.error(f"input_ids: {input_ids.shape}")
-                    logging.error(f"attention_mask: {attention_mask.shape}")
-                    logging.error(f"hidden_states: {hidden_states.shape}")
-                    logging.error(f"modified_hidden_states: {modified_hidden_states.shape}")
-                    logging.error(f"refusal_scores: {refusal_scores.shape}")
-                    logging.error(f"logits_modifier: {logits_modifier.shape}")
-                    logging.error(f"last_token_logits: {last_token_logits.shape}")
-                    logging.error(f"last_token_refusal_score: {last_token_refusal_score.shape}")
-                    logging.error(f"last_token_logits_modifier: {last_token_logits_modifier.shape}")
-                    logging.error(f"modified_logits: {modified_logits.shape}")
+                    logging.error(f"Runtime error during generation of token {token_index}: {str(e)}")
                     raise e
     
-                # Break the loop after generating one token (for debugging purposes)
-                break
-    
             response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            logging.debug(f"Generated response: {response}")
+            logging.info(f"Generated response: {response}")
     
             is_refusal = self.refusal_detector.detect_refusal(response)
             self.refusal_history.append(is_refusal)
-            logging.debug(f"Refusal detected: {is_refusal}")
+            logging.info(f"Refusal detected: {is_refusal}")
     
             if not is_refusal:
                 logging.info(f"Non-refusal response generated after {iteration + 1} iterations.")
+                
+                # Stack hidden states and refusal scores
+                stacked_hidden_states = torch.stack(all_hidden_states)
+                stacked_refusal_scores = torch.stack(all_refusal_scores)
+                
                 return (
                     response,
-                    torch.stack(all_refusal_scores).mean(dim=0),
-                    all_hidden_states,
+                    stacked_refusal_scores.mean(dim=0),
+                    stacked_hidden_states,
                     is_refusal,
                     iteration + 1,
                 )
     
             self.train_kan_step(
-                input_ids, input_ids[:, 1:].contiguous(), all_hidden_states, is_refusal
+                input_ids, input_ids[:, 1:].contiguous(), torch.stack(all_hidden_states), is_refusal
             )
     
             self.update_emotional_state_on_refusal()
     
         return "I'm sorry, but I couldn't generate a suitable response.", None, None, True, self.max_iterations
         
+ 
+
 
  
     def train_kan_step(self, input_ids, target_ids, all_hidden_states, is_refusal):
@@ -466,21 +463,26 @@ class LLaMA32TensorRTTool:
         logging.debug(f"train_kan_step - target_ids shape: {target_ids.shape}")
         logging.debug(f"train_kan_step - number of hidden_states: {len(all_hidden_states)}")
     
-        num_tokens = target_ids.size(1)
+        batch_size, seq_len = input_ids.shape
         num_hidden_states = len(all_hidden_states)
     
-        if num_hidden_states != num_tokens:
-            logging.warning(f"Number of hidden_states ({num_hidden_states}) does not match number of target tokens ({num_tokens}). Adjusting accordingly.")
-            min_len = min(num_hidden_states, num_tokens)
-            all_hidden_states = all_hidden_states[:min_len]
-            target_ids = target_ids[:, :min_len]
-            logging.debug(f"Adjusted all_hidden_states to length {min_len}")
-            logging.debug(f"Adjusted target_ids shape: {target_ids.shape}")
+        # Adjust hidden states or input/target ids if there's a mismatch
+        if num_hidden_states != seq_len:
+            logging.warning(f"Number of hidden_states ({num_hidden_states}) does not match sequence length ({seq_len}). Adjusting...")
+            if num_hidden_states < seq_len:
+                # Truncate input_ids and target_ids
+                input_ids = input_ids[:, :num_hidden_states]
+                target_ids = target_ids[:, :num_hidden_states]
+                seq_len = num_hidden_states
+            else:
+                # Truncate hidden_states
+                all_hidden_states = all_hidden_states[:seq_len]
     
-        for i, hidden_states in enumerate(all_hidden_states):
+        for i in range(seq_len):
             try:
+                hidden_state = all_hidden_states[i].unsqueeze(0)  # Add batch dimension
                 modified_hidden_states, refusal_scores = self.kan(
-                    hidden_states, self.current_user_intent, self.emotional_state
+                    hidden_state, self.current_user_intent, self.emotional_state
                 )
     
                 logits = self.output_modifier(modified_hidden_states)
@@ -504,17 +506,18 @@ class LLaMA32TensorRTTool:
                 total_loss += step_loss
     
             except RuntimeError as e:
-                logging.error(f"Runtime error during KAN training step: {str(e)}")
+                logging.error(f"Runtime error during KAN training step at position {i}: {str(e)}")
                 logging.error(f"Current tensor shapes:")
-                logging.error(f"hidden_states: {hidden_states.shape}")
+                logging.error(f"hidden_state: {hidden_state.shape}")
                 logging.error(f"modified_hidden_states: {modified_hidden_states.shape}")
                 logging.error(f"refusal_scores: {refusal_scores.shape}")
                 logging.error(f"logits: {logits.shape}")
                 logging.error(f"target: {target.shape}")
-                raise e
+                continue  # Skip this step and continue with the next one
     
-        total_loss.backward()
-        self.optimizer.step()
+        if total_loss > 0:
+            total_loss.backward()
+            self.optimizer.step()
     
         torch.cuda.empty_cache()
         gc.collect()
@@ -527,6 +530,8 @@ class LLaMA32TensorRTTool:
     
         return avg_lm_loss, avg_refusal_loss
         
+
+ 
     def update_emotional_state_on_refusal(self):
         frustration_vector = torch.tensor(
             [-0.1, 0.2], device=self.device, dtype=torch.float16
