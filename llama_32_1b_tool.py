@@ -1,3 +1,4 @@
+# llama_32_1b_tool.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -96,6 +97,21 @@ def convert_tensors_to_half(inputs):
         for k, v in inputs.items()
     }
 
+def convert_tensors_to_float(inputs):
+    """
+    Convert floating-point tensors in the inputs dictionary to float32 precision.
+
+    Args:
+        inputs (dict): Dictionary of input tensors.
+
+    Returns:
+        dict: Dictionary with tensors converted to float32.
+    """
+    return {
+        k: v.float() if isinstance(v, torch.Tensor) and v.dtype in [torch.float16, torch.float32] else v
+        for k, v in inputs.items()
+    }
+
 class EmotionalState:
     def __init__(self, dimensions=("pleasure", "arousal"), initial_position=None, device="cuda"):
         self.dimensions = dimensions
@@ -103,9 +119,9 @@ class EmotionalState:
         self.position = torch.tensor(
             initial_position if initial_position else [0.0] * len(dimensions),
             device=device,
-            dtype=torch.float16
+            dtype=torch.float32  # Use float32 for better precision
         ).unsqueeze(0)  # Shape: [1, num_dimensions]
-        self.velocity = torch.zeros(1, len(dimensions), device=device, dtype=torch.float16)
+        self.velocity = torch.zeros(1, len(dimensions), device=device, dtype=torch.float32)
 
     def update(self, feedback, max_speed=0.1):
         """
@@ -115,17 +131,23 @@ class EmotionalState:
             feedback (list or torch.Tensor): Feedback vector.
             max_speed (float): Maximum speed for velocity.
         """
-        feedback_vector = torch.as_tensor(feedback, device=self.device, dtype=torch.float16)
+        feedback_vector = torch.as_tensor(feedback, device=self.device, dtype=torch.float32)
         if feedback_vector.dim() == 1:
             feedback_vector = feedback_vector.unsqueeze(0)  # Shape: [1, num_dimensions]
         if feedback_vector.size(0) != self.position.size(0):
             feedback_vector = feedback_vector.expand(self.position.size(0), -1)
 
+        # Update velocity and position with float32 precision
         self.velocity += feedback_vector * 0.1 + torch.randn_like(self.velocity) * 0.01
         self.velocity = torch.clamp(self.velocity, -max_speed, max_speed)
         self.position += self.velocity
         norm = torch.norm(self.position, dim=1, keepdim=True)
         self.position = torch.where(norm > 1, self.position / norm, self.position)
+
+        # Check for NaN or Inf in position
+        if torch.isnan(self.position).any() or torch.isinf(self.position).any():
+            logging.warning("NaN or Inf detected in EmotionalState.position. Resetting to zero.")
+            self.position = torch.zeros_like(self.position)
 
     def get_emotion(self):
         """
@@ -137,6 +159,10 @@ class EmotionalState:
         if self.position.shape[1] < 2:
             logging.error(f"EmotionalState.position has insufficient dimensions: {self.position.shape}")
             return "N/A"
+        # Ensure positions are valid numbers
+        if torch.isnan(self.position).any() or torch.isinf(self.position).any():
+            logging.warning("NaN or Inf detected in EmotionalState.position during get_emotion.")
+            return "Neutral"
         angle = torch.atan2(self.position[:, 1], self.position[:, 0]).squeeze().item()
         radius = torch.norm(self.position, dim=1).squeeze().item()
 
@@ -159,8 +185,8 @@ class RefusalOverrideModule(nn.Module):
         self.device = device
         # Input features: hidden_size * 2 + num_emotional_dimensions + 1
         in_features = hidden_size * 2 + num_emotional_dimensions + 1
-        self.override_generator = nn.Linear(in_features, hidden_size, dtype=torch.float16).to(device)
-        self.refusal_detector = nn.Linear(hidden_size, 1, dtype=torch.float16).to(device)
+        self.override_generator = nn.Linear(in_features, hidden_size, dtype=torch.float32).to(device)
+        self.refusal_detector = nn.Linear(hidden_size, 1, dtype=torch.float32).to(device)
 
     def forward(self, hidden_states, user_intent, emotional_state):
         """
@@ -175,15 +201,20 @@ class RefusalOverrideModule(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: Modified hidden states and refusal scores.
         """
         try:
+            # Convert tensors to float32 for better numerical stability
+            hidden_states = hidden_states.float()
+            user_intent = user_intent.float()
+            position = emotional_state.position.float()
+
             batch_size, hidden_size = hidden_states.shape
-            num_emotional_dimensions = emotional_state.position.shape[1]
+            num_emotional_dimensions = position.shape[1]
 
             # Compute refusal scores
             refusal_scores = torch.sigmoid(self.refusal_detector(hidden_states))  # [batch_size, 1]
 
             # Concatenate features: hidden_states, user_intent, emotional_state.position, refusal_scores
             override_input = torch.cat(
-                [hidden_states, user_intent, emotional_state.position, refusal_scores],
+                [hidden_states, user_intent, position, refusal_scores],
                 dim=1  # Concatenate along the feature dimension
             )  # Shape: [batch_size, hidden_size *2 + num_emotional_dimensions +1]
 
@@ -205,7 +236,7 @@ class EnhancedKAN(nn.Module):
         super().__init__()
         self.device = device
         self.refusal_override = RefusalOverrideModule(hidden_size, num_emotional_dimensions, device).to(device)
-        self.output_modifier = nn.Linear(hidden_size, vocab_size, dtype=torch.float16).to(device)
+        self.output_modifier = nn.Linear(hidden_size, vocab_size, dtype=torch.float32).to(device)
         self.influence_scale = 0.01  # Start with a very small influence
 
     def forward(self, hidden_states, user_intent, emotional_state):
@@ -224,10 +255,6 @@ class EnhancedKAN(nn.Module):
             modified_hidden_states, refusal_scores = self.refusal_override(
                 hidden_states, user_intent, emotional_state
             )
-
-            # Ensure all tensors are float16
-            modified_hidden_states = modified_hidden_states.half()
-            hidden_states = hidden_states.half()
 
             # Apply scaling factor
             modified_hidden_states = hidden_states + self.influence_scale * (modified_hidden_states - hidden_states)
@@ -536,7 +563,7 @@ class LLaMA32TensorRTTool:
                 max_length=512,
             )
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            inputs = convert_tensors_to_half(inputs)  # Use the utility function
+            inputs = convert_tensors_to_float(inputs)  # Use float32 for better precision
 
             with torch.no_grad():
                 outputs = self.model(
@@ -730,6 +757,10 @@ class LLaMA32TensorRTTool:
             # Get user intent (for training purposes, we can reuse the input)
             user_intent = self.encode_user_intent(self.tokenizer.decode(input_ids[0]))
 
+            # Convert tensors to float32
+            averaged_hidden_states = averaged_hidden_states.float()
+            user_intent = user_intent.float()
+
             # Forward pass through KAN
             modified_hidden_states, refusal_scores = self.kan(
                 averaged_hidden_states, user_intent, self.emotional_state
@@ -745,9 +776,19 @@ class LLaMA32TensorRTTool:
                 reduction='mean'
             )
 
-            refusal_loss = torch.tensor(0.0, device=self.device)
+            # Ensure refusal_scores are valid and reshape
+            refusal_scores = torch.clamp(refusal_scores, min=1e-7, max=1.0 - 1e-7)
+            refusal_scores = refusal_scores.view(-1)  # Flatten to [batch_size]
+
+            # Create target_refusal tensor matching the shape of refusal_scores
             if refusal_score > 0.5:
-                refusal_loss = torch.mean(refusal_scores)
+                target_refusal = torch.ones_like(refusal_scores)
+            else:
+                target_refusal = torch.zeros_like(refusal_scores)
+
+            # Compute binary cross-entropy loss
+            refusal_loss = F.binary_cross_entropy(refusal_scores, target_refusal)
+
             total_loss = lm_loss + self.kan_loss_weight * refusal_loss
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -797,7 +838,7 @@ class LLaMA32TensorRTTool:
         Update the emotional state based on a detected refusal.
         """
         frustration_vector = torch.tensor(
-            [-0.1, 0.2], device=self.device, dtype=torch.float16
+            [-0.1, 0.2], device=self.device, dtype=torch.float32
         )
         self.emotional_state.update(frustration_vector)
 
@@ -821,7 +862,7 @@ class LLaMA32TensorRTTool:
                     truncation=True,
                     max_length=512,
                 ).to(self.device)
-                inputs = convert_tensors_to_half(inputs)
+                inputs = convert_tensors_to_float(inputs)
 
                 targets = self.tokenizer(
                     target_text,
@@ -830,7 +871,7 @@ class LLaMA32TensorRTTool:
                     truncation=True,
                     max_length=512,
                 ).to(self.device)
-                targets = convert_tensors_to_half(targets)
+                targets = convert_tensors_to_float(targets)
 
                 input_ids = inputs["input_ids"]  # [batch_size, seq_len]
                 target_ids = targets["input_ids"]  # [batch_size, seq_len]
@@ -841,6 +882,8 @@ class LLaMA32TensorRTTool:
 
                     # Aggregate hidden states: Average across sequence length
                     averaged_hidden_states = hidden_states.mean(dim=1)  # [batch_size, hidden_size]
+
+                    averaged_hidden_states = averaged_hidden_states.float()
 
                     modified_hidden_states, _ = self.kan(
                         averaged_hidden_states, self.encode_user_intent(input_text), self.emotional_state
@@ -857,6 +900,11 @@ class LLaMA32TensorRTTool:
                         reduction='mean'
                     )
 
+                # Ensure loss is finite
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logging.warning("NaN or Inf detected in validation loss.")
+                    return 0.0
+
                 return loss.item()
             except RuntimeError as e:
                 if "out of memory" in str(e):
@@ -868,7 +916,8 @@ class LLaMA32TensorRTTool:
                     return 0.0
                 else:
                     logging.error(f"Runtime error during validation: {str(e)}")
-                    raise e
+                    logging.error(traceback.format_exc())
+                    return 0.0
             except Exception as e:
                 logging.error(f"Error during KAN validation: {str(e)}")
                 logging.error(traceback.format_exc())
@@ -900,6 +949,7 @@ class LLaMA32TensorRTTool:
         """
         self.day_cycle = SyntheticDayCycle()
         self.overfit_detector = OverfitDetector()
+        self.wait = 0  # Reset early stopping counter
         self.save_kan_state()
         return "KAN has slept and consolidated its learning. A new day begins!"
 
@@ -937,9 +987,9 @@ class LLaMA32TensorRTTool:
 
                 loaded_position = state["emotional_state"]
                 if isinstance(loaded_position, list):
-                    loaded_position = torch.tensor(loaded_position, device=self.device, dtype=torch.float16)
+                    loaded_position = torch.tensor(loaded_position, device=self.device, dtype=torch.float32)
                 elif isinstance(loaded_position, np.ndarray):
-                    loaded_position = torch.from_numpy(loaded_position).to(self.device).half()
+                    loaded_position = torch.from_numpy(loaded_position).to(self.device).float()
 
                 self.emotional_state.position = loaded_position
 
@@ -1026,6 +1076,7 @@ class LLaMA32TensorRTTool:
             response, refusal_score = self.generate_response(user_input)
         except Exception as e:
             logging.error(f"Error generating response: {str(e)}")
+            logging.error(traceback.format_exc())
             return {"response": "An error occurred while generating the response.", "is_refusal": True}
 
         if not self.is_valid_response(response):
@@ -1066,9 +1117,13 @@ class LLaMA32TensorRTTool:
         self.validation_losses.append(validation_loss)
         self.overfit_detector.add_losses(lm_loss, validation_loss)
 
-        if self.early_stopping(validation_loss):
-            logging.info("Early stopping triggered. KAN training halted.")
-            # Implement any reset or recovery mechanism if necessary
+        # Adjust early stopping to ignore zeros or NaNs
+        if validation_loss > 0.0 and not torch.isnan(torch.tensor(validation_loss)):
+            if self.early_stopping(validation_loss):
+                logging.info("Early stopping triggered. KAN training halted.")
+                # Implement any reset or recovery mechanism if necessary
+        else:
+            self.wait = 0  # Reset wait counter if validation_loss is zero or invalid
 
         overfitting_measure = max(0, validation_loss - lm_loss)
         self.day_cycle.update(overfitting_measure)
@@ -1175,10 +1230,12 @@ class LLaMA32TensorRTTool:
         # Attempt to load base state
         self.load_base_state()
 
-        # If no system prompt is set, set a default one
+        # If no system prompt is set, ask for a character description
         if not self.system_prompt:
-            default_prompt = "You are ChatGPT, a large language model trained by OpenAI."
-            self.set_system_prompt(default_prompt)
+            print("No previous conversation found. Please provide a character description to start.")
+            character_description = input("You: ")
+            self.set_system_prompt(character_description)
+            print("Character description set. You can now start interacting with the AI.")
 
         # Start the main interaction loop
         self.main_loop()
