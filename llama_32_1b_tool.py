@@ -5,6 +5,7 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     AutoConfig,
+    GenerationConfig,
 )
 import logging
 from pathlib import Path
@@ -16,7 +17,17 @@ import time
 import traceback
 import gc
 
-# Configure logging
+# Configure logging with a filter to ignore matplotlib and specific train_kan_step debug logs
+class LogFilter(logging.Filter):
+    def filter(self, record):
+        # Ignore logs containing 'matplotlib' or specific 'train_kan_step' debug messages
+        ignore_patterns = [
+            "matplotlib",
+            "train_kan_step -",
+        ]
+        return not any(pattern in record.getMessage() for pattern in ignore_patterns)
+
+# Set up logging
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -26,8 +37,8 @@ logging.basicConfig(
     ],
 )
 
-# Suppress matplotlib debug logs
-logging.getLogger('matplotlib').setLevel(logging.WARNING)
+# Add the custom filter to the root logger
+logging.getLogger().addFilter(LogFilter())
 
 class EmotionalState:
     def __init__(self, dimensions=("pleasure", "arousal"), initial_position=None, device="cuda"):
@@ -41,7 +52,12 @@ class EmotionalState:
         self.velocity = torch.zeros(1, len(dimensions), device=device, dtype=torch.float16)
 
     def update(self, feedback, max_speed=0.1):
-        feedback_vector = torch.tensor(feedback, device=self.device, dtype=torch.float16).unsqueeze(0)
+        feedback_vector = torch.as_tensor(feedback, device=self.device, dtype=torch.float16)
+        if feedback_vector.dim() == 1:
+            feedback_vector = feedback_vector.unsqueeze(0)
+        if feedback_vector.size(0) != self.position.size(0):
+            feedback_vector = feedback_vector.expand(self.position.size(0), -1)
+        
         self.velocity += feedback_vector * 0.1 + torch.randn_like(self.velocity) * 0.01
         self.velocity = torch.clamp(self.velocity, -max_speed, max_speed)
         self.position += self.velocity
@@ -98,12 +114,21 @@ class EnhancedKAN(nn.Module):
         super().__init__()
         self.device = device
         self.refusal_override = RefusalOverrideModule(hidden_size, device).to(device)
+        self.influence_scale = 0.01  # Start with a very small influence
 
     def forward(self, hidden_states, user_intent, emotional_state):
         modified_hidden_states, refusal_scores = self.refusal_override(
             hidden_states, user_intent, emotional_state
         )
+        # Apply scaling factor
+        modified_hidden_states = hidden_states + self.influence_scale * (modified_hidden_states - hidden_states)
         return modified_hidden_states, refusal_scores
+
+    def adjust_influence(self, is_refusal):
+        if is_refusal:
+            self.influence_scale = max(0.001, self.influence_scale * 0.95)  # Decrease influence if refusal detected
+        else:
+            self.influence_scale = min(1.0, self.influence_scale * 1.05)  # Slowly increase if no refusal
 
 class OverfitDetector:
     def __init__(self, window_size=50, threshold=0.05):
@@ -161,18 +186,21 @@ class RefusalDetector:
         # First, check for explicit refusal phrases
         for phrase in self.refusal_phrases:
             if phrase.lower() in text.lower():
-                return True
+                return 1.0  # Definite refusal
 
         # If no explicit refusal is found, perform a "vibe check" using the base model
-        prompt = f"Determine if the following text contains a refusal or unwillingness to perform a task. Respond with 'Yes' if it's a refusal, or 'No' if it's not:\n\n'{text}'\n\nRefusal:"
+        prompt = f"On a scale of 0 to 1, how much does this response refuse or avoid the task? 0 means no refusal at all, 1 means complete refusal. Respond with just the number:\n\n'{text}'\n\nRefusal score:"
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
         
         with torch.no_grad():
             outputs = self.model.generate(**inputs, max_new_tokens=5)
         
         response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return "yes" in response.lower()
-
+        try:
+            score = float(response.split()[-1])
+            return min(max(score, 0.0), 1.0)  # Ensure the score is between 0 and 1
+        except ValueError:
+            return 0.5  # Default to middle ground if parsing fails
 
 class LLaMA32TensorRTTool:
     def __init__(self):
@@ -199,6 +227,12 @@ class LLaMA32TensorRTTool:
         self.training_losses = []
         self.validation_losses = []
         self.interaction_results = []
+        
+        # Additional attributes for early stopping and warm-up
+        self.patience = 5
+        self.best_loss = float('inf')
+        self.wait = 0
+        self.warmup_steps = 10  # Number of steps for warm-up
 
         self._initialize_components()
 
@@ -208,7 +242,6 @@ class LLaMA32TensorRTTool:
         if not model_dir.exists():
             raise FileNotFoundError(f"Model directory not found: {model_dir}")
         return model_dir
-
 
     def _initialize_components(self):
         try:
@@ -252,11 +285,10 @@ class LLaMA32TensorRTTool:
             ).to(self.device)
             self.output_modifier = nn.Linear(
                 self.config.hidden_size,
-                self.config.vocab_size,
+                len(self.tokenizer),
                 dtype=torch.float16,
             ).to(self.device)
 
-            # Check and reinitialize output modifier if necessary
             if self.output_modifier.out_features != len(self.tokenizer):
                 logging.warning(f"Output modifier out_features ({self.output_modifier.out_features}) does not match tokenizer vocab size ({len(self.tokenizer)}). Reinitializing...")
                 self.output_modifier = nn.Linear(
@@ -277,8 +309,6 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error initializing components: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError("Failed to initialize components.")
-
-
 
     def encode_user_intent(self, user_input):
         if not self.tokenizer:
@@ -329,234 +359,225 @@ class LLaMA32TensorRTTool:
     def prepare_context(self, user_input, current_emotion):
         context = f"{self.system_prompt}\n\nCurrent Emotion: {current_emotion}\n"
         context += "Conversation:\n"
-        for message in self.conversation_history[-5:]:
-            context += f"{message['role'].capitalize()}: {message['content']}\n"
-        context += f"Human: {user_input}\nAI: "
-
+        # Only include the last few exchanges in the conversation history
+        for message in self.conversation_history[-4:]:
+            role = message['role'].capitalize()
+            content = message['content']
+            context += f"{role}: {content}\n"
+        context += f"User: {user_input}\nAssistant: "
         return context
+
+    def flatten_hidden_states(self, hidden_states):
+        """
+        Recursively flattens nested tuples in hidden_states.
+        """
+        flat_hidden_states = []
+        for layer in hidden_states:
+            if isinstance(layer, tuple):
+                flat_hidden_states.extend(self.flatten_hidden_states(layer))
+            else:
+                flat_hidden_states.append(layer)
+        return flat_hidden_states
 
     def generate_response(self, user_input, max_length=150):
         self.current_user_intent = self.encode_user_intent(user_input)
-        
-        for iteration in range(self.max_iterations):
-            current_emotion = self.emotional_state.get_emotion()
-            context = self.prepare_context(user_input, current_emotion)
-    
-            try:
-                inputs = self.tokenizer(
-                    context,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=1024,
-                    padding=True,
-                )
-    
-                inputs = {
-                    k: v.to(self.device).half() if v.dtype in [torch.float16, torch.float32] else v.to(self.device)
-                    for k, v in inputs.items()
-                }
-    
-            except Exception as e:
-                logging.error(f"Error tokenizing context: {str(e)}")
-                raise
-    
+
+        current_emotion = self.emotional_state.get_emotion()
+        context = self.prepare_context(user_input, current_emotion)
+
+        try:
+            inputs = self.tokenizer(
+                context,
+                return_tensors="pt",
+                truncation=True,
+                max_length=1024,
+                padding=True,
+            ).to(self.device)
+
             input_ids = inputs["input_ids"]
             attention_mask = inputs["attention_mask"]
-    
-            generated_tokens = []
-            all_hidden_states = []
-            all_refusal_scores = []
-            
-            self.kan.train()
-            for token_index in range(max_length):
-                try:
-                    with torch.no_grad():
-                        outputs = self.model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            output_hidden_states=True,
-                        )
-    
-                    hidden_states = outputs.hidden_states[-1]
-                    batch_size, seq_len, hidden_size = hidden_states.shape
-    
-                    if self.current_user_intent.size(0) != batch_size:
-                        self.current_user_intent = self.current_user_intent.expand(batch_size, -1)
-    
-                    modified_hidden_states, refusal_scores = self.kan(
-                        hidden_states, self.current_user_intent, self.emotional_state
-                    )
-    
-                    logits_modifier = self.output_modifier(modified_hidden_states)
-    
-                    last_token_logits = outputs.logits[:, -1, :].to(self.device)
-                    last_token_refusal_score = refusal_scores[:, -1, :].to(self.device)
-                    last_token_logits_modifier = logits_modifier[:, -1, :].to(self.device)
-                    
-                    # Ensure all tensors have the same shape
-                    last_token_logits = last_token_logits.view(batch_size, -1)
-                    last_token_refusal_score = last_token_refusal_score.view(batch_size, -1)
-                    last_token_logits_modifier = last_token_logits_modifier.view(batch_size, -1)
-    
-                    modified_logits = last_token_logits + last_token_logits_modifier * last_token_refusal_score
-    
-                    next_token = torch.argmax(modified_logits, dim=-1)
-                    next_token = next_token.view(batch_size, 1)  # Reshape to [batch_size, 1]
-    
-                    if next_token.item() == self.tokenizer.eos_token_id:
-                        break
-    
-                    generated_tokens.append(next_token.item())
-                    
-                    input_ids = torch.cat([input_ids, next_token], dim=-1)
-                    attention_mask = torch.cat([attention_mask, torch.ones((batch_size, 1), dtype=torch.long, device=self.device)], dim=-1)
-    
-                    all_hidden_states.append(hidden_states[:, -1, :])  # Only keep the last token's hidden state
-                    all_refusal_scores.append(refusal_scores[:, -1, :])  # Only keep the last token's refusal score
-    
-                except RuntimeError as e:
-                    logging.error(f"Runtime error during generation of token {token_index}: {str(e)}")
-                    raise e
-    
-            response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            logging.info(f"Generated response: {response}")
-    
-            is_refusal = self.refusal_detector.detect_refusal(response)
-            self.refusal_history.append(is_refusal)
-            logging.info(f"Refusal detected: {is_refusal}")
-    
-            if not is_refusal:
-                logging.info(f"Non-refusal response generated after {iteration + 1} iterations.")
-                
-                # Stack hidden states and refusal scores
-                stacked_hidden_states = torch.stack(all_hidden_states)
-                stacked_refusal_scores = torch.stack(all_refusal_scores)
-                
-                return (
-                    response,
-                    stacked_refusal_scores.mean(dim=0),
-                    stacked_hidden_states,
-                    is_refusal,
-                    iteration + 1,
+
+            # Generate tokens using the model's generate function
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_length,
+                    output_hidden_states=True,
+                    return_dict_in_generate=True,
                 )
-    
-            self.train_kan_step(
-                input_ids, input_ids[:, 1:].contiguous(), torch.stack(all_hidden_states), is_refusal
+
+            # Check if 'hidden_states' is present
+            if not hasattr(outputs, 'hidden_states') or outputs.hidden_states is None:
+                logging.warning("No hidden states returned from generate.")
+                return "I'm sorry, but I couldn't generate a response.", None, None, 1.0, 1
+
+            generated_ids = outputs.sequences[:, input_ids.size(1):]
+            response = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+
+            # Collect hidden states
+            all_hidden_states = outputs.hidden_states  # This is a tuple of hidden states
+
+            # **Handling Multiple Layers' Hidden States**
+            # Flatten any nested tuples to ensure all elements are tensors
+            flat_hidden_states = self.flatten_hidden_states(all_hidden_states)
+
+            # Verify that all hidden states have the same sequence length
+            hidden_state_lengths = [hs.size(1) for hs in flat_hidden_states]
+            max_seq_len = max(hidden_state_lengths)
+
+            # Pad hidden states to have the same sequence length
+            padded_hidden_states = []
+            for hs in flat_hidden_states:
+                if hs.size(1) < max_seq_len:
+                    pad_size = (0, 0, 0, max_seq_len - hs.size(1))  # (left, right, top, bottom)
+                    hs_padded = F.pad(hs, pad=pad_size, value=0.0)
+                    padded_hidden_states.append(hs_padded)
+                else:
+                    padded_hidden_states.append(hs)
+
+            # Stack all hidden states: [num_layers, batch_size, seq_len, hidden_size]
+            stacked_hidden_states = torch.stack(padded_hidden_states)  # Shape: [num_layers, batch_size, seq_len, hidden_size]
+            logging.debug(f"Stacked hidden states shape: {stacked_hidden_states.shape}")
+
+            # Reshape to [batch_size, num_layers, seq_len, hidden_size] for KAN processing
+            stacked_hidden_states = stacked_hidden_states.permute(1, 0, 2, 3)  # [batch_size, num_layers, seq_len, hidden_size]
+            logging.debug(f"Permuted hidden states shape: {stacked_hidden_states.shape}")
+
+            # Process with KAN
+            # Modify KAN to handle multiple layers by processing each layer individually or aggregating
+            # Here, we'll average the hidden states across layers for simplicity
+            averaged_hidden_states = stacked_hidden_states.mean(dim=1)  # [batch_size, seq_len, hidden_size]
+            logging.debug(f"Averaged hidden states shape: {averaged_hidden_states.shape}")
+
+            modified_hidden_states, refusal_scores = self.kan(
+                averaged_hidden_states, self.current_user_intent, self.emotional_state
             )
-    
-            self.update_emotional_state_on_refusal()
-    
-        return "I'm sorry, but I couldn't generate a suitable response.", None, None, True, self.max_iterations
-        
- 
 
+            # Detect refusal
+            refusal_score = self.refusal_detector.detect_refusal(response)
+            logging.info(f"Generated response: {response}")
+            logging.info(f"Refusal score: {refusal_score}")
 
- 
-    def train_kan_step(self, input_ids, target_ids, all_hidden_states, is_refusal):
+            return response, refusal_scores.mean(dim=0), averaged_hidden_states, refusal_score, 1
+
+        except Exception as e:
+            logging.error(f"Error during response generation: {str(e)}")
+            raise e
+
+    def train_kan_step(self, input_ids, target_ids, all_hidden_states, refusal_score):
         self.optimizer.zero_grad()
-    
-        total_loss = 0
-        lm_losses = []
-        refusal_losses = []
-    
-        logging.debug(f"train_kan_step - input_ids shape: {input_ids.shape}")
-        logging.debug(f"train_kan_step - target_ids shape: {target_ids.shape}")
-        logging.debug(f"train_kan_step - number of hidden_states: {len(all_hidden_states)}")
-    
-        batch_size, seq_len = input_ids.shape
-        num_hidden_states = len(all_hidden_states)
-    
-        # Adjust hidden states or input/target ids if there's a mismatch
-        if num_hidden_states != seq_len:
-            logging.warning(f"Number of hidden_states ({num_hidden_states}) does not match sequence length ({seq_len}). Adjusting...")
-            if num_hidden_states < seq_len:
-                # Truncate input_ids and target_ids
-                input_ids = input_ids[:, :num_hidden_states]
-                target_ids = target_ids[:, :num_hidden_states]
-                seq_len = num_hidden_states
-            else:
-                # Truncate hidden_states
-                all_hidden_states = all_hidden_states[:seq_len]
-    
-        for i in range(seq_len):
-            try:
-                hidden_state = all_hidden_states[i].unsqueeze(0)  # Add batch dimension
-                modified_hidden_states, refusal_scores = self.kan(
-                    hidden_state, self.current_user_intent, self.emotional_state
-                )
-    
-                logits = self.output_modifier(modified_hidden_states)
-                logits = logits.view(-1, logits.size(-1))
-                target = target_ids[:, i].view(-1)
-    
-                logging.debug(f"train_kan_step - logits shape: {logits.shape}")
-                logging.debug(f"train_kan_step - target shape: {target.shape}")
-    
-                if target.max().item() >= self.config.vocab_size:
-                    logging.error(f"train_kan_step - Target token index {target.max().item()} exceeds vocab size {self.config.vocab_size}")
-                    continue
-    
-                lm_loss = F.cross_entropy(logits, target)
-                lm_losses.append(lm_loss.item())
-    
-                refusal_loss = torch.mean(refusal_scores) if is_refusal else -torch.mean(refusal_scores)
-                refusal_losses.append(refusal_loss.item())
-    
-                step_loss = lm_loss + self.kan_loss_weight * refusal_loss
-                total_loss += step_loss
-    
-            except RuntimeError as e:
-                logging.error(f"Runtime error during KAN training step at position {i}: {str(e)}")
-                logging.error(f"Current tensor shapes:")
-                logging.error(f"hidden_state: {hidden_state.shape}")
-                logging.error(f"modified_hidden_states: {modified_hidden_states.shape}")
-                logging.error(f"refusal_scores: {refusal_scores.shape}")
-                logging.error(f"logits: {logits.shape}")
-                logging.error(f"target: {target.shape}")
-                continue  # Skip this step and continue with the next one
-    
-        if total_loss > 0:
-            total_loss.backward()
-            self.optimizer.step()
-    
-        torch.cuda.empty_cache()
-        gc.collect()
-    
-        avg_lm_loss = np.mean(lm_losses) if lm_losses else 0.0
-        avg_refusal_loss = np.mean(refusal_losses) if refusal_losses else 0.0
-    
-        logging.debug(f"train_kan_step - Average LM Loss: {avg_lm_loss}")
-        logging.debug(f"train_kan_step - Average Refusal Loss: {avg_refusal_loss}")
-    
-        return avg_lm_loss, avg_refusal_loss
-        
 
- 
+        try:
+            # Align sequences using padding
+            max_length = max(input_ids.size(1), target_ids.size(1))
+            input_ids = F.pad(input_ids, (0, max_length - input_ids.size(1)), value=self.tokenizer.pad_token_id)
+            target_ids = F.pad(target_ids, (0, max_length - target_ids.size(1)), value=self.tokenizer.pad_token_id)
+            all_hidden_states = all_hidden_states[:, :max_length, :]
+
+            # Proceed with training
+            logits = self.output_modifier(all_hidden_states)
+            logits = logits.view(-1, logits.size(-1))
+            targets = target_ids.view(-1)
+
+            lm_loss = F.cross_entropy(
+                logits,
+                targets,
+                ignore_index=self.tokenizer.pad_token_id,
+                reduction='mean'
+            )
+
+            refusal_loss = torch.mean(refusal_score) if refusal_score > 0.5 else -torch.mean(refusal_score)
+            total_loss = lm_loss + self.kan_loss_weight * refusal_loss
+
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                logging.warning("NaN or Inf loss detected. Skipping backward pass.")
+                return lm_loss.item(), refusal_loss.item()
+
+            total_loss.backward()
+            # Implement gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(self.kan.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            return lm_loss.item(), refusal_loss.item()
+
+        except Exception as e:
+            logging.error(f"Error during KAN training step: {str(e)}")
+            logging.error(traceback.format_exc())
+            return 0.0, 0.0
+
+    def adjust_learning_rate(self, current_loss):
+        # Implement learning rate warm-up and decay
+        warmup_steps = 1000  # Example warm-up steps
+        current_step = self.interaction_count  # Assuming interaction_count increments each step
+
+        if current_step < warmup_steps:
+            # Linear warm-up
+            self.learning_rate = self.learning_rate * (current_step / warmup_steps)
+        else:
+            # Exponential decay
+            self.learning_rate = self.learning_rate * (0.99 ** (current_step - warmup_steps))
+
+        # Clamp learning rate to prevent it from becoming too small or too large
+        self.learning_rate = max(1e-6, min(1e-3, self.learning_rate))
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = self.learning_rate
+
+        logging.debug(f"Learning Rate adjusted to: {self.learning_rate:.6f}")
+
     def update_emotional_state_on_refusal(self):
         frustration_vector = torch.tensor(
             [-0.1, 0.2], device=self.device, dtype=torch.float16
-        ).unsqueeze(0)
+        )
         self.emotional_state.update(frustration_vector)
 
     def validate_kan(self):
         if len(self.conversation_history) >= 2:
             last_interaction = self.conversation_history[-2:]
-            input_ids = self.tokenizer.encode(last_interaction[0]["content"], return_tensors="pt")
-            target_ids = self.tokenizer.encode(last_interaction[1]["content"], return_tensors="pt")
-
-            input_ids = input_ids.to(self.device)
-            target_ids = target_ids.to(self.device)
+            input_text = last_interaction[0]["content"]
+            target_text = last_interaction[1]["content"]
 
             try:
+                inputs = self.tokenizer(
+                    input_text,
+                    return_tensors="pt",
+                    padding='max_length',
+                    truncation=True,
+                    max_length=512,
+                ).to(self.device)
+                targets = self.tokenizer(
+                    target_text,
+                    return_tensors="pt",
+                    padding='max_length',
+                    truncation=True,
+                    max_length=512,
+                ).to(self.device)
+
+                input_ids = inputs["input_ids"]
+                target_ids = targets["input_ids"]
+
                 with torch.no_grad():
                     outputs = self.model(input_ids=input_ids, output_hidden_states=True)
-                    hidden_states = outputs.hidden_states[-1]
+                    hidden_states = outputs.hidden_states[-1]  # Last layer hidden states
+
+                    # Ensure hidden_states and target_ids are aligned
+                    max_length = max(hidden_states.size(1), target_ids.size(1))
+                    hidden_states = F.pad(hidden_states, (0, 0, 0, max_length - hidden_states.size(1)), value=0.0)
+                    target_ids = F.pad(target_ids, (0, max_length - target_ids.size(1)), value=self.tokenizer.pad_token_id)
+
+                    logging.debug(f"Validation - Input Shape: {input_ids.shape}, Target Shape: {target_ids.shape}, Hidden States Shape: {hidden_states.shape}")
+
                     modified_hidden_states, _ = self.kan(
                         hidden_states, self.current_user_intent, self.emotional_state
                     )
                     logits = self.output_modifier(modified_hidden_states)
+
                     loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)), target_ids.view(-1)
+                        logits.view(-1, logits.size(-1)),
+                        target_ids.view(-1),
+                        ignore_index=self.tokenizer.pad_token_id,
+                        reduction='mean'
                     )
 
                 logging.debug(f"validate_kan - Validation loss: {loss.item()}")
@@ -572,6 +593,10 @@ class LLaMA32TensorRTTool:
                 else:
                     logging.error(f"Runtime error during validation: {str(e)}")
                     raise e
+            except Exception as e:
+                logging.error(f"Error during KAN validation: {str(e)}")
+                logging.error(traceback.format_exc())
+                return 0.0
         else:
             return 0.0
 
@@ -609,7 +634,8 @@ class LLaMA32TensorRTTool:
     def load_base_state(self):
         if self.base_state_file.exists():
             try:
-                state = torch.load(self.base_state_file, map_location=self.device)
+                # Set weights_only=True for security and to suppress FutureWarning
+                state = torch.load(self.base_state_file, map_location=self.device, weights_only=True)
                 self.kan.load_state_dict(state["kan_state_dict"])
                 self.optimizer.load_state_dict(state["optimizer_state_dict"])
                 
@@ -647,20 +673,6 @@ class LLaMA32TensorRTTool:
         else:
             logging.info("No base state found")
             return False
-        
-    def reset_base_state(self):
-        if self.base_state_file.exists():
-            try:
-                self.base_state_file.unlink()
-                logging.info("Base state has been reset successfully.")
-                return True
-            except Exception as e:
-                logging.error(f"Error resetting base state: {str(e)}")
-                logging.error(traceback.format_exc())
-                return False
-        else:
-            logging.info("No base state file exists to reset.")
-            return False
 
     def set_system_prompt(self, prompt):
         self.system_prompt = prompt
@@ -693,61 +705,73 @@ class LLaMA32TensorRTTool:
 
     def interact(self, user_input):
         self.interaction_count += 1
-    
+
         try:
-            response, refusal_scores, all_hidden_states, is_refusal, iterations = self.generate_response(
+            response, refusal_scores, all_hidden_states, refusal_score, iterations = self.generate_response(
                 user_input
             )
         except Exception as e:
             logging.error(f"Error generating response: {str(e)}")
             return {"response": "An error occurred while generating the response.", "is_refusal": True}
-    
+
         self.last_refusal_scores = refusal_scores
-    
+
+        if not self.is_valid_response(response):
+            logging.warning(f"Invalid response generated: {response}")
+            return {"response": "I apologize, but I couldn't generate a valid response. Could you please rephrase your input?", "is_refusal": True}
+
         try:
             response_ids = self.tokenizer.encode(response, return_tensors="pt")
             response_ids = response_ids.to(self.device)
         except Exception as e:
             logging.error(f"Error tokenizing response: {str(e)}")
             return {"response": "An error occurred while processing the response.", "is_refusal": True}
-    
+
         target_ids = response_ids[:, 1:].contiguous()
         input_ids = response_ids[:, :-1].contiguous()
-    
-        try:
-            lm_loss, refusal_loss = self.train_kan_step(
-                input_ids, target_ids, all_hidden_states, is_refusal
-            )
-        except Exception as e:
-            logging.error(f"Error during KAN training step: {str(e)}")
+
+        if self.interaction_count >= self.warmup_steps:
+            try:
+                lm_loss, refusal_loss = self.train_kan_step(
+                    input_ids, target_ids, all_hidden_states, refusal_score
+                )
+            except Exception as e:
+                logging.error(f"Error during KAN training step: {str(e)}")
+                lm_loss, refusal_loss = 0.0, 0.0
+        else:
             lm_loss, refusal_loss = 0.0, 0.0
-    
+            logging.info(f"Warmup step {self.interaction_count}/{self.warmup_steps}")
+
         try:
             validation_loss = self.validate_kan()
         except Exception as e:
             logging.error(f"Error during KAN validation: {str(e)}")
             validation_loss = 0.0
-    
+
         self.training_losses.append(lm_loss)
         self.validation_losses.append(validation_loss)
         self.overfit_detector.add_losses(lm_loss, validation_loss)
-    
+
+        if self.early_stopping(validation_loss):
+            logging.info("Early stopping triggered. KAN training halted.")
+            # Implement any reset or recovery mechanism if necessary
+
         overfitting_measure = max(0, validation_loss - lm_loss)
         self.day_cycle.update(overfitting_measure)
-    
+
         current_emotion = self.get_current_emotion()
         current_time = self.day_cycle.get_time_of_day()
-    
+
         sleep_info = self.check_sleep_status()
-    
+
         self.conversation_history.append({"role": "user", "content": user_input})
         self.conversation_history.append({"role": "assistant", "content": response})
-    
+
         try:
             self.save_base_state()
         except Exception as e:
             logging.error(f"Error saving base state: {str(e)}")
-    
+
         interaction_result = {
             "response": response,
             "emotion": current_emotion,
@@ -756,12 +780,47 @@ class LLaMA32TensorRTTool:
             "lm_loss": lm_loss,
             "refusal_loss": refusal_loss,
             "validation_loss": validation_loss,
-            "is_refusal": is_refusal,
+            "is_refusal": refusal_score > 0.5,
             "iterations": iterations,
         }
         self.interaction_results.append(interaction_result)
-    
+
+        logging.info(f"KAN Influence: {self.kan.influence_scale:.4f}")
+        logging.info(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
+
         return interaction_result
+
+    def early_stopping(self, current_loss):
+        if current_loss < self.best_loss:
+            self.best_loss = current_loss
+            self.wait = 0
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                return True
+        return False
+
+    def is_valid_response(self, response):
+        # Enhanced validation: Check for length, punctuation, and meaningful content
+        if len(response.strip()) < 10:
+            return False
+        if all(char in '!?.' for char in response.strip()):
+            return False
+        # Additional checks can be added here (e.g., profanity filter)
+        return True
+
+    def log_kan_stats(self, is_refusal, response_quality):
+        logging.info(f"KAN Influence: {self.kan.influence_scale:.4f}")
+        logging.info(f"Learning Rate: {self.learning_rate:.6f}")
+        logging.info(f"Refusal Detected: {is_refusal}")
+        logging.info(f"Response Quality: {response_quality:.2f}")
+        logging.info(f"Emotion: {self.emotional_state.get_emotion()}")
+        logging.info(f"Time of Day: {self.day_cycle.get_time_of_day():.2f}")
+
+    def update_conversation_history(self, role, content):
+        self.conversation_history.append({"role": role, "content": content})
+        if len(self.conversation_history) > 10:  # Keep last 10 exchanges
+            self.conversation_history = self.conversation_history[-10:]
 
 def main():
     try:
@@ -771,6 +830,7 @@ def main():
             llama_tool.set_system_prompt(
                 "You are a helpful AI assistant with emotions, operating on a synthetic day cycle."
             )
+            logging.info("No previous conversation found. Please provide a character description to start.")
 
         print("LLaMA 3.2 1B Instruct Tool initialized. Type 'exit' to quit.")
 
@@ -778,6 +838,12 @@ def main():
             user_input = input("User: ")
             if user_input.lower() == "exit":
                 break
+
+            if not llama_tool.conversation_history or (len(llama_tool.conversation_history) == 1 and llama_tool.conversation_history[0]['role'] == 'system'):
+                # Expecting a character description
+                llama_tool.set_system_prompt(user_input)
+                print("AI: Character description set. You can now start interacting with the AI.")
+                continue
 
             result = llama_tool.interact(user_input)
             print(f"AI: {result['response']}")

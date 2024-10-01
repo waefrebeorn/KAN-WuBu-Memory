@@ -8,7 +8,8 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.disable, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
 
 class LLAMA32GUI:
     def __init__(self, master):
