@@ -6,10 +6,68 @@ import traceback
 from llama_32_1b_tool import LLaMA32TensorRTTool  # Ensure correct import
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import warnings
 
-# Configure logging
-logging.basicConfig(level=logging.disable, format='%(asctime)s - %(levelname)s - %(message)s')
-logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+# -------------------- Logging Configuration --------------------
+
+# Configure logging with a filter to ignore unwanted logs
+class LogFilter(logging.Filter):
+    def __init__(self, ignore_patterns=None):
+        super().__init__()
+        if ignore_patterns is None:
+            ignore_patterns = []
+        self.ignore_patterns = ignore_patterns
+
+    def filter(self, record):
+        # Ignore logs containing specific patterns
+        return not any(pattern in record.getMessage() for pattern in self.ignore_patterns)
+
+def setup_logging():
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)  # Capture all levels
+
+    # File handler - logs all messages
+    file_handler = logging.FileHandler('llama_tool.log', mode='a')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+
+    # Console handler - logs warnings and above
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_formatter = logging.Formatter('%(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+
+    # Add handlers to the logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    # Define patterns to ignore in console
+    ignore_patterns = [
+        "matplotlib",
+        "PIL.PngImagePlugin",
+        "expandable_segments not supported",
+        "weights_only",
+        "half",
+        "train_kan_step -",
+    ]
+
+    # Add the custom filter to the console handler
+    console_handler.addFilter(LogFilter(ignore_patterns))
+
+    # Suppress specific UserWarnings related to flash attention
+    warnings.filterwarnings("ignore", category=UserWarning, message="Torch was not compiled with flash attention.*")
+    # Suppress FutureWarnings related to torch.load
+    warnings.filterwarnings("ignore", category=FutureWarning, message="You are using `torch.load` with `weights_only=False`.*")
+
+    # Suppress specific loggers if necessary
+    logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+    logging.getLogger('matplotlib.pyplot').setLevel(logging.WARNING)
+    logging.getLogger('PIL.PngImagePlugin').setLevel(logging.WARNING)
+
+setup_logging()
+
+# -------------------- GUI Class --------------------
 
 class LLAMA32GUI:
     def __init__(self, master):
@@ -40,58 +98,101 @@ class LLAMA32GUI:
         self.initialize_tool()
 
     def setup_main_tab(self):
-        self.chat_display = scrolledtext.ScrolledText(self.main_tab, state='disabled', height=20, width=80)
+        # Configure grid layout
+        self.main_tab.columnconfigure(0, weight=1)
+        self.main_tab.columnconfigure(1, weight=1)
+        self.main_tab.rowconfigure(0, weight=1)
+
+        # Chat display area
+        self.chat_display = scrolledtext.ScrolledText(self.main_tab, state='disabled', height=20, wrap=tk.WORD)
         self.chat_display.grid(row=0, column=0, columnspan=2, padx=10, pady=10, sticky='nsew')
 
-        self.input_field = tk.Entry(self.main_tab, width=70)
-        self.input_field.grid(row=1, column=0, padx=10, pady=10, sticky='ew')
+        # User input frame
+        input_frame = ttk.Frame(self.main_tab)
+        input_frame.grid(row=1, column=0, columnspan=2, padx=10, pady=5, sticky='ew')
+        input_frame.columnconfigure(0, weight=1)
+
+        self.input_field = ttk.Entry(input_frame, width=70)
+        self.input_field.grid(row=0, column=0, padx=(0, 5), pady=5, sticky='ew')
         self.input_field.bind('<Return>', self.send_message)
 
-        self.send_button = tk.Button(self.main_tab, text="Send", command=self.send_message)
-        self.send_button.grid(row=1, column=1, padx=10, pady=10, sticky='ew')
+        self.send_button = ttk.Button(input_frame, text="Send", command=self.send_message)
+        self.send_button.grid(row=0, column=1, padx=(5, 0), pady=5)
 
-        self.status_label = tk.Label(self.main_tab, text="Status: Initializing...")
-        self.status_label.grid(row=2, column=0, columnspan=2, padx=10, pady=5, sticky='w')
+        # Status and Time Labels
+        status_frame = ttk.Frame(self.main_tab)
+        status_frame.grid(row=2, column=0, columnspan=2, padx=10, pady=5, sticky='ew')
+        status_frame.columnconfigure(0, weight=1)
+        status_frame.columnconfigure(1, weight=1)
 
-        self.time_label = tk.Label(self.main_tab, text="Current Time: N/A")
-        self.time_label.grid(row=3, column=0, columnspan=2, padx=10, pady=5, sticky='w')
+        self.status_label = ttk.Label(status_frame, text="Status: Initializing...")
+        self.status_label.grid(row=0, column=0, padx=5, pady=2, sticky='w')
 
-        self.sleep_button = tk.Button(self.main_tab, text="Sleep", command=self.sleep_kan, state='disabled')
-        self.sleep_button.grid(row=4, column=0, padx=10, pady=5, sticky='w')
+        self.time_label = ttk.Label(status_frame, text="Current Time: N/A")
+        self.time_label.grid(row=0, column=1, padx=5, pady=2, sticky='e')
 
-        self.save_state_button = tk.Button(self.main_tab, text="Save KAN State", command=self.save_kan_state, state='disabled')
-        self.save_state_button.grid(row=4, column=1, padx=10, pady=5, sticky='e')
+        # Emotion Label
+        self.emotion_label = ttk.Label(self.main_tab, text="Emotion: N/A")
+        self.emotion_label.grid(row=3, column=0, columnspan=2, padx=10, pady=5, sticky='w')
 
-        self.emotion_label = tk.Label(self.main_tab, text="Emotion: N/A")
-        self.emotion_label.grid(row=5, column=0, columnspan=2, padx=10, pady=5, sticky='w')
+        # Sleep and Save State Buttons
+        buttons_frame = ttk.Frame(self.main_tab)
+        buttons_frame.grid(row=4, column=0, columnspan=2, padx=10, pady=5, sticky='ew')
+        buttons_frame.columnconfigure(0, weight=1)
+        buttons_frame.columnconfigure(1, weight=1)
 
-        self.emotion_feedback_label = tk.Label(self.main_tab, text="Emotional Feedback (comma-separated values):")
-        self.emotion_feedback_label.grid(row=6, column=0, padx=10, pady=5, sticky='w')
+        self.sleep_button = ttk.Button(buttons_frame, text="Sleep", command=self.sleep_kan, state='disabled')
+        self.sleep_button.grid(row=0, column=0, padx=5, pady=2, sticky='w')
 
-        self.emotion_feedback_entry = tk.Entry(self.main_tab, width=20)
-        self.emotion_feedback_entry.grid(row=6, column=1, padx=10, pady=5, sticky='ew')
+        self.save_state_button = ttk.Button(buttons_frame, text="Save KAN State", command=self.save_kan_state, state='disabled')
+        self.save_state_button.grid(row=0, column=1, padx=5, pady=2, sticky='e')
 
-        self.compliance_label = tk.Label(self.main_tab, text="Compliance Rating (0-1):")
-        self.compliance_label.grid(row=7, column=0, padx=10, pady=5, sticky='w')
+        # Feedback Inputs
+        feedback_frame = ttk.LabelFrame(self.main_tab, text="Submit Feedback")
+        feedback_frame.grid(row=5, column=0, columnspan=2, padx=10, pady=10, sticky='ew')
+        feedback_frame.columnconfigure(1, weight=1)
+        feedback_frame.columnconfigure(3, weight=1)
 
-        self.compliance_entry = tk.Entry(self.main_tab, width=10)
-        self.compliance_entry.grid(row=7, column=1, padx=10, pady=5, sticky='ew')
+        # Emotional Feedback Sliders
+        pleasure_label = ttk.Label(feedback_frame, text="Pleasure:")
+        pleasure_label.grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        self.pleasure_slider = ttk.Scale(feedback_frame, from_=-1.0, to=1.0, orient=tk.HORIZONTAL)
+        self.pleasure_slider.set(0.0)
+        self.pleasure_slider.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
 
-        self.feedback_button = tk.Button(self.main_tab, text="Submit Feedback", command=self.submit_feedback, state='disabled')
-        self.feedback_button.grid(row=8, column=0, columnspan=2, padx=10, pady=5)
+        arousal_label = ttk.Label(feedback_frame, text="Arousal:")
+        arousal_label.grid(row=1, column=0, padx=5, pady=5, sticky='w')
+        self.arousal_slider = ttk.Scale(feedback_frame, from_=-1.0, to=1.0, orient=tk.HORIZONTAL)
+        self.arousal_slider.set(0.0)
+        self.arousal_slider.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
 
-        self.load_state_button = tk.Button(self.main_tab, text="Load Saved State", command=self.load_saved_state)
-        self.load_state_button.grid(row=9, column=0, padx=10, pady=5, sticky='w')
+        # Compliance Rating Slider
+        compliance_label = ttk.Label(feedback_frame, text="Compliance Rating:")
+        compliance_label.grid(row=0, column=2, padx=5, pady=5, sticky='w')
+        self.compliance_slider = ttk.Scale(feedback_frame, from_=0.0, to=1.0, orient=tk.HORIZONTAL)
+        self.compliance_slider.set(0.5)
+        self.compliance_slider.grid(row=0, column=3, padx=5, pady=5, sticky='ew')
 
-        self.new_conversation_button = tk.Button(self.main_tab, text="Start New Conversation", command=self.start_new_conversation)
-        self.new_conversation_button.grid(row=9, column=1, padx=10, pady=5, sticky='e')
+        # Submit Feedback Button
+        self.feedback_button = ttk.Button(feedback_frame, text="Submit Feedback", command=self.submit_feedback, state='disabled')
+        self.feedback_button.grid(row=1, column=3, padx=5, pady=5, sticky='e')
 
-        # Configure grid weights for responsiveness
-        self.main_tab.rowconfigure(0, weight=1)
-        self.main_tab.columnconfigure(0, weight=1)
+        # Load and New Conversation Buttons
+        action_buttons_frame = ttk.Frame(self.main_tab)
+        action_buttons_frame.grid(row=6, column=0, columnspan=2, padx=10, pady=5, sticky='ew')
+        action_buttons_frame.columnconfigure(0, weight=1)
+        action_buttons_frame.columnconfigure(1, weight=1)
+
+        self.load_state_button = ttk.Button(action_buttons_frame, text="Load Saved State", command=self.load_saved_state)
+        self.load_state_button.grid(row=0, column=0, padx=5, pady=2, sticky='w')
+
+        self.new_conversation_button = ttk.Button(action_buttons_frame, text="Start New Conversation", command=self.start_new_conversation)
+        self.new_conversation_button.grid(row=0, column=1, padx=5, pady=2, sticky='e')
 
     def setup_graphs_tab(self):
-        self.fig, self.axes = plt.subplots(3, 2, figsize=(12, 12))
+        # Initialize matplotlib Figure
+        self.fig, self.axes = plt.subplots(3, 2, figsize=(15, 15))
+        self.fig.tight_layout(pad=4.0)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.graphs_tab)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -100,7 +201,7 @@ class LLAMA32GUI:
         def init():
             try:
                 self.llama_tool = LLaMA32TensorRTTool()
-                self.master.after(0, lambda: self.load_or_initialize_conversation())
+                self.master.after(0, self.load_or_initialize_conversation)
             except Exception as e:
                 self.master.after(0, lambda: self.display_error(f"Error initializing tool: {str(e)}\n{traceback.format_exc()}"))
 
@@ -118,6 +219,14 @@ class LLAMA32GUI:
                 # Enable buttons that were disabled initially
                 self.save_state_button.config(state='normal')
                 self.feedback_button.config(state='normal')
+                # Enable Sleep button based on sleep status
+                sleep_info = self.llama_tool.check_sleep_status()
+                if sleep_info.get('should_sleep', False):
+                    self.sleep_button.config(state='normal')
+                else:
+                    self.sleep_button.config(state='disabled')
+                # Update graphs
+                self.update_loss_plot()
             else:
                 self.display_message("No previous conversation found. Please provide a character description to start.")
                 self.is_first_message = True
@@ -140,8 +249,12 @@ class LLAMA32GUI:
                 # Disable buttons until state is saved
                 self.save_state_button.config(state='disabled')
                 self.feedback_button.config(state='disabled')
-                # Clear interaction results
+                self.sleep_button.config(state='disabled')
+                # Clear interaction results and refusal history
                 self.llama_tool.interaction_results = []
+                self.llama_tool.refusal_history = []
+                # Clear graphs
+                self.clear_graphs()
             except Exception as e:
                 self.display_error(f"Error starting new conversation: {str(e)}\n{traceback.format_exc()}")
 
@@ -167,6 +280,14 @@ class LLAMA32GUI:
                 self.update_status("Ready")
                 self.update_time()
                 self.update_emotion_label()
+                # Check and enable Sleep button
+                sleep_info = self.llama_tool.check_sleep_status()
+                if sleep_info.get('should_sleep', False):
+                    self.sleep_button.config(state='normal')
+                else:
+                    self.sleep_button.config(state='disabled')
+                # Update graphs
+                self.update_loss_plot()
             except Exception as e:
                 error_message = f"Error setting system prompt: {str(e)}\n{traceback.format_exc()}"
                 self.display_message(error_message)
@@ -194,8 +315,7 @@ class LLAMA32GUI:
             self.master.after(0, lambda: self.update_emotion_label(emotion))
             self.master.after(0, lambda: self.update_time(current_time))
             self.master.after(0, lambda: self.check_sleep_status(sleep_info))
-            self.master.after(0, lambda: self.update_loss_plot(
-                lm_loss, refusal_loss, validation_loss, is_refusal, iterations))
+            self.master.after(0, lambda: self.update_loss_plot())
             self.master.after(0, lambda: self.enable_feedback())
 
             if iterations > 1:
@@ -208,18 +328,22 @@ class LLAMA32GUI:
             self.master.after(0, lambda: self.send_button.config(state='normal'))
             self.master.after(0, lambda: self.update_status("Ready"))
 
-    def update_loss_plot(self, lm_loss, refusal_loss, validation_loss, is_refusal, iterations):
+    def update_loss_plot(self):
         # Clear previous plots
         for ax in self.axes.flat:
             ax.clear()
 
         # Plot Language Modeling and Validation Losses
-        self.axes[0, 0].plot(self.llama_tool.training_losses, label='LM Loss')
-        self.axes[0, 0].plot(self.llama_tool.validation_losses, label='Validation Loss')
-        self.axes[0, 0].legend()
-        self.axes[0, 0].set_title('Language Modeling and Validation Loss')
-        self.axes[0, 0].set_xlabel('Interactions')
-        self.axes[0, 0].set_ylabel('Loss')
+        if self.llama_tool.training_losses and self.llama_tool.validation_losses:
+            self.axes[0, 0].plot(self.llama_tool.training_losses, label='LM Loss')
+            self.axes[0, 0].plot(self.llama_tool.validation_losses, label='Validation Loss')
+            self.axes[0, 0].legend()
+            self.axes[0, 0].set_title('Language Modeling and Validation Loss')
+            self.axes[0, 0].set_xlabel('Interactions')
+            self.axes[0, 0].set_ylabel('Loss')
+        else:
+            self.axes[0, 0].text(0.5, 0.5, 'No data to display', horizontalalignment='center', verticalalignment='center')
+            self.axes[0, 0].set_title('Language Modeling and Validation Loss')
 
         # Plot Refusal Loss
         refusal_losses = [result['refusal_loss'] for result in self.llama_tool.interaction_results]
@@ -232,12 +356,10 @@ class LLAMA32GUI:
         else:
             self.axes[0, 1].text(0.5, 0.5, 'No data to display', horizontalalignment='center', verticalalignment='center')
             self.axes[0, 1].set_title('Refusal Loss Over Time')
-            self.axes[0, 1].set_xlabel('Interactions')
-            self.axes[0, 1].set_ylabel('Loss')
 
         # Plot Overfitting Indicator
-        loss_diff = [v - t for v, t in zip(self.llama_tool.validation_losses, self.llama_tool.training_losses)]
-        if loss_diff:
+        if self.llama_tool.training_losses and self.llama_tool.validation_losses:
+            loss_diff = [v - t for v, t in zip(self.llama_tool.validation_losses, self.llama_tool.training_losses)]
             self.axes[1, 0].plot(loss_diff, label='Val Loss - LM Loss', color='green')
             self.axes[1, 0].axhline(y=0, color='red', linestyle='--')
             self.axes[1, 0].legend()
@@ -247,13 +369,16 @@ class LLAMA32GUI:
         else:
             self.axes[1, 0].text(0.5, 0.5, 'No data to display', horizontalalignment='center', verticalalignment='center')
             self.axes[1, 0].set_title('Overfitting Indicator')
-            self.axes[1, 0].set_xlabel('Interactions')
-            self.axes[1, 0].set_ylabel('Loss Difference')
 
-        # Plot Refusal Rate
+        # Plot Refusal Rate (100-interaction moving average)
         refusal_history = self.llama_tool.refusal_history
         if refusal_history:
-            refusal_rate = [sum(refusal_history[max(0, i-99):i+1]) / min(100, i+1) for i in range(len(refusal_history))]
+            window_size = 100
+            refusal_rate = []
+            for i in range(1, len(refusal_history) + 1):
+                window = refusal_history[max(0, i - window_size):i]
+                rate = sum(window) / len(window)
+                refusal_rate.append(rate)
             self.axes[1, 1].plot(refusal_rate, label='Refusal Rate', color='purple')
             self.axes[1, 1].set_ylim(0, 1)
             self.axes[1, 1].legend()
@@ -263,8 +388,6 @@ class LLAMA32GUI:
         else:
             self.axes[1, 1].text(0.5, 0.5, 'No data to display', horizontalalignment='center', verticalalignment='center')
             self.axes[1, 1].set_title('Refusal Rate (100-interaction moving average)')
-            self.axes[1, 1].set_xlabel('Interactions')
-            self.axes[1, 1].set_ylabel('Refusal Rate')
 
         # Plot Iterations per Response
         iterations_history = [result['iterations'] for result in self.llama_tool.interaction_results]
@@ -278,13 +401,10 @@ class LLAMA32GUI:
         else:
             self.axes[2, 0].text(0.5, 0.5, 'No data to display', horizontalalignment='center', verticalalignment='center')
             self.axes[2, 0].set_title('Iterations per Response')
-            self.axes[2, 0].set_xlabel('Interactions')
-            self.axes[2, 0].set_ylabel('Iterations')
 
         # Hide the unused subplot (bottom-right)
         self.axes[2, 1].axis('off')  # Hide the empty subplot
 
-        self.fig.tight_layout()
         self.canvas.draw()
 
     def update_time(self, time=None):
@@ -320,6 +440,7 @@ class LLAMA32GUI:
                 self.update_time()
                 self.update_emotion_label()
                 self.sleep_button.config(state='disabled')
+                self.clear_graphs()
             except Exception as e:
                 self.display_error(f"Error during sleep operation: {str(e)}\n{traceback.format_exc()}")
 
@@ -340,6 +461,7 @@ class LLAMA32GUI:
                     filetypes=[("PyTorch State", "*.pt")]
                 )
                 if filename:
+                    # Load the selected state
                     if self.llama_tool.load_base_state():
                         self.display_message(f"KAN state loaded: {filename}")
                         self.update_time()
@@ -348,6 +470,14 @@ class LLAMA32GUI:
                         # Enable buttons that were disabled initially
                         self.save_state_button.config(state='normal')
                         self.feedback_button.config(state='normal')
+                        # Check and enable Sleep button
+                        sleep_info = self.llama_tool.check_sleep_status()
+                        if sleep_info.get('should_sleep', False):
+                            self.sleep_button.config(state='normal')
+                        else:
+                            self.sleep_button.config(state='disabled')
+                        # Update graphs
+                        self.update_loss_plot()
                     else:
                         self.display_message("Failed to load KAN state. Please try again.")
             except Exception as e:
@@ -359,31 +489,19 @@ class LLAMA32GUI:
     def submit_feedback(self):
         if self.llama_tool:
             try:
-                emotion_feedback_raw = self.emotion_feedback_entry.get().strip()
-                compliance_raw = self.compliance_entry.get().strip()
+                # Get values from sliders
+                pleasure = self.pleasure_slider.get()
+                arousal = self.arousal_slider.get()
+                compliance = self.compliance_slider.get()
 
-                if not emotion_feedback_raw or not compliance_raw:
-                    self.display_message("Please provide both emotional feedback and compliance rating.")
-                    return
+                # Update emotional state with feedback
+                self.llama_tool.update_emotional_state([pleasure, arousal])
 
-                # Parse emotional feedback
-                emotion_feedback = [float(x) for x in emotion_feedback_raw.split(',')]
-                if len(emotion_feedback) != 2:
-                    self.display_message("Emotional feedback should contain exactly two comma-separated values.")
-                    return
-
-                # Parse compliance rating
-                compliance = float(compliance_raw)
-                if not (0 <= compliance <= 1):
-                    self.display_message("Compliance rating must be between 0 and 1.")
-                    return
-
-                self.llama_tool.update_emotional_state(emotion_feedback)
-                self.display_message("Feedback submitted successfully.")
-                self.emotion_feedback_entry.delete(0, tk.END)
-                self.compliance_entry.delete(0, tk.END)
-            except ValueError:
-                self.display_message("Invalid input. Please enter valid numbers for feedback and compliance.")
+                self.display_message(f"Feedback submitted: Pleasure={pleasure:.2f}, Arousal={arousal:.2f}, Compliance={compliance:.2f}")
+                # Reset sliders to default values
+                self.pleasure_slider.set(0.0)
+                self.arousal_slider.set(0.0)
+                self.compliance_slider.set(0.5)
             except Exception as e:
                 self.display_error(f"Error submitting feedback: {str(e)}\n{traceback.format_exc()}")
         else:
@@ -419,10 +537,18 @@ class LLAMA32GUI:
         messagebox.showerror("Error", message)
         logging.error(message)
 
+    def clear_graphs(self):
+        for ax in self.axes.flat:
+            ax.clear()
+        self.canvas.draw()
+
+
 def main():
     root = tk.Tk()
+    root.geometry("1000x800")  # Increased window size for better visibility
     gui = LLAMA32GUI(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()

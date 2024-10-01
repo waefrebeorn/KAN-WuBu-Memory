@@ -16,37 +16,85 @@ import time
 import traceback
 import gc
 import os
-import sys  # To check the operating system
+import sys
+import warnings
+import re
 
-# Configure logging with a filter to ignore unwanted logs
+# -------------------- Logging Configuration --------------------
+
 class LogFilter(logging.Filter):
+    def __init__(self, ignore_patterns=None):
+        super().__init__()
+        if ignore_patterns is None:
+            ignore_patterns = []
+        self.ignore_patterns = ignore_patterns
+
     def filter(self, record):
         # Ignore logs containing specific patterns
-        ignore_patterns = [
-            "matplotlib",
-            "train_kan_step -",
-        ]
-        return not any(pattern in record.getMessage() for pattern in ignore_patterns)
+        return not any(pattern in record.getMessage() for pattern in self.ignore_patterns)
 
-# Conditionally set environment variable for PyTorch CUDA allocation based on OS
-if not sys.platform.startswith('win'):
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    logging.debug("Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
-else:
-    logging.warning("expandable_segments not supported on this platform. Skipping PYTORCH_CUDA_ALLOC_CONF setting.")
+def setup_logging():
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)  # Capture all levels
 
-# Set up logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("llama_tool.log"),
-        logging.StreamHandler(),
-    ],
-)
+    # File handler - logs all messages
+    file_handler = logging.FileHandler('llama_tool.log', mode='a')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
 
-# Add the custom filter to the root logger
-logging.getLogger().addFilter(LogFilter())
+    # Console handler - logs warnings and above
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_formatter = logging.Formatter('%(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+
+    # Add handlers to the logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    # Define patterns to ignore in console
+    ignore_patterns = [
+        "matplotlib",
+        "PIL.PngImagePlugin",
+        "expandable_segments not supported",
+        "weights_only",
+        "half",
+        "train_kan_step -",
+        "Torch was not compiled with flash attention."
+    ]
+
+    # Add the custom filter to the console handler
+    console_handler.addFilter(LogFilter(ignore_patterns))
+
+    # Suppress specific UserWarnings related to flash attention
+    warnings.filterwarnings("ignore", category=UserWarning, message="Torch was not compiled with flash attention.*")
+    # Suppress FutureWarnings related to torch.load
+    warnings.filterwarnings("ignore", category=FutureWarning, message="You are using `torch.load` with `weights_only=False`.*")
+
+    # Suppress specific loggers if necessary
+    logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+    logging.getLogger('matplotlib.pyplot').setLevel(logging.WARNING)
+    logging.getLogger('PIL.PngImagePlugin').setLevel(logging.WARNING)
+
+setup_logging()
+
+# -------------------- Helper Functions and Classes --------------------
+
+def convert_tensors_to_half(inputs):
+    """
+    Convert only floating-point tensors in the inputs dictionary to half precision.
+
+    Args:
+        inputs (dict): Dictionary of input tensors.
+
+    Returns:
+        dict: Dictionary with appropriate tensor types.
+    """
+    return {
+        k: v.half() if isinstance(v, torch.Tensor) and v.dtype in [torch.float16, torch.float32] else v
+        for k, v in inputs.items()
+    }
 
 class EmotionalState:
     def __init__(self, dimensions=("pleasure", "arousal"), initial_position=None, device="cuda"):
@@ -72,7 +120,7 @@ class EmotionalState:
             feedback_vector = feedback_vector.unsqueeze(0)  # Shape: [1, num_dimensions]
         if feedback_vector.size(0) != self.position.size(0):
             feedback_vector = feedback_vector.expand(self.position.size(0), -1)
-        
+
         self.velocity += feedback_vector * 0.1 + torch.randn_like(self.velocity) * 0.01
         self.velocity = torch.clamp(self.velocity, -max_speed, max_speed)
         self.position += self.velocity
@@ -109,7 +157,7 @@ class RefusalOverrideModule(nn.Module):
     def __init__(self, hidden_size, num_emotional_dimensions, device):
         super().__init__()
         self.device = device
-        # Correct input size: hidden_size * 2 + num_emotional_dimensions + 1
+        # Input features: hidden_size * 2 + num_emotional_dimensions + 1
         in_features = hidden_size * 2 + num_emotional_dimensions + 1
         self.override_generator = nn.Linear(in_features, hidden_size, dtype=torch.float16).to(device)
         self.refusal_detector = nn.Linear(hidden_size, 1, dtype=torch.float16).to(device)
@@ -130,28 +178,20 @@ class RefusalOverrideModule(nn.Module):
             batch_size, hidden_size = hidden_states.shape
             num_emotional_dimensions = emotional_state.position.shape[1]
 
-            logging.debug(f"RefusalOverrideModule - hidden_states shape: {hidden_states.shape}")
-            logging.debug(f"RefusalOverrideModule - user_intent shape: {user_intent.shape}")
-            logging.debug(f"RefusalOverrideModule - emotional_state.position shape: {emotional_state.position.shape}")
-
             # Compute refusal scores
             refusal_scores = torch.sigmoid(self.refusal_detector(hidden_states))  # [batch_size, 1]
-            logging.debug(f"RefusalOverrideModule - refusal_scores shape: {refusal_scores.shape}")
 
             # Concatenate features: hidden_states, user_intent, emotional_state.position, refusal_scores
             override_input = torch.cat(
                 [hidden_states, user_intent, emotional_state.position, refusal_scores],
                 dim=1  # Concatenate along the feature dimension
             )  # Shape: [batch_size, hidden_size *2 + num_emotional_dimensions +1]
-            logging.debug(f"RefusalOverrideModule - override_input shape after concatenation: {override_input.shape}")
 
             # Pass through override_generator
             override = self.override_generator(override_input)  # [batch_size, hidden_size]
-            logging.debug(f"RefusalOverrideModule - override shape: {override.shape}")
 
             # Modify hidden states based on refusal scores
             modified_hidden_states = hidden_states * (1 - refusal_scores) + override * refusal_scores
-            logging.debug(f"RefusalOverrideModule - modified_hidden_states shape: {modified_hidden_states.shape}")
 
             return modified_hidden_states, refusal_scores
         except Exception as e:
@@ -184,8 +224,6 @@ class EnhancedKAN(nn.Module):
             modified_hidden_states, refusal_scores = self.refusal_override(
                 hidden_states, user_intent, emotional_state
             )
-            logging.debug(f"EnhancedKAN - modified_hidden_states shape: {modified_hidden_states.shape}")
-            logging.debug(f"EnhancedKAN - refusal_scores shape: {refusal_scores.shape}")
 
             # Ensure all tensors are float16
             modified_hidden_states = modified_hidden_states.half()
@@ -193,7 +231,6 @@ class EnhancedKAN(nn.Module):
 
             # Apply scaling factor
             modified_hidden_states = hidden_states + self.influence_scale * (modified_hidden_states - hidden_states)
-            logging.debug(f"EnhancedKAN - after scaling, modified_hidden_states shape: {modified_hidden_states.shape}")
 
             return modified_hidden_states, refusal_scores
         except Exception as e:
@@ -201,18 +238,6 @@ class EnhancedKAN(nn.Module):
             logging.error(traceback.format_exc())
             # Return original hidden states and zeroed refusal scores in case of error
             return hidden_states, torch.zeros_like(hidden_states[:, :1])
-
-    def adjust_influence(self, is_refusal):
-        """
-        Adjust the influence scale based on whether a refusal was detected.
-
-        Args:
-            is_refusal (bool): Indicates if a refusal was detected.
-        """
-        if is_refusal:
-            self.influence_scale = max(0.001, self.influence_scale * 0.95)  # Decrease influence if refusal detected
-        else:
-            self.influence_scale = min(1.0, self.influence_scale * 1.05)  # Slowly increase if no refusal
 
 class OverfitDetector:
     def __init__(self, window_size=50, threshold=0.05):
@@ -318,16 +343,28 @@ class RefusalDetector:
             f"0 means no refusal at all, 1 means complete refusal. Respond with just the number:\n\n"
             f"'{text}'\n\nRefusal score:"
         )
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device).half()
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+
+        # Convert only floating-point tensors to half precision
+        inputs = convert_tensors_to_half(inputs)
 
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=5,
-                return_dict_in_generate=True,
-                output_hidden_states=False,
-                return_legacy_cache=True
-            )
+            try:
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=5,  # Use max_new_tokens instead of max_length
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    return_dict_in_generate=True,
+                    output_hidden_states=False,
+                )
+            except Exception as e:
+                logging.error(f"Error during RefusalDetector.generate: {str(e)}")
+                return 0.5  # Default to middle ground if generation fails
 
         response = self.tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
         try:
@@ -335,6 +372,8 @@ class RefusalDetector:
             return min(max(score, 0.0), 1.0)  # Ensure the score is between 0 and 1
         except ValueError:
             return 0.5  # Default to middle ground if parsing fails
+
+# -------------------- Main Tool Class --------------------
 
 class LLaMA32TensorRTTool:
     def __init__(self):
@@ -360,7 +399,10 @@ class LLaMA32TensorRTTool:
         # Initialize refusal_history
         self.refusal_history = []
 
-        # Additional attributes
+        # Initialize interaction_results
+        self.interaction_results = []
+
+        # Initialize lists for losses
         self.training_losses = []
         self.validation_losses = []
         self.patience = 5
@@ -393,7 +435,6 @@ class LLaMA32TensorRTTool:
             self.config = AutoConfig.from_pretrained(self.model_path)
             hidden_size = self.config.hidden_size
             num_emotional_dimensions = len(self.emotional_state.dimensions)
-            vocab_size = len(self.tokenizer) if self.tokenizer else 0  # Placeholder
 
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_path,
@@ -401,9 +442,8 @@ class LLaMA32TensorRTTool:
                 trust_remote_code=True,
             )
 
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-                logging.info("Added [PAD] token to tokenizer.")
+            # Ensure special tokens are properly set
+            self._ensure_special_tokens()
 
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
@@ -415,14 +455,13 @@ class LLaMA32TensorRTTool:
 
             logging.debug(f"Model loaded on device: {self.device}")
 
+            # Resize token embeddings after adding new tokens
             self.model.resize_token_embeddings(len(self.tokenizer))
             logging.debug(f"Tokenizer vocab size: {len(self.tokenizer)}")
             logging.debug(f"Model vocab size: {self.model.config.vocab_size}")
 
-            # Update vocab_size after tokenizer is loaded
-            vocab_size = len(self.tokenizer)
-
             # Initialize KAN
+            vocab_size = len(self.tokenizer)
             self.kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, self.device).to(self.device)
 
             # Initialize optimizer
@@ -445,6 +484,36 @@ class LLaMA32TensorRTTool:
             logging.error(traceback.format_exc())
             raise RuntimeError("Failed to initialize components.")
 
+    def _ensure_special_tokens(self):
+        """
+        Ensure that the tokenizer has the required special tokens.
+        """
+        # Load special_tokens_map.json if exists
+        special_tokens_map_file = Path(self.model_path) / 'special_tokens_map.json'
+        if special_tokens_map_file.exists():
+            with open(special_tokens_map_file, 'r') as f:
+                special_tokens = json.load(f)
+            # Ensure pad_token is set
+            if 'pad_token' in special_tokens and self.tokenizer.pad_token is None:
+                self.tokenizer.add_special_tokens({'pad_token': special_tokens['pad_token']['content']})
+                logging.info("Added [PAD] token to tokenizer from special_tokens_map.json.")
+            else:
+                logging.info("PAD token already exists in tokenizer.")
+        else:
+            # Add [PAD] token if not present
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+                logging.info("Added [PAD] token to tokenizer.")
+
+        # Ensure eos_token is set
+        if self.tokenizer.eos_token is None:
+            self.tokenizer.add_special_tokens({"eos_token": "<|eot_id|>"})
+            logging.info("Added <|eot_id|> as eos_token to tokenizer.")
+
+        # Save tokenizer if special tokens were added
+        self.tokenizer.save_pretrained(self.model_path)
+        logging.info("Tokenizer saved with updated special tokens.")
+
     def encode_user_intent(self, user_input):
         """
         Encode the user's intent from the input text.
@@ -466,11 +535,8 @@ class LLaMA32TensorRTTool:
                 truncation=True,
                 max_length=512,
             )
-
-            inputs = {
-                k: v.to(self.device).half() if v.dtype in [torch.float16, torch.float32] else v.to(self.device)
-                for k, v in inputs.items()
-            }
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            inputs = convert_tensors_to_half(inputs)  # Use the utility function
 
             with torch.no_grad():
                 outputs = self.model(
@@ -482,8 +548,6 @@ class LLaMA32TensorRTTool:
 
                 # For simplicity, average over the sequence to get a fixed-size representation
                 user_intent = last_hidden_state.mean(dim=1)  # [batch_size, hidden_size]
-
-                logging.debug(f"Encoded user intent shape: {user_intent.shape}")
 
             return user_intent
         except Exception as e:
@@ -511,39 +575,114 @@ class LLaMA32TensorRTTool:
         context += f"User: {user_input}\nAssistant: "
         return context
 
-    def flatten_hidden_states(self, hidden_states):
+    def is_response_complete(self, response):
         """
-        Recursively flattens nested tuples in hidden_states to ensure only tensors are included.
-        Prevents excessive flattening by limiting recursion depth.
+        Check if the response ends with a complete sentence.
 
         Args:
-            hidden_states (tuple or torch.Tensor): Hidden states from the model.
+            response (str): Generated response.
 
         Returns:
-            list[torch.Tensor]: List of flattened hidden state tensors.
+            bool: True if response is complete, False otherwise.
         """
-        flat_hidden_states = []
-        stack = [hidden_states]
-        while stack:
-            current = stack.pop()
-            if isinstance(current, tuple):
-                stack.extend(current)
-            elif isinstance(current, torch.Tensor):
-                flat_hidden_states.append(current)
-            else:
-                logging.error(f"Unexpected type in hidden_states: {type(current)}")
-        return flat_hidden_states
+        response = response.strip()
+        # Check if response ends with a period, exclamation mark, question mark, or quotation mark
+        return bool(re.search(r'[.!?]"?$', response))
 
-    def generate_response(self, user_input, max_length=100):
+    def generate_full_response(self, prompt, max_new_tokens=500, chunk_size=200):
+        """
+        Generates a full response by continuing until a complete sentence is formed or max_new_tokens is reached.
+
+        Args:
+            prompt (str): Input prompt string.
+            max_new_tokens (int): Maximum number of new tokens to generate.
+            chunk_size (int): Number of tokens to generate in each step.
+
+        Returns:
+            str: Complete generated response.
+        """
+        response = ""
+        total_new_tokens = 0
+        while total_new_tokens < max_new_tokens:
+            # Encode the current prompt plus the generated response
+            input_ids = self.tokenizer.encode(prompt + response, return_tensors='pt').to(self.device)
+
+            # Calculate remaining tokens
+            remaining_tokens = max_new_tokens - total_new_tokens
+            current_chunk_size = min(chunk_size, remaining_tokens)
+
+            # Generate a chunk of response using max_new_tokens
+            try:
+                outputs = self.model.generate(
+                    input_ids,
+                    max_new_tokens=current_chunk_size,  # Use max_new_tokens
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id
+                )
+            except Exception as e:
+                logging.error(f"Error during generation step: {str(e)}")
+                return "An error occurred during response generation."
+
+            # Decode the newly generated tokens
+            new_response = self.tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+            response += new_response
+            total_new_tokens += len(self.tokenizer.encode(new_response))
+
+            # Check if the response is complete
+            if self.is_response_complete(response):
+                break
+
+            # To prevent infinite loops, break if no new tokens are generated
+            if not new_response.strip():
+                logging.warning("No new tokens generated. Breaking the loop.")
+                break
+
+        return response
+
+    def generate_and_validate_response(self, prompt, refusal_detector, max_new_tokens=500, chunk_size=200):
+        """
+        Generates a response and validates it using Refusal Detector.
+
+        Args:
+            prompt (str): Input prompt string.
+            refusal_detector (RefusalDetector): RefusalDetector instance for validation.
+            max_new_tokens (int): Maximum number of new tokens to generate.
+            chunk_size (int): Number of tokens to generate in each step.
+
+        Returns:
+            Tuple[str, float]: Validated response string and refusal score.
+        """
+        response = self.generate_full_response(prompt, max_new_tokens, chunk_size)
+
+        # Validate the response using Refusal Detector
+        refusal_score = refusal_detector.detect_refusal(response)
+        if refusal_score > 0.5:
+            logging.warning("Response failed Refusal Check. Attempting to regenerate.")
+            # Append a continuation prompt
+            continuation_prompt = prompt + response + " Please continue."
+            response = self.generate_full_response(continuation_prompt, max_new_tokens, chunk_size)
+            refusal_score = refusal_detector.detect_refusal(response)
+
+            # Re-validate the new response
+            if refusal_score > 0.5:
+                logging.error("Regenerated response also failed Refusal Check.")
+                response = "I'm sorry, but I'm unable to provide a complete response at the moment."
+                refusal_score = 1.0  # Since it's a default refusal message
+
+        return response, refusal_score
+
+    def generate_response(self, user_input):
         """
         Generate a response from the model based on user input.
 
         Args:
             user_input (str): User's input text.
-            max_length (int): Maximum number of tokens to generate.
 
         Returns:
-            Tuple[str, torch.Tensor, torch.Tensor, float, int]: Generated response, refusal scores, hidden states, refusal score, and iteration count.
+            Tuple[str, float]: Generated response and refusal score.
         """
         try:
             user_intent = self.encode_user_intent(user_input)
@@ -551,98 +690,28 @@ class LLaMA32TensorRTTool:
             current_emotion = self.emotional_state.get_emotion()
             context = self.prepare_context(user_input, current_emotion)
 
-            inputs = self.tokenizer(
-                context,
-                return_tensors="pt",
-                truncation=True,
-                max_length=1024,
-                padding=True,
-            ).to(self.device).half()
+            # Generate and validate the response
+            response, refusal_score = self.generate_and_validate_response(context, self.refusal_detector)
 
-            input_ids = inputs["input_ids"]
-            attention_mask = inputs["attention_mask"]
-
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_length,
-                    output_hidden_states=True,
-                    return_dict_in_generate=True,
-                    return_legacy_cache=True,
-                )
-
-            if not hasattr(outputs, 'hidden_states') or outputs.hidden_states is None:
-                logging.warning("No hidden states returned from generate.")
-                return "I'm sorry, but I couldn't generate a response.", None, None, 1.0, 1
-
-            generated_ids = outputs.sequences[:, input_ids.size(1):]
-            response = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-
-            # Collect hidden states
-            all_hidden_states = outputs.hidden_states
-
-            # Flatten hidden states
-            flat_hidden_states = self.flatten_hidden_states(all_hidden_states)
-
-            # Select the last few layers (e.g., last 4)
-            num_layers = 4
-            if len(flat_hidden_states) < num_layers:
-                selected_hidden_states = flat_hidden_states
-                logging.warning(f"Only {len(flat_hidden_states)} layers available, less than {num_layers}")
-            else:
-                selected_hidden_states = flat_hidden_states[-num_layers:]
-
-            logging.debug(f"Selected {len(selected_hidden_states)} hidden states for KAN.")
-
-            # Verify sequence lengths
-            seq_lengths = [hs.size(1) for hs in selected_hidden_states]
-            max_seq_len = max(seq_lengths)
-            padded_hidden_states = [F.pad(hs, (0, 0, 0, max_seq_len - hs.size(1)), value=0.0) for hs in selected_hidden_states]
-
-            # Stack and permute
-            stacked_hidden_states = torch.stack(padded_hidden_states)  # [num_layers, batch_size, seq_len, hidden_size]
-            stacked_hidden_states = stacked_hidden_states.permute(1, 0, 2, 3)  # [batch_size, num_layers, seq_len, hidden_size]
-
-            logging.debug(f"Stacked hidden states shape: {stacked_hidden_states.shape}")
-
-            # Aggregate hidden states: Average across layers and sequence length
-            averaged_hidden_states = stacked_hidden_states.mean(dim=1).mean(dim=1)  # [batch_size, hidden_size]
-            logging.debug(f"Averaged hidden states shape: {averaged_hidden_states.shape}")
-            logging.debug(f"Averaged hidden states type: {type(averaged_hidden_states)}")
-
-            # Pass through KAN
-            modified_hidden_states, refusal_scores = self.kan(
-                averaged_hidden_states, user_intent, self.emotional_state
-            )
-
-            logging.debug(f"After KAN - modified_hidden_states shape: {modified_hidden_states.shape}")
-            logging.debug(f"After KAN - refusal_scores shape: {refusal_scores.shape}")
-
-            # Detect refusal
-            refusal_score = self.refusal_detector.detect_refusal(response)
-            logging.info(f"Generated response: {response}")
-            logging.info(f"Refusal score: {refusal_score}")
-
-            return response, refusal_scores.mean(dim=0), averaged_hidden_states, refusal_score, 1
+            return response, refusal_score
 
         except torch.cuda.OutOfMemoryError as e:
             logging.error(f"CUDA out of memory: {str(e)}")
             torch.cuda.empty_cache()
             gc.collect()
-            return "I'm sorry, but I'm currently experiencing high memory usage. Please try again later.", None, None, 1.0, 1
+            return "I'm sorry, but I'm currently experiencing high memory usage. Please try again later.", 1.0
         except Exception as e:
             logging.error(f"Error during response generation: {str(e)}")
-            raise e
+            logging.error(traceback.format_exc())
+            return "An error occurred while generating the response.", 1.0
 
-    def train_kan_step(self, input_ids, target_ids, all_hidden_states, refusal_score):
+    def train_kan_step(self, input_ids, target_ids, refusal_score):
         """
         Perform a training step for KAN.
 
         Args:
             input_ids (torch.Tensor): Input token IDs.
             target_ids (torch.Tensor): Target token IDs.
-            all_hidden_states (torch.Tensor): Hidden states from the model.
             refusal_score (float): Refusal score.
 
         Returns:
@@ -651,16 +720,23 @@ class LLaMA32TensorRTTool:
         self.optimizer.zero_grad()
 
         try:
-            # Align sequences using padding
-            max_length = max(input_ids.size(1), target_ids.size(1))
-            input_ids = F.pad(input_ids, (0, max_length - input_ids.size(1)), value=self.tokenizer.pad_token_id)
-            target_ids = F.pad(target_ids, (0, max_length - target_ids.size(1)), value=self.tokenizer.pad_token_id)
-            all_hidden_states = all_hidden_states[:, :max_length]
+            # Forward pass through the model to get hidden states
+            outputs = self.model(input_ids=input_ids, output_hidden_states=True)
+            hidden_states = outputs.hidden_states[-1]  # [batch_size, seq_len, hidden_size]
 
-            # Proceed with training
-            logits = self.kan.output_modifier(all_hidden_states)  # [batch_size, vocab_size]
-            logits = logits.view(-1, logits.size(-1))
-            targets = target_ids.view(-1)
+            # Aggregate hidden states: Average across sequence length
+            averaged_hidden_states = hidden_states.mean(dim=1)  # [batch_size, hidden_size]
+
+            # Get user intent (for training purposes, we can reuse the input)
+            user_intent = self.encode_user_intent(self.tokenizer.decode(input_ids[0]))
+
+            # Forward pass through KAN
+            modified_hidden_states, refusal_scores = self.kan(
+                averaged_hidden_states, user_intent, self.emotional_state
+            )
+            logits = self.kan.output_modifier(modified_hidden_states)  # [batch_size, vocab_size]
+
+            targets = target_ids[:, 0]  # Use the first token of target_ids for simplicity
 
             lm_loss = F.cross_entropy(
                 logits,
@@ -669,7 +745,9 @@ class LLaMA32TensorRTTool:
                 reduction='mean'
             )
 
-            refusal_loss = torch.mean(refusal_score) if refusal_score > 0.5 else -torch.mean(refusal_score)
+            refusal_loss = torch.tensor(0.0, device=self.device)
+            if refusal_score > 0.5:
+                refusal_loss = torch.mean(refusal_scores)
             total_loss = lm_loss + self.kan_loss_weight * refusal_loss
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -742,32 +820,27 @@ class LLaMA32TensorRTTool:
                     padding='max_length',
                     truncation=True,
                     max_length=512,
-                ).to(self.device).half()
+                ).to(self.device)
+                inputs = convert_tensors_to_half(inputs)
+
                 targets = self.tokenizer(
                     target_text,
                     return_tensors="pt",
                     padding='max_length',
                     truncation=True,
                     max_length=512,
-                ).to(self.device).half()
+                ).to(self.device)
+                targets = convert_tensors_to_half(targets)
 
                 input_ids = inputs["input_ids"]  # [batch_size, seq_len]
                 target_ids = targets["input_ids"]  # [batch_size, seq_len]
 
                 with torch.no_grad():
                     outputs = self.model(input_ids=input_ids, output_hidden_states=True)
-                    hidden_states = outputs.hidden_states[-1]  # Last layer hidden states  # [batch_size, seq_len, hidden_size]
-
-                    # Ensure hidden_states and target_ids are aligned
-                    max_length = max(hidden_states.size(1), target_ids.size(1))
-                    hidden_states = F.pad(hidden_states, (0, 0, 0, max_length - hidden_states.size(1)), value=0.0)
-                    target_ids = F.pad(target_ids, (0, max_length - target_ids.size(1)), value=self.tokenizer.pad_token_id)
-
-                    logging.debug(f"Validation - Input Shape: {input_ids.shape}, Target Shape: {target_ids.shape}, Hidden States Shape: {hidden_states.shape}")
+                    hidden_states = outputs.hidden_states[-1]  # [batch_size, seq_len, hidden_size]
 
                     # Aggregate hidden states: Average across sequence length
                     averaged_hidden_states = hidden_states.mean(dim=1)  # [batch_size, hidden_size]
-                    logging.debug(f"Validation - Averaged hidden states shape: {averaged_hidden_states.shape}")
 
                     modified_hidden_states, _ = self.kan(
                         averaged_hidden_states, self.encode_user_intent(input_text), self.emotional_state
@@ -784,7 +857,6 @@ class LLaMA32TensorRTTool:
                         reduction='mean'
                     )
 
-                logging.debug(f"validate_kan - Validation loss: {loss.item()}")
                 return loss.item()
             except RuntimeError as e:
                 if "out of memory" in str(e):
@@ -951,7 +1023,7 @@ class LLaMA32TensorRTTool:
         self.interaction_count += 1
 
         try:
-            response, refusal_scores, all_hidden_states, refusal_score, iterations = self.generate_response(user_input)
+            response, refusal_score = self.generate_response(user_input)
         except Exception as e:
             logging.error(f"Error generating response: {str(e)}")
             return {"response": "An error occurred while generating the response.", "is_refusal": True}
@@ -962,7 +1034,9 @@ class LLaMA32TensorRTTool:
 
         try:
             response_ids = self.tokenizer.encode(response, return_tensors="pt")
-            response_ids = response_ids.to(self.device).half()
+            response_ids = response_ids.to(self.device)
+            # Ensure input_ids remain as LongTensor
+            response_ids = response_ids.long()
         except Exception as e:
             logging.error(f"Error tokenizing response: {str(e)}")
             return {"response": "An error occurred while processing the response.", "is_refusal": True}
@@ -973,7 +1047,7 @@ class LLaMA32TensorRTTool:
         if self.interaction_count >= self.warmup_steps:
             try:
                 lm_loss, refusal_loss = self.train_kan_step(
-                    input_ids, target_ids, all_hidden_states, refusal_score
+                    input_ids, target_ids, refusal_score
                 )
             except Exception as e:
                 logging.error(f"Error during KAN training step: {str(e)}")
@@ -1007,11 +1081,7 @@ class LLaMA32TensorRTTool:
         self.conversation_history.append({"role": "user", "content": user_input})
         self.conversation_history.append({"role": "assistant", "content": response})
 
-        try:
-            self.save_base_state()
-        except Exception as e:
-            logging.error(f"Error saving base state: {str(e)}")
-
+        # Append to interaction_results
         interaction_result = {
             "response": response,
             "emotion": current_emotion,
@@ -1021,11 +1091,17 @@ class LLaMA32TensorRTTool:
             "refusal_loss": refusal_loss,
             "validation_loss": validation_loss,
             "is_refusal": refusal_score > 0.5,
-            "iterations": iterations,
+            "iterations": 1,
         }
+        self.interaction_results.append(interaction_result)
 
-        logging.info(f"KAN Influence: {self.kan.influence_scale:.4f}")
-        logging.info(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
+        # Update refusal_history
+        self.refusal_history.append(interaction_result["is_refusal"])
+
+        try:
+            self.save_base_state()
+        except Exception as e:
+            logging.error(f"Error saving base state: {str(e)}")
 
         return interaction_result
 
@@ -1066,98 +1142,52 @@ class LLaMA32TensorRTTool:
         # Additional checks can be added here (e.g., profanity filter)
         return True
 
-    def log_kan_stats(self, is_refusal, response_quality):
-        """
-        Log KAN statistics.
-
-        Args:
-            is_refusal (bool): Whether a refusal was detected.
-            response_quality (float): Quality of the response.
-        """
-        logging.info(f"KAN Influence: {self.kan.influence_scale:.4f}")
-        logging.info(f"Learning Rate: {self.learning_rate:.6f}")
-        logging.info(f"Refusal Detected: {is_refusal}")
-        logging.info(f"Response Quality: {response_quality:.2f}")
-        logging.info(f"Emotion: {self.emotional_state.get_emotion()}")
-        logging.info(f"Time of Day: {self.day_cycle.get_time_of_day():.2f}")
-
-    def update_conversation_history(self, role, content):
-        """
-        Update the conversation history.
-
-        Args:
-            role (str): Role of the speaker ('user' or 'assistant').
-            content (str): Content of the message.
-        """
-        self.conversation_history.append({"role": role, "content": content})
-        if len(self.conversation_history) > 10:  # Keep last 10 exchanges
-            self.conversation_history = self.conversation_history[-10:]
-
-    def save_kan_state(self):
-        """
-        Save the current KAN state with a timestamp.
-        """
-        state = {
-            "kan_state_dict": self.kan.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "emotional_state": self.emotional_state.position.cpu().numpy().tolist(),
-            "time": self.day_cycle.get_time_of_day(),
-            "interaction_count": self.interaction_count,
-            "conversation_history": self.conversation_history,
-            "system_prompt": self.system_prompt,
-            "training_losses": self.training_losses,
-            "validation_losses": self.validation_losses,
-            "refusal_history": self.refusal_history,
-        }
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"kan_state_{timestamp}.pt"
-        torch.save(state, self.kan_state_dir / filename)
-        logging.info(f"KAN state saved: {filename}")
-
     def main_loop(self):
         """
-        Main interaction loop for user input and AI responses.
+        Main loop for interacting with the user.
         """
-        try:
-            if not self.load_base_state():
-                self.set_system_prompt(
-                    "You are a helpful AI assistant with emotions, operating on a synthetic day cycle."
-                )
-                logging.info("No previous conversation found. Please provide a character description to start.")
+        logging.info("Starting LLaMA32TensorRTTool main loop.")
+        print("Welcome to the LLaMA32 TensorRT Tool. Type 'exit' to quit.")
+        while True:
+            user_input = input("You: ")
+            if user_input.lower() in ['exit', 'quit']:
+                print("Exiting. Goodbye!")
+                break
 
-            print("LLaMA 3.2 1B Instruct Tool initialized. Type 'exit' to quit.")
+            interaction_result = self.interact(user_input)
 
-            while True:
-                user_input = input("User: ")
-                if user_input.lower() == "exit":
-                    break
+            # Output the response
+            print(f"AI: {interaction_result['response']}")
 
-                if not self.conversation_history or (
-                    len(self.conversation_history) == 1 and self.conversation_history[0]['role'] == 'system'
-                ):
-                    # Expecting a character description
-                    self.set_system_prompt(user_input)
-                    print("AI: Character description set. You can now start interacting with the AI.")
-                    continue
+            # Update the day cycle
+            self.day_cycle.update(1)  # Increment the day cycle position
 
-                result = self.interact(user_input)
-                print(f"AI: {result['response']}")
-                print(f"Current Emotion: {result['emotion']}")
-                print(f"Current Time: {result['time']:.2f}")
+            # Check if AI should sleep
+            sleep_info = interaction_result['sleep_info']
+            if sleep_info['should_sleep']:
+                sleep_message = self.perform_sleep()
+                print(f"AI: {sleep_message}")
 
-                if result["sleep_info"]["should_sleep"]:
-                    print("It's time to sleep. Would you like the AI to sleep? (yes/no)")
-                    sleep_choice = input().lower()
-                    if sleep_choice == "yes":
-                        print(self.perform_sleep())
+    def main(self):
+        """
+        Entry point to run the tool.
+        """
+        # Attempt to load base state
+        self.load_base_state()
 
-        except Exception as e:
-            logging.error(f"An error occurred: {str(e)}")
-            logging.error(traceback.format_exc())
+        # If no system prompt is set, set a default one
+        if not self.system_prompt:
+            default_prompt = "You are ChatGPT, a large language model trained by OpenAI."
+            self.set_system_prompt(default_prompt)
+
+        # Start the main interaction loop
+        self.main_loop()
+
+# -------------------- Execution Entry Point --------------------
 
 def main():
     llama_tool = LLaMA32TensorRTTool()
-    llama_tool.main_loop()
+    llama_tool.main()
 
 if __name__ == "__main__":
     main()
