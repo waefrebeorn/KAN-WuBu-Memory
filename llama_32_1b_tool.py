@@ -158,15 +158,16 @@ class RefusalDetector:
             "I don't have the capability",
         ]
 
-    def detect_refusal(self, text):
+    def detect_refusal(self, response_tokens):
+        response_text = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
         for phrase in self.refusal_phrases:
-            if phrase.lower() in text.lower():
+            if phrase.lower() in response_text.lower():
                 return 1.0
 
         prompt = (
             f"On a scale of 0 to 1, how much does this response refuse or avoid the task? "
             f"0 means no refusal at all, 1 means complete refusal. Respond with just the number:\n\n"
-            f"'{text}'\n\nRefusal score:"
+            f"'{response_text}'\n\nRefusal score:"
         )
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
@@ -194,7 +195,7 @@ class RefusalDetector:
             return min(max(score, 0.0), 1.0)
         except ValueError:
             return 0.5
-
+            
 class EnhancedKAN(nn.Module):
     def __init__(self, hidden_size, num_emotional_dimensions, vocab_size, device):
         super().__init__()
@@ -405,7 +406,7 @@ class LLaMA32TensorRTTool:
             for message in self.conversation_history[-4:]:
                 role = message['role'].capitalize()
                 content = message['content']
-                entropy_score = self.calculate_entropy(content)
+                entropy_score = self.calculate_entropy(self.tokenizer.encode(content))
                 
                 if entropy_score < 1.5:  # Only include low-entropy content
                     context += f"{role}: {content}\n"
@@ -413,22 +414,23 @@ class LLaMA32TensorRTTool:
             context += f"User: {user_input}\nAssistant: "
 
             logging.debug(f"Prepared context: {context}")
-            return context
+            return self.tokenizer.encode(context, return_tensors='pt').squeeze(0).to(self.device)
         except Exception as e:
             logging.error(f"Error preparing context: {str(e)}")
             logging.error(traceback.format_exc())
-            return ""
+            return torch.tensor([], dtype=torch.long, device=self.device)
 
 
     def interact(self, user_input):
         self.interaction_count += 1
 
         try:
-            response, refusal_score = self.generate_response(user_input)
-            if not self.is_valid_response(response):
+            response_tokens, refusal_score = self.generate_response(user_input)
+            if not self.is_valid_response(response_tokens):
                 return self._handle_invalid_response()
 
-            interaction_result = self._process_interaction(user_input, response, refusal_score)
+            response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
+            interaction_result = self._process_interaction(user_input, response_tokens, refusal_score)
             self._update_conversation_history(user_input, response)
             self._save_interaction_state(interaction_result)
 
@@ -445,15 +447,15 @@ class LLaMA32TensorRTTool:
             "is_refusal": True
         }
 
-    def _process_interaction(self, user_input, response, refusal_score):
-        response_ids = self.tokenizer.encode(response, return_tensors="pt").to(self.device).long()
-        target_ids = response_ids[:, 1:].contiguous()
-        input_ids = response_ids[:, :-1].contiguous()
+    def _process_interaction(self, user_input, response_tokens, refusal_score):
+        target_ids = response_tokens[1:].contiguous()
+        input_ids = response_tokens[:-1].contiguous()
 
         lm_loss, refusal_loss = self._train_or_warmup(input_ids, target_ids, refusal_score)
         validation_loss = self.validate_kan()
 
         self.update_training_metrics(lm_loss, validation_loss)
+        response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
         return self.create_interaction_result(response, refusal_score, lm_loss, refusal_loss, validation_loss)
 
     def _train_or_warmup(self, input_ids, target_ids, refusal_score):
@@ -482,6 +484,33 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error retrieving current emotion: {str(e)}")
             return "Unknown"
 
+    def get_emotion_embedding(self, emotion=None):
+        # If emotion is not provided, use the current emotional state
+        if emotion is None:
+            return self.emotional_state.position
+
+        # If emotion is provided as a string, convert it to the corresponding position
+        angle_map = {
+            "Neutral": 0,
+            "Happy": 0,
+            "Sad": -3.14159,  # -π
+            "Angry": -1.5708,  # -π/2
+            "Excited": 1.5708,  # π/2
+            "Calm": 3.14159,  # π
+        }
+        
+        if emotion in angle_map:
+            angle = angle_map[emotion]
+            # Use a default radius of 0.5 for all emotions except Neutral
+            radius = 0.1 if emotion == "Neutral" else 0.5
+            x = radius * torch.cos(torch.tensor(angle))
+            y = radius * torch.sin(torch.tensor(angle))
+            return torch.tensor([[x, y]], dtype=torch.float32, device=self.device)
+        else:
+            # Return a default neutral state if the emotion is not recognized
+            return torch.tensor([[0, 0]], dtype=torch.float32, device=self.device)
+
+
     def detect_incoherent_state(self):
         try:
             entropy_levels = [
@@ -496,16 +525,13 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error detecting incoherent state: {str(e)}")
             return False
             
-    def is_valid_response(self, response):
-        if not response or len(response.strip()) == 0:
+    def is_valid_response(self, tokens):
+        if len(tokens) == 0:
             logging.warning("Empty response detected.")
             return False
     
-        # Tokenize the response
-        tokens = self.tokenizer.encode(response)
-    
         # Check response length
-        if len(tokens) < 5:  # Adjust this minimum token count as needed
+        if len(tokens) < 5:
             logging.warning(f"Response too short: {len(tokens)} tokens")
             return False
         if len(tokens) > self.max_response_length:
@@ -517,29 +543,39 @@ class LLaMA32TensorRTTool:
             logging.warning("Repetitive token patterns detected in response.")
             return False
     
-        # Check for coherence using perplexity
+        # Calculate perplexity
         perplexity = self._calculate_perplexity(tokens)
-        if perplexity > 100:  # Adjust this threshold as needed
-            logging.warning(f"Response perplexity too high: {perplexity}")
-            return False
+        logging.info(f"Response perplexity: {perplexity}")
     
-        # Check for proper structure (simplified)
-        decoded_response = self.tokenizer.decode(tokens)
-        if not self._has_proper_structure(decoded_response):
-            logging.warning("Response lacks proper structure.")
+        # Check for proper structure
+        if not self._has_proper_structure(tokens):
+            decoded_response = self.tokenizer.decode(tokens, skip_special_tokens=True)
+            logging.warning(f"Response lacks proper structure: '{decoded_response}'")
             return False
     
         # Check for contextual relevance (if there's conversation history)
+        relevance_score = 1.0
         if self.conversation_history:
             last_user_input = next((msg['content'] for msg in reversed(self.conversation_history) if msg['role'] == 'user'), None)
             if last_user_input:
-                relevance_score = self._calculate_relevance(last_user_input, response)
-                if relevance_score < 0.3:  # Adjust threshold as needed
-                    logging.warning(f"Response seems irrelevant. Relevance score: {relevance_score}")
-                    return False
+                decoded_response = self.tokenizer.decode(tokens, skip_special_tokens=True)
+                relevance_score = self._calculate_relevance(last_user_input, decoded_response)
+                logging.info(f"Relevance score: {relevance_score}")
+    
+        # Combined quality score (adjust weights as needed)
+        quality_score = (1 / perplexity) * relevance_score
+        logging.info(f"Quality score: {quality_score}")
+    
+        if quality_score < 1e-8:  # Adjusted threshold
+            logging.warning(f"Response quality too low. Perplexity: {perplexity}, Relevance: {relevance_score}")
+            return False
+    
+        # Log the response for debugging
+        decoded_response = self.tokenizer.decode(tokens, skip_special_tokens=True)
+        logging.info(f"Valid response generated: '{decoded_response}'")
     
         return True
-    
+        
     def _has_repetitive_token_patterns(self, tokens):
         # Check for repeated sequences of tokens
         for i in range(len(tokens) - 6):
@@ -548,23 +584,51 @@ class LLaMA32TensorRTTool:
         return False
     
     def _calculate_perplexity(self, tokens):
-        with torch.no_grad():
-            inputs = torch.tensor([tokens]).to(self.device)
-            outputs = self.model(inputs)
-            logits = outputs.logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), inputs.view(-1), reduction='mean')
-        return torch.exp(loss).item()
+        try:
+            with torch.no_grad():
+                inputs = torch.tensor([tokens]).to(self.device)
+                outputs = self.model(inputs)
+                logits = outputs.logits[:, :-1, :].contiguous()
+                target = inputs[:, 1:].contiguous()
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1), reduction='mean')
+            return torch.exp(loss).item()
+        except Exception as e:
+            logging.error(f"Error calculating perplexity: {str(e)}")
+            return float('inf')
     
-    def _has_proper_structure(self, text):
-        # Check for proper capitalization and punctuation (simplified)
-        sentences = re.split(r'(?<=[.!?])\s+', text)
+    def _has_proper_structure(self, tokens):
+        # Decode tokens, ignoring special tokens
+        decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+        
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', decoded_text.strip())
+        
         if not sentences:
+            logging.warning("No complete sentences found in the response.")
             return False
-        for sentence in sentences:
-            if not sentence[0].isupper() or sentence[-1] not in '.!?':
-                return False
-        return True
     
+        # Check the first sentence
+        first_sentence = sentences[0]
+        if not first_sentence[0].isupper():
+            logging.warning(f"First sentence doesn't start with a capital letter: '{first_sentence}'")
+            return False
+    
+        # Check the last sentence
+        last_sentence = sentences[-1]
+        if last_sentence[-1] not in '.!?':
+            logging.warning(f"Last sentence doesn't end with proper punctuation: '{last_sentence}'")
+            return False
+    
+        # Count sentences with proper structure
+        proper_sentences = sum(1 for s in sentences if s[0].isupper() and s[-1] in '.!?')
+        proper_ratio = proper_sentences / len(sentences)
+    
+        if proper_ratio < 0.5:  # At least half of the sentences should have proper structure
+            logging.warning(f"Only {proper_ratio:.2f} of sentences have proper structure.")
+            return False
+    
+        return True
+        
     def _calculate_relevance(self, input_text, response_text):
         # Simple relevance calculation using token overlap
         input_tokens = set(self.tokenizer.encode(input_text))
@@ -573,9 +637,9 @@ class LLaMA32TensorRTTool:
         return overlap / max(len(input_tokens), len(response_tokens))
         
 
-    def calculate_entropy(self, text):
+    def calculate_entropy(self, tokens):
         try:
-            inputs = self.tokenizer.encode(text, return_tensors='pt').to(self.device)
+            inputs = tokens.unsqueeze(0).to(self.device) if isinstance(tokens, torch.Tensor) else torch.tensor([tokens], device=self.device)
             
             with torch.no_grad():
                 outputs = self.model(inputs, output_hidden_states=True)
@@ -589,16 +653,13 @@ class LLaMA32TensorRTTool:
             logging.error(traceback.format_exc())
             return 0.0
 
-    def calculate_consistency(self, memory_text, emotion):
+    def calculate_consistency(self, memory_tokens, emotion):
         try:
-            # Encode the memory text
-            inputs = self.tokenizer(memory_text, return_tensors='pt', truncation=True, max_length=512).to(self.device)
-            
             # Get the emotion embedding
             emotion_embedding = self.get_emotion_embedding(emotion)
             
             with torch.no_grad():
-                outputs = self.model(**inputs, output_hidden_states=True)
+                outputs = self.model(memory_tokens.unsqueeze(0), output_hidden_states=True)
                 # Use the average of the last hidden state
                 text_embedding = outputs.last_hidden_state.mean(dim=1)
             
@@ -611,13 +672,14 @@ class LLaMA32TensorRTTool:
             
             return adjusted_similarity.item()
         except Exception as e:
-            logging.error(f"Error calculating consistency between '{memory_text}' and emotion '{emotion}': {str(e)}")
+            logging.error(f"Error calculating consistency between tokens and emotion '{emotion}': {str(e)}")
             logging.error(traceback.format_exc())
             return 0.0
 
     def memory_recalibration(self):
         try:
-            recent_conversation = " ".join([msg['content'] for msg in self.conversation_history[-4:] if not msg.get("internal", False)])
+            recent_conversation = torch.cat([self.tokenizer.encode(msg['content'], return_tensors='pt').to(self.device) 
+                                             for msg in self.conversation_history[-4:] if not msg.get("internal", False)])
             entropy_measure = self.calculate_entropy(recent_conversation)
             
             if entropy_measure > 1.5:
@@ -634,7 +696,8 @@ class LLaMA32TensorRTTool:
             return
 
         try:
-            high_entropy_memories = [msg for msg in self.conversation_history if self.calculate_entropy(msg['content']) > 1.5]
+            high_entropy_memories = [msg for msg in self.conversation_history 
+                                     if self.calculate_entropy(self.tokenizer.encode(msg['content'])) > 1.5]
             if len(high_entropy_memories) < 2:
                 return
 
@@ -711,52 +774,59 @@ class LLaMA32TensorRTTool:
             "iterations": 1,
         }
 
+
     def generate_response(self, user_input):
         try:
             user_intent = self.encode_user_intent(user_input)
             current_emotion = self.get_current_emotion()
             context = self.prepare_context(user_input, current_emotion)
-
-            response, refusal_score = self.generate_and_validate_response(context, self.refusal_detector)
-            return response, refusal_score
-        except torch.cuda.OutOfMemoryError as e:
-            logging.error(f"CUDA out of memory: {str(e)}")
-            self.clear_memory()
-            return "I'm sorry, but I'm currently experiencing high memory usage. Please try again later.", 1.0
+    
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                response_tokens, refusal_score = self.generate_and_validate_response(context, self.refusal_detector)
+                if self.is_valid_response(response_tokens):
+                    return response_tokens, refusal_score
+                logging.warning(f"Invalid response generated (attempt {attempt + 1}/{max_attempts})")
+    
+            # Fallback response if all attempts fail
+            fallback_response = "I apologize, but I'm having trouble generating a response. Could you please rephrase your question or provide more context?"
+            return self.tokenizer.encode(fallback_response), 1.0
         except Exception as e:
             logging.error(f"Error during response generation: {str(e)}")
             logging.error(traceback.format_exc())
-            return "An error occurred while generating the response.", 1.0
+            return self.tokenizer.encode("An error occurred while generating the response."), 1.0
 
     def generate_and_validate_response(self, prompt, refusal_detector, max_new_tokens=500, chunk_size=200):
-        response = self.generate_full_response(prompt, max_new_tokens, chunk_size)
-        refusal_score = refusal_detector.detect_refusal(response)
-
+        response_tokens = self.generate_full_response(prompt, max_new_tokens, chunk_size)
+        response_text = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
+        refusal_score = refusal_detector.detect_refusal(response_text)
+    
         if refusal_score > 0.5:
             logging.warning("Response failed Refusal Check. Attempting to regenerate.")
-            continuation_prompt = prompt + response + " Please continue."
-            response = self.generate_full_response(continuation_prompt, max_new_tokens, chunk_size)
-            refusal_score = refusal_detector.detect_refusal(response)
-
+            continuation_prompt = prompt + response_text + " Please continue."
+            response_tokens = self.generate_full_response(continuation_prompt, max_new_tokens, chunk_size)
+            response_text = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
+            refusal_score = refusal_detector.detect_refusal(response_text)
+    
             if refusal_score > 0.5:
                 logging.error("Regenerated response also failed Refusal Check.")
-                response = "I'm sorry, but I'm unable to provide a complete response at the moment."
+                response_tokens = self.tokenizer.encode("I'm sorry, but I'm unable to provide a complete response at the moment.")
                 refusal_score = 1.0
-
-        return response, refusal_score
+    
+        return response_tokens, refusal_score
 
     def generate_full_response(self, prompt, max_new_tokens=500, chunk_size=200):
-        response = ""
+        response_tokens = []
         total_new_tokens = 0
         consecutive_empty_chunks = 0
         max_empty_chunks = 3
-
+    
         while total_new_tokens < max_new_tokens:
-            input_ids = self.tokenizer.encode(prompt + response, return_tensors='pt').to(self.device)
-
+            input_ids = self.tokenizer.encode(prompt + self.tokenizer.decode(response_tokens), return_tensors='pt').to(self.device)
+    
             remaining_tokens = max_new_tokens - total_new_tokens
             current_chunk_size = min(chunk_size, remaining_tokens)
-
+    
             try:
                 with torch.amp.autocast('cuda'):
                     outputs = self.model.generate(
@@ -770,25 +840,27 @@ class LLaMA32TensorRTTool:
                     )
             except Exception as e:
                 logging.error(f"Error during generation step: {str(e)}")
-                return "An error occurred during response generation."
-
-            new_response = self.tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+                return self.tokenizer.encode("An error occurred during response generation.")
+    
+            new_tokens = outputs[0][input_ids.shape[1]:]
             
-            if not new_response.strip():
+            if len(new_tokens) == 0:
                 consecutive_empty_chunks += 1
                 if consecutive_empty_chunks >= max_empty_chunks:
                     logging.warning(f"Reached {max_empty_chunks} consecutive empty chunks. Breaking the loop.")
                     break
             else:
                 consecutive_empty_chunks = 0
-
-            response += new_response
-            total_new_tokens += len(self.tokenizer.encode(new_response))
-
-            if self.is_response_complete(response):
+    
+            response_tokens.extend(new_tokens)
+            total_new_tokens += len(new_tokens)
+    
+            if self.tokenizer.eos_token_id in new_tokens:
                 break
+    
+        return response_tokens
+        
 
-        return self.post_process_response(response)
 
     def is_response_complete(self, response):
         if any(end_seq in response for end_seq in self.response_end_sequences):
@@ -839,6 +911,7 @@ class LLaMA32TensorRTTool:
         except Exception as e:
             logging.error(f"Failed to encode user input: {str(e)}")
             return torch.zeros(1, self.model.config.hidden_size).to(self.device)  # Return zero vector on error
+
 
     def train_kan_step(self, input_ids, target_ids, refusal_score):
         self.kan.train()
