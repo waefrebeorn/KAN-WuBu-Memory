@@ -16,7 +16,7 @@ import os
 import sys
 import warnings
 import re
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 
 # -------------------- Logging Configuration --------------------
 
@@ -131,86 +131,6 @@ class EmotionalState:
         else:
             return "Calm"
 
-class AdaptiveKANLayer(nn.Module):
-    def __init__(self, input_size, output_size, num_knots=10, temperature=0.666):
-        super(AdaptiveKANLayer, self).__init__()
-        self.input_size = input_size
-        self.output_size = output_size
-        self.num_knots = num_knots
-        self.temperature = temperature
-
-        # Define spline parameters
-        self.knots = nn.Parameter(torch.linspace(-1, 1, num_knots))
-        self.coeffs = nn.Parameter(torch.randn(input_size, output_size, num_knots))
-
-    def forward(self, x):
-        weights = self.compute_spline_weights(x)
-        return torch.matmul(x, weights)
-
-    def compute_spline_weights(self, x):
-        weights = F.interpolate(self.coeffs.unsqueeze(0), size=(self.num_knots,)).squeeze(0)
-        return weights
-
-    def calculate_entropy(self, logits):
-        p = F.softmax(logits, dim=-1)
-        entropy = -torch.sum(p * torch.log(p + 1e-9), dim=-1)
-        return entropy
-
-    def adaptive_update(self, entropy, variance):
-        if entropy < 0.1 and variance < 0.1:
-            self.prune_knots()
-        elif entropy > 5.0 and variance < 0.1:
-            self.extend_knots()
-        elif entropy < 5.0 and variance > 5.0:
-            self.refine_coeffs()
-        elif entropy > 5.0 and variance > 5.0:
-            self.increase_capacity()
-        else:
-            self.moderate_update()
-
-    def prune_knots(self):
-        if self.num_knots > 3:
-            self.num_knots -= 1
-            self.knots = nn.Parameter(torch.linspace(-1, 1, self.num_knots))
-            self.coeffs = nn.Parameter(torch.randn(self.input_size, self.output_size, self.num_knots))
-
-    def extend_knots(self):
-        self.num_knots += 1
-        self.knots = nn.Parameter(torch.linspace(-1, 1, self.num_knots))
-        self.coeffs = nn.Parameter(torch.randn(self.input_size, self.output_size, self.num_knots))
-
-    def refine_coeffs(self):
-        with torch.no_grad():
-            self.coeffs += torch.randn_like(self.coeffs) * 0.01
-
-    def increase_capacity(self):
-        with torch.no_grad():
-            self.coeffs = nn.Parameter(torch.cat([self.coeffs, torch.randn(self.input_size, self.output_size, self.num_knots)], dim=1))
-
-    def moderate_update(self):
-        self.refine_coeffs()
-
-class AdaptiveKANNetwork(nn.Module):
-    def __init__(self, input_size, hidden_sizes, output_size, num_layers=3, temperature=0.666):
-        super(AdaptiveKANNetwork, self).__init__()
-        self.input_size = input_size
-        self.hidden_sizes = hidden_sizes
-        self.output_size = output_size
-        self.num_layers = num_layers
-        self.temperature = temperature
-
-        self.layers = nn.ModuleList()
-        in_size = input_size
-        for hidden_size in hidden_sizes:
-            self.layers.append(AdaptiveKANLayer(in_size, hidden_size, num_knots=10, temperature=temperature))
-            in_size = hidden_size
-        self.output_layer = AdaptiveKANLayer(in_size, output_size, num_knots=10, temperature=temperature)
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-            x = F.relu(x)
-        return self.output_layer(x)
 class RefusalOverrideModule(nn.Module):
     def __init__(self, hidden_size, num_emotional_dimensions, device):
         super().__init__()
@@ -314,6 +234,7 @@ class RefusalDetector:
             "I don't feel comfortable",
             "I'm not able to",
             "I cannot assist with",
+            "I'm unable to provide",
             "I won't be able to",
             "I don't have the capability",
         ]
@@ -454,7 +375,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error initializing components: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError("Failed to initialize components.")
-            
+
     def _ensure_special_tokens(self):
         special_tokens_map_file = Path(self.model_path) / 'special_tokens_map.json'
         if special_tokens_map_file.exists():
@@ -978,11 +899,9 @@ class LLaMA32TensorRTTool:
 
         self.main_loop()
 
-
 def main():
     llama_tool = LLaMA32TensorRTTool()
     llama_tool.main()
-
 
 if __name__ == "__main__":
     main()
