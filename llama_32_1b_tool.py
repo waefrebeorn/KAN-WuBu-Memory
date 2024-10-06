@@ -258,7 +258,7 @@ class LLaMA32TensorRTTool:
         self.overfit_detector = OverfitDetector()
         self.day_cycle = SyntheticDayCycle()
 
-        self.scaler = GradScaler()
+        self.scaler = torch.amp.GradScaler('cuda')
 
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
@@ -419,6 +419,7 @@ class LLaMA32TensorRTTool:
             logging.error(traceback.format_exc())
             return ""
 
+
     def interact(self, user_input):
         self.interaction_count += 1
 
@@ -488,10 +489,89 @@ class LLaMA32TensorRTTool:
                 for msg in self.conversation_history[-5:]
                 if msg['role'] == 'assistant'
             ]
+            if not entropy_levels:
+                return False
             return sum(1 for level in entropy_levels if level > 1.5) / len(entropy_levels) > 0.5
         except Exception as e:
             logging.error(f"Error detecting incoherent state: {str(e)}")
             return False
+            
+    def is_valid_response(self, response):
+        if not response or len(response.strip()) == 0:
+            logging.warning("Empty response detected.")
+            return False
+    
+        # Tokenize the response
+        tokens = self.tokenizer.encode(response)
+    
+        # Check response length
+        if len(tokens) < 5:  # Adjust this minimum token count as needed
+            logging.warning(f"Response too short: {len(tokens)} tokens")
+            return False
+        if len(tokens) > self.max_response_length:
+            logging.warning(f"Response exceeds maximum length: {len(tokens)} tokens")
+            return False
+    
+        # Check for repetitive patterns in tokens
+        if self._has_repetitive_token_patterns(tokens):
+            logging.warning("Repetitive token patterns detected in response.")
+            return False
+    
+        # Check for coherence using perplexity
+        perplexity = self._calculate_perplexity(tokens)
+        if perplexity > 100:  # Adjust this threshold as needed
+            logging.warning(f"Response perplexity too high: {perplexity}")
+            return False
+    
+        # Check for proper structure (simplified)
+        decoded_response = self.tokenizer.decode(tokens)
+        if not self._has_proper_structure(decoded_response):
+            logging.warning("Response lacks proper structure.")
+            return False
+    
+        # Check for contextual relevance (if there's conversation history)
+        if self.conversation_history:
+            last_user_input = next((msg['content'] for msg in reversed(self.conversation_history) if msg['role'] == 'user'), None)
+            if last_user_input:
+                relevance_score = self._calculate_relevance(last_user_input, response)
+                if relevance_score < 0.3:  # Adjust threshold as needed
+                    logging.warning(f"Response seems irrelevant. Relevance score: {relevance_score}")
+                    return False
+    
+        return True
+    
+    def _has_repetitive_token_patterns(self, tokens):
+        # Check for repeated sequences of tokens
+        for i in range(len(tokens) - 6):
+            if tokens[i:i+3] == tokens[i+3:i+6]:
+                return True
+        return False
+    
+    def _calculate_perplexity(self, tokens):
+        with torch.no_grad():
+            inputs = torch.tensor([tokens]).to(self.device)
+            outputs = self.model(inputs)
+            logits = outputs.logits
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), inputs.view(-1), reduction='mean')
+        return torch.exp(loss).item()
+    
+    def _has_proper_structure(self, text):
+        # Check for proper capitalization and punctuation (simplified)
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        if not sentences:
+            return False
+        for sentence in sentences:
+            if not sentence[0].isupper() or sentence[-1] not in '.!?':
+                return False
+        return True
+    
+    def _calculate_relevance(self, input_text, response_text):
+        # Simple relevance calculation using token overlap
+        input_tokens = set(self.tokenizer.encode(input_text))
+        response_tokens = set(self.tokenizer.encode(response_text))
+        overlap = len(input_tokens.intersection(response_tokens))
+        return overlap / max(len(input_tokens), len(response_tokens))
+        
 
     def calculate_entropy(self, text):
         try:
@@ -511,16 +591,27 @@ class LLaMA32TensorRTTool:
 
     def calculate_consistency(self, memory_text, emotion):
         try:
-            emotion_vector = torch.tensor(self.emotional_state.position, dtype=torch.float32, device=self.device)
-            inputs = self.tokenizer(memory_text, return_tensors='pt').to(self.device)
+            # Encode the memory text
+            inputs = self.tokenizer(memory_text, return_tensors='pt', truncation=True, max_length=512).to(self.device)
+            
+            # Get the emotion embedding
+            emotion_embedding = self.get_emotion_embedding(emotion)
+            
             with torch.no_grad():
-                outputs = self.model(**inputs)
-                hidden_state = outputs.last_hidden_state.mean(dim=1)
-
-            similarity = F.cosine_similarity(hidden_state, emotion_vector, dim=-1)
-            return similarity.item()
+                outputs = self.model(**inputs, output_hidden_states=True)
+                # Use the average of the last hidden state
+                text_embedding = outputs.last_hidden_state.mean(dim=1)
+            
+            # Calculate cosine similarity between text and emotion embeddings
+            similarity = F.cosine_similarity(text_embedding, emotion_embedding, dim=-1)
+            
+            # Adjust similarity based on emotion intensity
+            emotion_intensity = torch.norm(self.emotional_state.position)
+            adjusted_similarity = similarity * emotion_intensity
+            
+            return adjusted_similarity.item()
         except Exception as e:
-            logging.error(f"Error calculating consistency: {str(e)}")
+            logging.error(f"Error calculating consistency between '{memory_text}' and emotion '{emotion}': {str(e)}")
             logging.error(traceback.format_exc())
             return 0.0
 
@@ -667,7 +758,7 @@ class LLaMA32TensorRTTool:
             current_chunk_size = min(chunk_size, remaining_tokens)
 
             try:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     outputs = self.model.generate(
                         input_ids,
                         max_new_tokens=current_chunk_size,
@@ -754,7 +845,7 @@ class LLaMA32TensorRTTool:
         self.optimizer.zero_grad()
 
         try:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True)
                 hidden_states = outputs.hidden_states[-1]
 
