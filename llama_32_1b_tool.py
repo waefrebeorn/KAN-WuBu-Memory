@@ -92,7 +92,6 @@ class EmotionalState:
         norm = torch.norm(self.position, dim=1, keepdim=True)
         self.position = torch.where(norm > 1, self.position / norm, self.position)
 
-
     def get_emotion(self):
         valence, arousal, dominance = self.position.squeeze().tolist()
         if abs(valence) < 0.3 and abs(arousal) < 0.3 and abs(dominance) < 0.3:
@@ -108,9 +107,12 @@ class EmotionalState:
             else:
                 return "Sad" if dominance > 0 else "Depressed"
 
-    def get_embedding(self):
+    def get_embedding(self, batch_size=1):
+        # Ensure the embedding is of shape (batch_size, num_emotional_dimensions)
+        if batch_size != self.position.size(0):
+            return self.position.expand(batch_size, -1)
         return self.position
-
+        
 class OverfitDetector:
     def __init__(self, window_size=50, threshold=0.05):
         self.window_size = window_size
@@ -325,9 +327,14 @@ class EnhancedKAN(nn.Module):
         super().__init__()
         self.device = device
         dtype = torch.float16
-
-        input_size = hidden_size + hidden_size + num_emotional_dimensions + 1
-        self.refusal_override = nn.Linear(input_size, hidden_size, dtype=dtype).to(device)
+        
+        self.hidden_size = hidden_size
+        self.emotional_size = num_emotional_dimensions
+        
+        # Adjust input size: hidden_size (for hidden_states mean) + hidden_size (for user_intent) + emotional_dimensions
+        self.input_size = hidden_size + hidden_size + num_emotional_dimensions
+        
+        self.refusal_override = nn.Linear(self.input_size, hidden_size, dtype=dtype).to(device)
         self.output_modifier = nn.Linear(hidden_size, vocab_size, dtype=dtype).to(device)
         self.influence_scale = 0.01
 
@@ -336,41 +343,36 @@ class EnhancedKAN(nn.Module):
             if self.training:
                 hidden_states = hidden_states.requires_grad_()
 
-            # Ensure consistent dtype for all inputs
+            # Ensure consistent dtype and device for all inputs
             hidden_states = hidden_states.to(self.device).to(torch.float16)
             user_intent = user_intent.to(self.device).to(torch.float16)
             position = emotional_state.get_embedding().to(self.device).to(torch.float16)
 
+            # Average hidden_states across the sequence dimension
             if hidden_states.dim() == 3:
-                batch_size, seq_length, hidden_dim = hidden_states.shape
-                hidden_states = hidden_states.view(batch_size * seq_length, hidden_dim)
+                hidden_states_mean = hidden_states.mean(dim=1)
             else:
-                batch_size, hidden_dim = hidden_states.shape
+                hidden_states_mean = hidden_states
 
-            # Adjust dimensions to match hidden_states
-            if user_intent.shape[0] != hidden_states.shape[0]:
-                user_intent = user_intent.expand(hidden_states.shape[0], -1)
-            if position.shape[0] != hidden_states.shape[0]:
-                position = position.expand(hidden_states.shape[0], -1)
-
-            # Compute refusal scores
-            refusal_scores = torch.sigmoid(self.refusal_override(hidden_states))
+            # Ensure user_intent has the right shape
+            if user_intent.dim() == 3:
+                user_intent = user_intent.squeeze(1)
 
             # Concatenate features
-            override_input = torch.cat([hidden_states, user_intent, position, refusal_scores], dim=1).to(hidden_states.dtype)
+            kan_input = torch.cat([hidden_states_mean, user_intent, position], dim=-1)
 
-            # Ensure correct input size for the linear layer
-            override = self.refusal_override(override_input)
+            # Apply refusal override
+            refusal_scores = torch.sigmoid(self.refusal_override(kan_input))
 
-            # Modify hidden states using the override layer output
-            modified_hidden_states = hidden_states + self.influence_scale * (override - hidden_states)
+            # Modify hidden states using the refusal scores
+            modified_hidden_states = hidden_states + self.influence_scale * refusal_scores.unsqueeze(1)
 
             return modified_hidden_states, refusal_scores
         except Exception as e:
             logging.error(f"Error in EnhancedKAN.forward: {str(e)}")
             logging.error(traceback.format_exc())
-            return hidden_states, torch.zeros_like(hidden_states[:, :1])
-
+            return hidden_states, torch.zeros_like(hidden_states[:, 0])
+            
 class EntropyManager:
     def __init__(self, model, tokenizer, device):
         self.model = model
