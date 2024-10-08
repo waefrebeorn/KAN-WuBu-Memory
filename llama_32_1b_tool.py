@@ -500,10 +500,9 @@ class LLaMA32TensorRTTool:
         try:
             current_emotion = self.emotional_state.get_emotion()
             context = self.memory_manager.get_context(current_emotion)
-            context += f"<|start_header_id|>user<|end_header_id|>\n{user_input}<|eot_id|>"
-            context += f"<|start_header_id|>assistant<|end_header_id|>\n"
-
-            input_ids = self.tokenizer.encode(context, return_tensors='pt').to(self.device)
+            prompt = f"{context}\nUser: {user_input}\nCowgirl assistant:"
+    
+            input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
             
             response_tokens = []
             total_entropy = 0
@@ -517,7 +516,7 @@ class LLaMA32TensorRTTool:
                     total_entropy += local_entropy
                     
                     if self.entropy_manager.should_trigger_cot(local_entropy):
-                        cot_response = self.trigger_chain_of_thought(context + self.tokenizer.decode(response_tokens))
+                        cot_response = self.trigger_chain_of_thought(prompt + self.tokenizer.decode(response_tokens))
                         response_tokens.extend(self.tokenizer.encode(cot_response))
                         break
                     
@@ -529,22 +528,34 @@ class LLaMA32TensorRTTool:
                     
                     response_tokens.append(next_token.item())
                     input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
-
+    
             response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
             avg_entropy = total_entropy / len(response_tokens)
             
-            self.update_visualization_data(avg_entropy, current_emotion, self.memory_manager.calculate_importance_score({'content': response}, avg_entropy))
+            logging.debug(f"Generated response: {response}")
             
             return response_tokens, avg_entropy
         except Exception as e:
             logging.error(f"Error during response generation: {str(e)}")
             return self.tokenizer.encode("An error occurred while generating the response.<|eot_id|>"), 0.0
-
+    
     def trigger_chain_of_thought(self, context):
-        cot_prompt = f"{context}\nLet's approach this step-by-step:\n1."
+        cot_prompt = f"{context}\nLet's think this through step-by-step:\n1."
         cot_input_ids = self.tokenizer.encode(cot_prompt, return_tensors='pt').to(self.device)
         cot_output = self.model.generate(cot_input_ids, max_length=500, num_return_sequences=1, no_repeat_ngram_size=2)
-        return self.tokenizer.decode(cot_output[0], skip_special_tokens=True)
+        thought_process = self.tokenizer.decode(cot_output[0], skip_special_tokens=True)
+        
+        # Extract final response from thought process
+        final_response = self._extract_final_response(thought_process)
+        return final_response
+    
+    def _extract_final_response(self, thought_process):
+        # Implement logic to extract the final response from the thought process
+        # This could involve looking for a specific pattern or taking the last sentence
+        # For now, we'll just return the last sentence as an example
+        sentences = thought_process.split('.')
+        return sentences[-1].strip() + '.'
+        
 
     def sample_next_token(self, logits, temperature=1.0, top_p=None):
         logits = logits / temperature
@@ -562,26 +573,31 @@ class LLaMA32TensorRTTool:
         return torch.multinomial(probs, num_samples=1)
 
     def is_valid_response(self, tokens):
+        # Check if the response is empty or exceeds the maximum length
         if len(tokens) == 0:
             logging.warning("Empty response detected.")
             return False
     
-        if len(tokens) < 5 or len(tokens) > self.max_response_length:
+        if len(tokens) < 3 or len(tokens) > self.max_response_length:
             logging.warning(f"Response length issue: {len(tokens)} tokens")
             return False
     
-        if self._has_repetitive_token_patterns(tokens):
-            logging.warning("Repetitive token patterns detected in response.")
+        # Check for excessive repetition of patterns in the response
+        if self._has_repetitive_token_patterns(tokens, max_repeats=2):
+            logging.warning("Excessive repetitive token patterns detected in response.")
             return False
     
+        # Calculate perplexity
         perplexity = self._calculate_perplexity(tokens)
         logging.info(f"Response perplexity: {perplexity}")
     
-        if not self._has_proper_structure(tokens):
+        # Structure check: skip for very short responses
+        if len(tokens) >= 5 and not self._has_proper_structure(tokens):
             decoded_response = self.tokenizer.decode(tokens, skip_special_tokens=True)
             logging.warning(f"Response lacks proper structure: '{decoded_response}'")
             return False
     
+        # Relevance check with more flexibility
         relevance_score = 1.0
         if self.memory_manager.sliding_window:
             last_user_input = next((msg['content'] for msg in reversed(self.memory_manager.sliding_window) if msg['role'] == 'user'), None)
@@ -590,20 +606,25 @@ class LLaMA32TensorRTTool:
                 relevance_score = self._calculate_relevance(last_user_input, decoded_response)
                 logging.info(f"Relevance score: {relevance_score}")
     
-        quality_score = (1 / perplexity) * relevance_score
+        # Adjusted quality score threshold for more flexibility
+        quality_score = (1 / (perplexity + 1e-9)) * relevance_score
         logging.info(f"Quality score: {quality_score}")
     
-        if quality_score < 1e-8:
+        # Allow borderline responses if they meet basic criteria
+        if quality_score < 1e-6:
             logging.warning(f"Response quality too low. Perplexity: {perplexity}, Relevance: {relevance_score}")
             return False
     
+        # Log and return True for valid responses
         decoded_response = self.tokenizer.decode(tokens, skip_special_tokens=True)
         logging.info(f"Valid response generated: '{decoded_response}'")
-    
         return True
-
-    def _has_repetitive_token_patterns(self, tokens):
-        for i in range(len(tokens) - 6):
+    
+    def _has_repetitive_token_patterns(self, tokens, max_repeats=2):
+        """
+        Check if the response has excessive repetition of patterns.
+        """
+        for i in range(len(tokens) - max_repeats * 3):
             if tokens[i:i+3] == tokens[i+3:i+6]:
                 return True
         return False
