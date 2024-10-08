@@ -671,35 +671,65 @@ class LLaMA32TensorRTTool:
         gc.collect()
         torch.cuda.synchronize()
         logging.info(f"GPU memory cleared and synchronized. Current memory usage: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-
+    
     def _initialize_model_full_gpu(self):
         logging.info("Attempting full GPU initialization with enforced max_memory...")
     
         max_memory = {i: "98GB" for i in range(torch.cuda.device_count())}
-    
         checkpoint_path = str(self.model_path)
+    
+        logging.info(f"Checkpoint path: {checkpoint_path}")
+        logging.info(f"Current working directory: {os.getcwd()}")
+        logging.info(f"User running the script: {os.getlogin()}")
+    
+        try:
+            logging.info(f"Directory contents: {os.listdir(os.path.dirname(checkpoint_path))}")
+        except Exception as e:
+            logging.error(f"Error listing directory contents: {str(e)}")
+    
+        try:
+            file_stat = os.stat(checkpoint_path)
+            logging.info(f"File stats: size={file_stat.st_size}, permissions={oct(file_stat.st_mode)}")
+        except Exception as e:
+            logging.error(f"Error getting file stats: {str(e)}")
+    
+        try:
+            # Try to open the file directly
+            with open(checkpoint_path, 'rb') as f:
+                logging.info(f"File opened successfully, first 100 bytes: {f.read(100).hex()}")
+        except Exception as e:
+            logging.error(f"Error opening file directly: {str(e)}")
     
         try:
             # Initialize model with empty weights
             with init_empty_weights():
                 config = AutoConfig.from_pretrained(checkpoint_path)
                 model = AutoModelForCausalLM.from_config(config)
+            logging.info("Model initialized with empty weights")
     
             # Move the empty model to GPU
             model = model.to_empty(device='cuda')
+            logging.info("Empty model moved to GPU")
     
             # Load the model weights
+            logging.info("Attempting to load state dict...")
             state_dict = torch.load(checkpoint_path)
+            logging.info("State dict loaded successfully")
+    
             model.load_state_dict(state_dict)
+            logging.info("State dict applied to model")
     
             # Enable gradient checkpointing for memory efficiency
             model.gradient_checkpointing_enable()
+            logging.info("Gradient checkpointing enabled")
     
             # Ensure use_cache is set to False
             model.config.use_cache = False
+            logging.info("use_cache set to False")
     
             # Set model to evaluation mode
             model.eval()
+            logging.info("Model set to evaluation mode")
     
             # Verify that weights are tied
             if not self._verify_tied_weights(model):
@@ -712,7 +742,16 @@ class LLaMA32TensorRTTool:
         except Exception as e:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
-            raise RuntimeError("Failed to initialize model on GPU.")
+            
+            # Additional error information
+            if isinstance(e, RuntimeError) and "CUDA out of memory" in str(e):
+                logging.error("CUDA out of memory error. Consider reducing model size or batch size.")
+            elif isinstance(e, FileNotFoundError):
+                logging.error(f"Model file not found. Ensure the path is correct: {checkpoint_path}")
+            elif isinstance(e, PermissionError):
+                logging.error(f"Permission denied when accessing the model file. Check file permissions.")
+    
+            raise RuntimeError("Failed to initialize model on GPU.") 
             
     def _verify_tied_weights(self, model):
         # Add a method to verify if weights are tied
