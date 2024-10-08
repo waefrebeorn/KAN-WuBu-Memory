@@ -765,9 +765,6 @@ class LLaMA32TensorRTTool:
     def _generate_response(self, user_input, context):
         if not self.components_initialized:
             raise RuntimeError("Components not initialized. Call _initialize_components() first.")
-        
-        if self.tokenizer is None:
-            raise RuntimeError("Tokenizer is not initialized.")
     
         prompt = f"{context}\nUser: {user_input}\nAssistant:"
         input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
@@ -797,11 +794,10 @@ class LLaMA32TensorRTTool:
                 break
     
             response_tokens.append(next_token.item())
-            
+    
             next_token = next_token.view(1, 1)
             input_ids = torch.cat([input_ids, next_token], dim=-1)
     
-            # Early stopping based on content
             if len(response_tokens) > 10:
                 partial_response = self.tokenizer.decode(response_tokens)
                 if self._is_response_complete(partial_response):
@@ -967,23 +963,39 @@ class LLaMA32TensorRTTool:
         return overlap / max(len(input_tokens), len(response_tokens))
 
     def train_kan_step(self, input_ids, target_ids, refusal_score):
+        logging.debug("Entering train_kan_step...")
+        logging.debug(f"Input IDs shape: {input_ids.shape if isinstance(input_ids, torch.Tensor) else 'Not a tensor'}")
+        logging.debug(f"Target IDs shape: {target_ids.shape if isinstance(target_ids, torch.Tensor) else 'Not a tensor'}")
+    
+        if isinstance(input_ids, list):
+            input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
+        if isinstance(target_ids, list):
+            target_ids = torch.tensor(target_ids, dtype=torch.long, device=self.device)
+    
         self.kan.train()
         self.optimizer.zero_grad()
     
         try:
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True)
-                hidden_states = outputs.hidden_states[-1]
     
-                if self.training:
-                    hidden_states = hidden_states.requires_grad_()
+                # Modify unpacking to match actual output structure
+                if isinstance(outputs, dict) and 'hidden_states' in outputs:
+                    hidden_states = outputs['hidden_states'][-1]  # Use the last hidden state layer
+                elif isinstance(outputs, tuple) and len(outputs) >= 2:
+                    hidden_states = outputs[1]  # In some configurations, hidden states are the second element in the tuple
+                else:
+                    raise ValueError(f"Unexpected output format: {type(outputs)} with outputs: {outputs}")
+    
+                # Ensure hidden_states is a 3D tensor
+                if len(hidden_states.size()) != 3:
+                    raise ValueError(f"Unexpected hidden states shape: {hidden_states.size()}")
     
                 modified_hidden_states, kan_refusal_scores = self.kan(
                     hidden_states, self.encode_user_intent(self.tokenizer.decode(input_ids[0])), self.emotional_state
                 )
     
                 lm_logits = self.model.lm_head(modified_hidden_states)
-    
                 lm_loss = F.cross_entropy(lm_logits.view(-1, lm_logits.size(-1)), target_ids.view(-1), ignore_index=-100)
     
                 refusal_loss = F.binary_cross_entropy_with_logits(
@@ -996,14 +1008,9 @@ class LLaMA32TensorRTTool:
             self.scaler.step(self.optimizer)
             self.scaler.update()
     
+            logging.debug("Exiting train_kan_step successfully.")
             return lm_loss.item(), refusal_loss.item()
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                logging.error("CUDA out of memory during KAN training. Clearing cache and skipping step.")
-                self.clear_memory()
-                return 0.0, 0.0
-            else:
-                raise e
+    
         except Exception as e:
             logging.error(f"Error during KAN training step: {str(e)}")
             logging.error(traceback.format_exc())
@@ -1023,14 +1030,14 @@ class LLaMA32TensorRTTool:
                 inputs = self.tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=512).to(self.device)
                 targets = self.tokenizer(target_text, return_tensors="pt", padding=True, truncation=True, max_length=512).to(self.device)
     
+                # Use consistent output handling
                 outputs = self.model(**inputs, output_hidden_states=True)
-                hidden_states = outputs.hidden_states[-1]
+                hidden_states = outputs.hidden_states if 'hidden_states' in outputs else outputs[1]  # Adjust as needed
     
                 modified_hidden_states, _ = self.kan(hidden_states, self.encode_user_intent(input_text), self.emotional_state)
                 lm_logits = self.model.lm_head(modified_hidden_states)
     
-                # Check the shape of lm_logits before slicing
-                if len(lm_logits.shape) == 3:  # Ensure the logits have 3 dimensions
+                if len(lm_logits.shape) == 3:
                     min_length = min(lm_logits.size(1), targets.input_ids.size(1))
                     lm_logits = lm_logits[:, :min_length, :]
                     targets_flattened = targets.input_ids[:, :min_length].contiguous().view(-1)
@@ -1045,6 +1052,7 @@ class LLaMA32TensorRTTool:
             logging.error(traceback.format_exc())
             return 0.0
     
+    
     def encode_user_intent(self, user_input):
         try:
             inputs = self.tokenizer(
@@ -1054,16 +1062,17 @@ class LLaMA32TensorRTTool:
                 truncation=True,
                 max_length=512,
             ).to(self.device)
-
+    
             with torch.no_grad():
                 outputs = self.model(**inputs, output_hidden_states=True)
-                last_hidden_state = outputs.hidden_states[-1]
-                user_intent = last_hidden_state.mean(dim=1)
-
+                hidden_states = outputs.hidden_states if 'hidden_states' in outputs else outputs[1]
+                user_intent = hidden_states.mean(dim=1)
+    
             return user_intent
         except Exception as e:
             logging.error(f"Failed to encode user input: {str(e)}")
             return torch.zeros(1, self.model.config.hidden_size).to(self.device)
+    
 
     def update_visualization_data(self, entropy, emotion, memory_importance):
         self.visualization_data['entropy'].append(entropy)
