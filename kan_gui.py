@@ -210,7 +210,7 @@ class LLAMA32GUI:
                 self.save_state_button.config(state='normal')
                 self.feedback_button.config(state='normal')
                 sleep_info = self.llama_tool.check_sleep_status()
-                self.sleep_button.config(state='normal' if sleep_info.get('should_sleep', False) else 'disabled')
+                self.sleep_button.config(state='normal' if sleep_info else 'disabled')
                 self.update_loss_plot()
             else:
                 self.display_message("No previous conversation found. Please provide a character description to start.")
@@ -248,6 +248,9 @@ class LLAMA32GUI:
         try:
             interaction_result = await self.loop.run_in_executor(None, self.llama_tool.interact, user_input)
             response = interaction_result['response']
+            
+            if not response.strip():
+                return "I apologize, but I couldn't generate a valid response. Could you please rephrase your input?", True
             
             response = self.clean_response(response)
             
@@ -298,7 +301,7 @@ class LLAMA32GUI:
     def save_kan_state(self):
         if self.llama_tool:
             try:
-                self.llama_tool.save_kan_state()
+                self.llama_tool.save_base_state()
                 self.display_message("KAN state saved.")
             except Exception as e:
                 self.display_error(f"Error saving KAN state: {str(e)}\n{traceback.format_exc()}")
@@ -320,7 +323,7 @@ class LLAMA32GUI:
                         self.save_state_button.config(state='normal')
                         self.feedback_button.config(state='normal')
                         sleep_info = self.llama_tool.check_sleep_status()
-                        self.sleep_button.config(state='normal' if sleep_info.get('should_sleep', False) else 'disabled')
+                        self.sleep_button.config(state='normal' if sleep_info else 'disabled')
                         self.update_loss_plot()
                     else:
                         self.display_message("Failed to load KAN state. Please try again.")
@@ -348,11 +351,11 @@ class LLAMA32GUI:
     def update_emotion_label(self, emotion=None):
         if emotion is None and self.llama_tool:
             try:
-                emotion = self.llama_tool.get_current_emotion()
-            except IndexError as ie:
+                emotion = self.llama_tool.emotional_state.get_emotion()
+            except AttributeError as ae:
                 emotion = "N/A"
-                self.display_message("Error retrieving emotion: Incomplete emotional state data.")
-                logging.error(f"Error retrieving emotion: {str(ie)}\n{traceback.format_exc()}")
+                self.display_message("Error retrieving emotion: Emotional state not initialized.")
+                logging.error(f"Error retrieving emotion: {str(ae)}\n{traceback.format_exc()}")
             except Exception as e:
                 emotion = "N/A"
                 self.display_message(f"Error retrieving emotion: {str(e)}")

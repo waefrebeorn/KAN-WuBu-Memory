@@ -643,7 +643,7 @@ class LLaMA32TensorRTTool:
         if proper_ratio < 0.5:
             logging.warning(f"Only {proper_ratio:.2f} of sentences have proper structure.")
             return False
-    
+            
         return True
         
     def _calculate_relevance(self, input_text, response_text):
@@ -953,14 +953,17 @@ class LLaMA32TensorRTTool:
                 self.entropy_manager.global_entropy = checkpoint['entropy_manager']['global_entropy']
                 self.visualization_data = checkpoint['visualization_data']
                 logging.info(f"Base state loaded from {self.base_state_file}")
+                return True
             except Exception as e:
                 logging.error(f"Error loading base state: {str(e)}")
                 logging.error(traceback.format_exc())
                 logging.info("Initializing with default state.")
                 self._initialize_default_state()
+                return False
         else:
             logging.info("No base state file found. Starting with default initialization.")
             self._initialize_default_state()
+            return False
 
     def _initialize_default_state(self):
         self.emotional_state.position = torch.zeros(1, len(self.emotional_state.dimensions), device=self.device)
