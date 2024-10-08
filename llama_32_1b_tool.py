@@ -134,6 +134,119 @@ class OverfitDetector:
             and (val_trend - train_trend) > self.threshold
         )
 
+class TensorSwapper:
+    def __init__(self, device):
+        self.device = device
+        self.cpu_tensors = {}
+
+    def swap_out(self, name, tensor):
+        self.cpu_tensors[name] = tensor.detach().cpu()
+        del tensor
+        torch.cuda.empty_cache()
+
+    def swap_in(self, name):
+        if name in self.cpu_tensors:
+            tensor = self.cpu_tensors[name].to(self.device)
+            del self.cpu_tensors[name]
+            return tensor
+        else:
+            raise KeyError(f"Tensor {name} not found in CPU storage")
+
+
+class ResponseQualityManager:
+    def __init__(self, kan_model, tokenizer, refusal_detector, emotional_state, memory_manager):
+        self.kan_model = kan_model
+        self.tokenizer = tokenizer
+        self.refusal_detector = refusal_detector
+        self.emotional_state = emotional_state
+        self.memory_manager = memory_manager
+        self.invalid_response_count = 0
+
+    def evaluate_response(self, user_input, response_tokens, context):
+        """Evaluate the response based on various quality criteria."""
+        response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
+
+        # Check refusal score using the existing refusal detector
+        refusal_score = self.refusal_detector.detect_refusal(response_tokens)
+        quality_metrics = {
+            'is_refusal': refusal_score > 0.5,
+            'relevance_score': self.calculate_relevance(user_input, response),
+            'length': len(response_tokens),
+            'structure': self.has_proper_structure(response),
+            'perplexity': self.calculate_perplexity(response_tokens),
+        }
+
+        # Combine all quality metrics into a final decision
+        is_valid = self.is_valid_response(quality_metrics)
+        return is_valid, quality_metrics
+    
+    def calculate_perplexity(self, tokens):
+        try:
+            with torch.no_grad():
+                inputs = torch.tensor([tokens]).to(self.kan_model.device)
+                outputs = self.kan_model.model(inputs)
+                logits = outputs.logits[:, :-1, :].contiguous()
+                target = inputs[:, 1:].contiguous()
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1), reduction='mean')
+            return torch.exp(loss).item()
+        except Exception as e:
+            logging.error(f"Error calculating perplexity: {str(e)}")
+            return float('inf')
+
+    
+    def calculate_relevance(self, input_text, response_text):
+        """Calculate the relevance between the user's input and the generated response."""
+        input_tokens = set(self.tokenizer.encode(input_text))
+        response_tokens = set(self.tokenizer.encode(response_text))
+        overlap = len(input_tokens.intersection(response_tokens))
+        return overlap / max(len(input_tokens), len(response_tokens))
+
+    def has_proper_structure(self, response):
+        """Check if the response has proper sentence structure."""
+        sentences = re.split(r'(?<=[.!?])\s+', response.strip())
+        return all(sentence[0].isupper() and sentence[-1] in '.!?' for sentence in sentences)
+
+    def is_valid_response(self, quality_metrics):
+        """Evaluate if the response passes all quality criteria."""
+        return (
+            not quality_metrics['is_refusal'] and
+            quality_metrics['length'] >= 5 and
+            quality_metrics['structure'] and
+            quality_metrics['perplexity'] < 50  # Example threshold for perplexity
+        )
+
+    def corrective_training(self, user_input, response_tokens, corrective_response):
+        """Perform corrective training on an invalid response."""
+        # Encode the corrective response as the target for training
+        target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.kan_model.device)
+
+        # Perform a training step using the invalid response and the corrective response
+        lm_loss, refusal_loss = self.kan_model.train_kan_step(
+            torch.tensor([response_tokens], dtype=torch.long).to(self.kan_model.device),
+            target_ids,
+            refusal_score=0.0  # Assume no refusal in this corrective context
+        )
+        return lm_loss, refusal_loss
+
+    def adaptive_regeneration(self, user_input, context, max_attempts=3):
+        """Regenerate a response until a valid one is found or maximum attempts are reached."""
+        for attempt in range(max_attempts):
+            # Generate a new response
+            response_tokens, response_entropy = self.kan_model.generate_response(user_input)
+            is_valid, quality_metrics = self.evaluate_response(user_input, response_tokens, context)
+
+            # If valid response is found, return it
+            if is_valid:
+                return response_tokens, quality_metrics
+
+            # Perform corrective training with a predefined corrective response
+            corrective_response = "I misunderstood. Can you rephrase that?"
+            self.corrective_training(user_input, response_tokens, corrective_response)
+
+        # After max attempts, return the last generated response
+        return response_tokens, quality_metrics
+
+
 class SyntheticDayCycle:
     def __init__(self, cycle_length=100):
         self.cycle_length = cycle_length
@@ -359,9 +472,11 @@ class LLaMA32TensorRTTool:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model_path = self._get_model_path()
         self.tokenizer = None
+        self.components_initialized = False
+
         self.model = None
         self.config = None
-        self.emotional_state = EmotionalState(device=self.device)
+        self.emotional_state = EmotionalState(device=self.device) 
         self.system_prompt = ""
         self.optimizer = None
         self.learning_rate = 1e-5
@@ -373,7 +488,7 @@ class LLaMA32TensorRTTool:
         self.kan_state_dir = Path("kan_states")
         self.kan_state_dir.mkdir(exist_ok=True)
         self.base_state_file = self.kan_state_dir / "base_state.pt"
-
+        
         self.refusal_history = []
         self.interaction_results = []
         self.training_losses = []
@@ -382,24 +497,24 @@ class LLaMA32TensorRTTool:
         self.best_loss = float('inf')
         self.wait = 0
 
-        self.overfit_detector = OverfitDetector()
-        self.day_cycle = SyntheticDayCycle()
+        self.overfit_detector = None
+        self.day_cycle = None
+        self.tensor_swapper = None
 
-        self.scaler = GradScaler()
+        self.scaler = torch.amp.GradScaler('cuda')
 
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
 
         self.entropy_manager = None
-        self.memory_manager = None
+        self.memory_manager = AdvancedMemoryManager(max_context_length=2048, tokenizer=None, device=self.device)
+        
 
         self.visualization_data = {
             'entropy': [],
             'emotion': [],
             'memory_importance': []
         }
-
-        self._initialize_components()
 
     def _get_model_path(self):
         script_dir = Path(__file__).parent
@@ -408,72 +523,168 @@ class LLaMA32TensorRTTool:
             raise FileNotFoundError(f"Model directory not found: {model_dir}")
         return model_dir
 
+    
     def _initialize_components(self):
-        try:
-            self.config = AutoConfig.from_pretrained(self.model_path)
-            hidden_size = self.config.hidden_size
-            num_emotional_dimensions = len(self.emotional_state.dimensions)
-
-            self.tokenizer = self._initialize_tokenizer()
-            self.model = self._initialize_model() # Initialize model first
-            hidden_size = self.model.config.hidden_size # Access hidden_size after model init
-            
-            vocab_size = len(self.tokenizer)
-            self.kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, self.device).to(self.device)
-
-            self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
-            self.refusal_detector = RefusalDetector(self.tokenizer, self.model)
-            self.entropy_manager = EntropyManager(self.model, self.tokenizer, self.device)
-            self.memory_manager = AdvancedMemoryManager(2048, self.tokenizer, self.device)
-
-            self.clear_memory()
-            logging.info("Components initialized successfully.")
-        except Exception as e:
-            logging.error(f"Error initializing components: {str(e)}")
-            logging.error(traceback.format_exc())
-            raise RuntimeError("Failed to initialize components.")
-
-    def _initialize_tokenizer(self):
-        tokenizer_config_path = os.path.join(self.model_path, "tokenizer_config.json")
-
-        if not os.path.exists(tokenizer_config_path) or os.stat(tokenizer_config_path).st_size == 0:
-            # Handle missing or empty config
-            logging.warning(f"Tokenizer config file missing or empty at: {tokenizer_config_path}. Creating a default tokenizer.")
-            tokenizer = AutoTokenizer.from_pretrained(self.model_path, use_fast=True, trust_remote_code=True)  # Let HF create a default
-            tokenizer.save_pretrained(self.model_path)  # Save the created default config
-
-        else: # If config exists, proceed as usual but with error handling:
+        logging.info("Starting component initialization (GPU-only, prevent offloading)...")
+        self.components_initialized = False
+        initialization_attempts = 0
+        max_attempts = 3
+    
+        while initialization_attempts < max_attempts:
             try:
-                tokenizer = AutoTokenizer.from_pretrained(
-                    self.model_path, use_fast=True, trust_remote_code=True, padding_side='left'
-                )
-
-            except json.JSONDecodeError as e:
-                logging.error(f"Error decoding tokenizer config: {e}")
-                logging.warning("Attempting to create a default tokenizer...")
-                tokenizer = AutoTokenizer.from_pretrained(self.model_path, use_fast=True, trust_remote_code=True)
-                tokenizer.save_pretrained(self.model_path)  # Overwrite potentially corrupted config
-
-        tokenizer.pad_token = tokenizer.eos_token  # Set padding token AFTER loading/creating
-        tokenizer.save_pretrained(self.model_path)  # Save in case a default was created
-        return tokenizer
-
-    def _initialize_model(self):
-        config = AutoConfig.from_pretrained(self.model_path) # Load config directly here
-        with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(config)
-
-        model.tie_weights() # Call tie_weights *before* loading checkpoint
-
-        model = load_checkpoint_and_dispatch(
-            model, self.model_path, device_map="auto",  # no dtype here, let accelerate handle it
-            no_split_module_classes=["LlamaDecoderLayer"]
+                logging.info(f"Initialization attempt {initialization_attempts + 1}/{max_attempts}")
+    
+                # Initialize configuration
+                self.config = AutoConfig.from_pretrained(self.model_path)
+                hidden_size = self.config.hidden_size
+                num_emotional_dimensions = len(self.emotional_state.dimensions)
+    
+                # Initialize tokenizer
+                self.tokenizer = self._initialize_tokenizer()
+                if self.tokenizer is None:
+                    raise RuntimeError("Failed to initialize tokenizer")
+    
+                # Initialize model with different GPU-only strategies based on attempt number
+                if initialization_attempts == 0:
+                    self.model = self._initialize_model_full_gpu()
+                elif initialization_attempts == 1:
+                    self.model = self._initialize_model_gpu_optimized()
+                else:
+                    self.model = self._initialize_model_quantized()
+    
+                # Initialize other components
+                vocab_size = len(self.tokenizer)
+                self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
+                self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
+                self.refusal_detector = self._initialize_refusal_detector()
+                self.entropy_manager = self._initialize_entropy_manager()
+                self.memory_manager.tokenizer = self.tokenizer
+                self.overfit_detector = OverfitDetector()
+                self.day_cycle = SyntheticDayCycle()
+                self.tensor_swapper = TensorSwapper(self.device)
+    
+                # Clear CUDA cache and run garbage collection
+                self.clear_memory()
+    
+                self.components_initialized = True
+                logging.info("All components initialized successfully on GPU.")
+                return
+    
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e):
+                    logging.warning(f"CUDA out of memory during attempt {initialization_attempts + 1}. Trying alternative GPU initialization...")
+                    torch.cuda.empty_cache()
+                    initialization_attempts += 1
+                else:
+                    logging.error(f"Runtime error during initialization: {str(e)}")
+                    logging.error(traceback.format_exc())
+                    raise
+            except Exception as e:
+                logging.error(f"Unexpected error during initialization: {str(e)}")
+                logging.error(traceback.format_exc())
+                raise
+    
+        logging.error("Failed to initialize components after maximum attempts.")
+        raise RuntimeError("Component initialization failed after multiple GPU-only attempts")
+    
+    def _initialize_model_full_gpu(self):
+        logging.info("Attempting full GPU initialization...")
+        
+        # Use low_cpu_mem_usage to prevent CPU offloading
+        model = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            config=self.config,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map="auto"
         )
-        model.gradient_checkpointing_enable()
-        model.resize_token_embeddings(len(self.tokenizer))
-
-        # Model is now properly initialized and loaded onto the device.
+        
+        model.tie_weights()
+        model.eval()
         return model
+    
+    def _initialize_model_gpu_optimized(self):
+        logging.info("Attempting GPU-optimized initialization...")
+        
+        # Use low_cpu_mem_usage and device_map to keep everything on GPU
+        model = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            config=self.config,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map="auto"
+        )
+        
+        # Enable gradient checkpointing
+        model.gradient_checkpointing_enable()
+        
+        # Disable creating the past key/value states
+        model.config.use_cache = False
+        
+        model.tie_weights()
+        model.eval()
+        return model
+    
+    def _initialize_model_quantized(self):
+        logging.info("Attempting initialization with quantization...")
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError:
+            logging.error("BitsAndBytesConfig not available. Make sure you have the latest transformers library installed.")
+            raise
+    
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16
+        )
+    
+        model = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            config=self.config,
+            quantization_config=quantization_config,
+            device_map="auto",
+            low_cpu_mem_usage=True
+        )
+    
+        model.tie_weights()
+        model.eval()
+        return model
+    
+    
+    def clear_memory(self):
+        torch.cuda.empty_cache()
+        gc.collect()
+        logging.info("GPU memory cleared.")
+        
+    def _initialize_tokenizer(self):
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path,
+                use_fast=True,
+                trust_remote_code=True,
+                padding_side='left',
+                model_max_length=131072,
+            )
+            logging.info("Tokenizer initialized successfully.")
+            return tokenizer
+        except Exception as e:
+            logging.error(f"Failed to initialize tokenizer: {str(e)}")
+            logging.error(traceback.format_exc())
+            return None
+    
+            
+
+    def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size):
+        return EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, self.device).to(self.device)
+
+    def _initialize_refusal_detector(self):
+        return RefusalDetector(self.tokenizer, self.model)
+
+    def _initialize_entropy_manager(self):
+        return EntropyManager(self.model, self.tokenizer, self.device)
+
+    def _initialize_memory_manager(self):
+        return AdvancedMemoryManager(2048, self.tokenizer, self.device)
 
     def _ensure_special_tokens(self, tokenizer):
         special_tokens_map_file = Path(self.model_path) / 'special_tokens_map.json'
@@ -504,6 +715,30 @@ class LLaMA32TensorRTTool:
         
         self.emotional_state.update([valence_change, arousal_change, dominance_change])
 
+    def chunked_attention(self, input_ids, chunk_size=512):
+        input_len = input_ids.size(1)
+        all_hidden_states = []
+    
+        for i in range(0, input_len, chunk_size):
+            chunk = input_ids[:, i:i+chunk_size]
+            with torch.no_grad():
+                outputs = self.model(chunk)
+            all_hidden_states.append(outputs.last_hidden_state)
+    
+        return torch.cat(all_hidden_states, dim=1)
+
+    def get_dynamic_batch_size(self, input_length):
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        memory_used = torch.cuda.memory_allocated(0)
+        available_memory = total_memory - memory_used
+    
+        # Estimate memory needed per sample (this is a rough estimate, adjust as needed)
+        memory_per_sample = input_length * 2 * 4  # 2 for input_ids and attention_mask, 4 bytes per float32
+    
+        max_batch_size = available_memory // memory_per_sample
+        return max(1, min(32, max_batch_size))  # Clamp between 1 and 32
+
+
     def analyze_sentiment(self, text):
         positive_words = set(['good', 'great', 'excellent', 'amazing', 'wonderful', 'fantastic'])
         negative_words = set(['bad', 'terrible', 'awful', 'horrible', 'disappointing', 'poor'])
@@ -512,54 +747,55 @@ class LLaMA32TensorRTTool:
         sentiment = sum(1 for word in words if word in positive_words) - sum(1 for word in words if word in negative_words)
         return sentiment / len(words)
 
-    def generate_response(self, user_input):
-        try:
-            current_emotion = self.emotional_state.get_emotion()
-            context = self.memory_manager.get_context(current_emotion)
-            prompt = f"{context}\nUser: {user_input}\nAssistant:"
+    def _generate_response(self, user_input, context):
+        if not self.components_initialized:
+            raise RuntimeError("Components not initialized. Call _initialize_components() first.")
+        
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer is not initialized.")
     
-            input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
-            
-            if input_ids.shape[1] > self.model.config.max_position_embeddings:
-                input_ids = input_ids[:, -self.model.config.max_position_embeddings:]
-                logging.warning("Truncated context window to fit model's maximum position embeddings.")
-
-            response_tokens = []
-            total_entropy = 0
-            
-            for _ in range(100):  # Maximum response length
-                with torch.no_grad():
-                    outputs = self.model(input_ids=input_ids)
-                    next_token_logits = outputs.logits[:, -1, :]
+        prompt = f"{context}\nUser: {user_input}\nAssistant:"
+        input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
     
-                    local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
-                    total_entropy += local_entropy
+        if input_ids.shape[1] > self.model.config.max_position_embeddings:
+            input_ids = input_ids[:, -self.model.config.max_position_embeddings:]
     
-                    if self.entropy_manager.should_trigger_cot(local_entropy):
-                        cot_response = self.trigger_chain_of_thought(prompt + self.tokenizer.decode(response_tokens))
-                        response_tokens.extend(self.tokenizer.encode(cot_response))
-                        break
+        response_tokens = []
+        total_entropy = 0
     
-                    sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
-                    next_token = self.sample_next_token(next_token_logits, **sampling_params)
+        max_new_tokens = 100
+        for _ in range(max_new_tokens):
+            with torch.no_grad():
+                outputs = self.model(input_ids)
+                next_token_logits = outputs.logits[:, -1, :]
     
-                    # Handle EOS token more robustly
-                    if next_token.item() in [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]:
-                        break
+            local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
+            total_entropy += local_entropy
     
-                    response_tokens.append(next_token.item())
-                    input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
+            sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
+            next_token = self.sample_next_token(next_token_logits, **sampling_params)
     
-            response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
-            avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
-            
-            logging.debug(f"Generated response: {response}")
+            if next_token.item() in [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]:
+                break
     
-            return response_tokens, avg_entropy
-        except Exception as e:
-            logging.error(f"Error during response generation: {str(e)}")
-            return self.tokenizer.encode("An error occurred while generating the response.<|eot_id|>"), 0.0
+            response_tokens.append(next_token.item())
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
     
+            del outputs, next_token_logits
+            torch.cuda.empty_cache()
+    
+        avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
+        quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
+    
+        return response_tokens, quality_metrics
+    
+    def _calculate_quality_metrics(self, response_tokens, user_input):
+        response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
+        return {
+            'relevance_score': self._calculate_relevance(user_input, response),
+            'perplexity': self._calculate_perplexity(response_tokens),
+        }
+        
     def trigger_chain_of_thought(self, context):
         cot_prompt = f"{context}\nLet's think this through step-by-step:\n1."
         cot_input_ids = self.tokenizer.encode(cot_prompt, return_tensors='pt').to(self.device)
@@ -825,35 +1061,33 @@ class LLaMA32TensorRTTool:
         plt.close()
 
     def interact(self, user_input):
+        if not self.components_initialized:
+            raise RuntimeError("Components not initialized. Call _initialize_components() first.")
+    
         self.interaction_count += 1
+        context = self.memory_manager.get_context(self.emotional_state.get_emotion())
     
         try:
-            self.memory_manager.update_memory({"role": "user", "content": user_input}, 0.0)
-            response_tokens, response_entropy = self.generate_response(user_input)
-            
-            if not self.is_valid_response(response_tokens):
-                return self._handle_invalid_response()
-    
-            response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
-            refusal_score = self.refusal_detector.detect_refusal(response_tokens)
-            
-            self.update_emotional_state(response, response_entropy)
-            self.memory_manager.update_memory({"role": "assistant", "content": response}, response_entropy)
-            
-            lm_loss, refusal_loss = self._train_or_warmup(response_tokens[:-1], response_tokens[1:], refusal_score)
-            validation_loss = self.validate_kan()
-    
-            self.update_training_metrics(lm_loss, validation_loss)
-            
-            interaction_result = self.create_interaction_result(response, refusal_score, lm_loss, refusal_loss, validation_loss)
-            self._save_interaction_state(interaction_result)
-    
-            return interaction_result
+            response_tokens, quality_metrics = self._generate_response(user_input, context)
         except Exception as e:
-            logging.error(f"Error in interaction process: {str(e)}")
+            logging.error(f"Error generating response: {str(e)}")
             logging.error(traceback.format_exc())
-            return {"response": "An error occurred during the interaction process.", "is_refusal": True}
-
+            return {"response": "I apologize, but I encountered an error while generating a response."}
+    
+        response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
+        self.memory_manager.update_memory({"role": "assistant", "content": response}, quality_metrics['relevance_score'])
+        refusal_score = self.refusal_detector.detect_refusal(response_tokens)
+        self.update_emotional_state(response, quality_metrics['perplexity'])
+    
+        lm_loss, refusal_loss = self._train_or_warmup(response_tokens[:-1], response_tokens[1:], refusal_score)
+        validation_loss = self.validate_kan()
+    
+        self.update_training_metrics(lm_loss, validation_loss)
+        interaction_result = self.create_interaction_result(response, refusal_score, lm_loss, refusal_loss, validation_loss)
+        self._save_interaction_state(interaction_result)
+    
+        return interaction_result
+    
     def _handle_invalid_response(self):
         logging.warning("Invalid response generated.")
         return {
@@ -962,25 +1196,35 @@ class LLaMA32TensorRTTool:
                     'cycle_length': self.day_cycle.cycle_length,
                     'current_position': self.day_cycle.current_position
                 },
-                'refusal_history': self.refusal_history[-100:],
-                'training_losses': self.training_losses[-100:],
-                'validation_losses': self.validation_losses[-100:],
+                'refusal_history': self.refusal_history[-100:],  # Save last 100 entries
+                'training_losses': self.training_losses[-100:],  # Save last 100 entries
+                'validation_losses': self.validation_losses[-100:],  # Save last 100 entries
                 'entropy_manager': {
                     'entropy_history': list(self.entropy_manager.entropy_history),
                     'global_entropy': self.entropy_manager.global_entropy,
                 },
                 'visualization_data': self.visualization_data,
+                'components_initialized': self.components_initialized,
             }
+    
+            # Save tokenizer separately if it exists
+            if self.tokenizer:
+                self.tokenizer.save_pretrained(self.kan_state_dir / "tokenizer")
+                state_dict['tokenizer_path'] = str(self.kan_state_dir / "tokenizer")
+    
             torch.save(state_dict, self.base_state_file)
             logging.info(f"Base state saved to {self.base_state_file}")
+            return True
         except Exception as e:
             logging.error(f"Error saving base state: {str(e)}")
             logging.error(traceback.format_exc())
-
+            return False
+            
     def load_base_state(self):
         if self.base_state_file.exists():
             try:
                 checkpoint = torch.load(self.base_state_file, map_location=self.device)
+                
                 self.kan.load_state_dict(checkpoint['kan_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 self.emotional_state.position = torch.tensor(checkpoint['emotional_state'], device=self.device)
@@ -999,6 +1243,19 @@ class LLaMA32TensorRTTool:
                 self.entropy_manager.entropy_history = deque(checkpoint['entropy_manager']['entropy_history'], maxlen=self.entropy_manager.entropy_history.maxlen)
                 self.entropy_manager.global_entropy = checkpoint['entropy_manager']['global_entropy']
                 self.visualization_data = checkpoint['visualization_data']
+                self.components_initialized = checkpoint.get('components_initialized', False)
+    
+                # Load tokenizer if path is provided
+                if 'tokenizer_path' in checkpoint and os.path.exists(checkpoint['tokenizer_path']):
+                    self.tokenizer = AutoTokenizer.from_pretrained(checkpoint['tokenizer_path'])
+                    logging.info(f"Tokenizer loaded from {checkpoint['tokenizer_path']}")
+                else:
+                    logging.warning("Tokenizer not found in saved state. Using default initialization.")
+                    self.tokenizer = self._initialize_tokenizer()
+    
+                if not self.components_initialized:
+                    self._initialize_components()
+                
                 logging.info(f"Base state loaded from {self.base_state_file}")
                 return True
             except Exception as e:
@@ -1011,12 +1268,24 @@ class LLaMA32TensorRTTool:
             logging.info("No base state file found. Starting with default initialization.")
             self._initialize_default_state()
             return False
+        
 
     def _initialize_default_state(self):
+        if not self.components_initialized:
+            self._initialize_components()
+    
+        if self.emotional_state is None:
+            self.emotional_state = EmotionalState(device=self.device)
+        
         self.emotional_state.position = torch.zeros(1, len(self.emotional_state.dimensions), device=self.device)
+        
+        if self.memory_manager is None:
+            self.memory_manager = AdvancedMemoryManager(max_context_length=2048, tokenizer=self.tokenizer, device=self.device)
+        
         self.memory_manager.memory_buffer.clear()
         self.memory_manager.important_memory_buffer.clear()
         self.memory_manager.sliding_window.clear()
+        
         self.interaction_count = 0
         self.best_loss = float('inf')
         self.wait = 0
@@ -1025,9 +1294,11 @@ class LLaMA32TensorRTTool:
         self.refusal_history = []
         self.training_losses = []
         self.validation_losses = []
-        self.entropy_manager.entropy_history.clear()
-        self.entropy_manager.global_entropy = 0.0
+        if self.entropy_manager:
+            self.entropy_manager.entropy_history.clear()
+            self.entropy_manager.global_entropy = 0.0
         self.visualization_data = {'entropy': [], 'emotion': [], 'memory_importance': []}
+    
 
     def main(self):
         self.load_base_state()
