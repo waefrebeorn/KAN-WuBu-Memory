@@ -404,10 +404,11 @@ class EntropyManager:
         return {"temperature": temperature, "top_p": top_p}
 
 class AdvancedMemoryManager:
-    def __init__(self, max_context_length, tokenizer, device):
+    def __init__(self, max_context_length, tokenizer, device, model=None):
         self.max_context_length = max_context_length
         self.tokenizer = tokenizer
         self.device = device
+        self.model = model 
         self.memory_buffer = deque(maxlen=max_context_length)
         self.important_memory_buffer = deque(maxlen=max_context_length // 2)
         self.sliding_window = deque(maxlen=max_context_length)
@@ -487,7 +488,7 @@ class LLaMA32TensorRTTool:
         self.interaction_count = 0
         self.refusal_detector = None
         self.kan_loss_weight = 0.5
-        self.warmup_steps = 10
+        self.warmup_steps = 0
         self.kan_state_dir = Path("kan_states")
         self.kan_state_dir.mkdir(exist_ok=True)
         self.base_state_file = self.kan_state_dir / "base_state.pt"
@@ -499,7 +500,8 @@ class LLaMA32TensorRTTool:
         self.patience = 5
         self.best_loss = float('inf')
         self.wait = 0
-
+        
+        self.memory_manager = None
         self.overfit_detector = None
         self.day_cycle = None
         self.tensor_swapper = None
@@ -510,8 +512,8 @@ class LLaMA32TensorRTTool:
         self.max_response_length = 1000
 
         self.entropy_manager = None
-        self.memory_manager = AdvancedMemoryManager(max_context_length=2048, tokenizer=None, device=self.device)
-
+        
+        
         self.visualization_data = {
             'entropy': [],
             'emotion': [],
@@ -546,7 +548,7 @@ class LLaMA32TensorRTTool:
                 if self.tokenizer is None:
                     raise RuntimeError("Failed to initialize tokenizer")
     
-                # Initialize model with different GPU-only strategies based on attempt number
+                # Ensure model is initialized before AdvancedMemoryManager
                 if initialization_attempts == 0:
                     self.model = self._initialize_model_full_gpu()
                 elif initialization_attempts == 1:
@@ -554,13 +556,24 @@ class LLaMA32TensorRTTool:
                 else:
                     self.model = self._initialize_model_quantized()
     
-                # Initialize other components
+                if self.model is None:
+                    raise RuntimeError("Model initialization failed")
+    
+                # Initialize other components that depend on the model
                 vocab_size = len(self.tokenizer)
                 self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
                 self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
                 self.refusal_detector = self._initialize_refusal_detector()
                 self.entropy_manager = self._initialize_entropy_manager()
-                self.memory_manager.tokenizer = self.tokenizer
+    
+                # Initialize AdvancedMemoryManager only after the model is defined
+                self.memory_manager = AdvancedMemoryManager(
+                    max_context_length=2048,
+                    tokenizer=self.tokenizer,
+                    device=self.device,
+                    model=self.model  # Pass the properly initialized model here
+                )
+    
                 self.overfit_detector = OverfitDetector()
                 self.day_cycle = SyntheticDayCycle()
                 self.tensor_swapper = TensorSwapper(self.device)
@@ -765,7 +778,10 @@ class LLaMA32TensorRTTool:
         response_tokens = []
         total_entropy = 0
     
-        max_new_tokens = 100
+        max_new_tokens = 500  # Increased from 100 to 500
+        max_response_length = 2000  # Maximum number of tokens for the entire response
+        stop_sequences = [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]
+    
         for _ in range(max_new_tokens):
             with torch.no_grad():
                 outputs = self.model(input_ids)
@@ -777,18 +793,19 @@ class LLaMA32TensorRTTool:
             sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
             next_token = self.sample_next_token(next_token_logits, **sampling_params)
     
-            if next_token.item() in [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]:
+            if next_token.item() in stop_sequences or len(response_tokens) >= max_response_length:
                 break
     
             response_tokens.append(next_token.item())
             
-            # Modify this line:
-            next_token = next_token.view(1, 1)  # Reshape to [1, 1]
-            try:
-                input_ids = torch.cat([input_ids, next_token], dim=-1)
-            except RuntimeError as e:
-                logging.error(f"Concatenation error. input_ids shape: {input_ids.shape}, next_token shape: {next_token.shape}")
-                raise e
+            next_token = next_token.view(1, 1)
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+    
+            # Early stopping based on content
+            if len(response_tokens) > 10:
+                partial_response = self.tokenizer.decode(response_tokens)
+                if self._is_response_complete(partial_response):
+                    break
     
             del outputs, next_token_logits
             torch.cuda.empty_cache()
@@ -797,6 +814,15 @@ class LLaMA32TensorRTTool:
         quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
     
         return response_tokens, quality_metrics
+    
+    def _is_response_complete(self, partial_response):
+        # Check if the response seems complete based on content
+        sentences = re.split(r'(?<=[.!?])\s+', partial_response.strip())
+        if len(sentences) >= 3:  # At least three sentences
+            last_sentence = sentences[-1]
+            if last_sentence[-1] in '.!?':  # Last sentence ends with punctuation
+                return True
+        return False
         
     def _calculate_quality_metrics(self, response_tokens, user_input):
         response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
@@ -1234,13 +1260,26 @@ class LLaMA32TensorRTTool:
         if self.base_state_file.exists():
             try:
                 checkpoint = torch.load(self.base_state_file, map_location=self.device)
-                
+    
                 self.kan.load_state_dict(checkpoint['kan_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 self.emotional_state.position = torch.tensor(checkpoint['emotional_state'], device=self.device)
+    
+                # Ensure model is initialized before using it in Memory Manager
+                if not self.model:
+                    self.model = self._initialize_model_full_gpu()  # Ensure that model is properly initialized
+    
+                self.memory_manager = AdvancedMemoryManager(
+                    max_context_length=2048,
+                    tokenizer=self.tokenizer,
+                    device=self.device,
+                    model=self.model  # Pass the properly initialized model here
+                )
+    
                 self.memory_manager.memory_buffer = deque(checkpoint['memory_manager']['memory_buffer'], maxlen=self.memory_manager.max_context_length)
                 self.memory_manager.important_memory_buffer = deque(checkpoint['memory_manager']['important_memory_buffer'], maxlen=self.memory_manager.max_context_length // 2)
                 self.memory_manager.sliding_window = deque(checkpoint['memory_manager']['sliding_window'], maxlen=self.memory_manager.max_context_length)
+    
                 self.interaction_count = checkpoint['interaction_count']
                 self.best_loss = checkpoint['best_loss']
                 self.wait = checkpoint['wait']
@@ -1255,7 +1294,6 @@ class LLaMA32TensorRTTool:
                 self.visualization_data = checkpoint['visualization_data']
                 self.components_initialized = checkpoint.get('components_initialized', False)
     
-                # Load tokenizer if path is provided
                 if 'tokenizer_path' in checkpoint and os.path.exists(checkpoint['tokenizer_path']):
                     self.tokenizer = AutoTokenizer.from_pretrained(checkpoint['tokenizer_path'])
                     logging.info(f"Tokenizer loaded from {checkpoint['tokenizer_path']}")
@@ -1265,13 +1303,12 @@ class LLaMA32TensorRTTool:
     
                 if not self.components_initialized:
                     self._initialize_components()
-                
+    
                 logging.info(f"Base state loaded from {self.base_state_file}")
                 return True
             except Exception as e:
                 logging.error(f"Error loading base state: {str(e)}")
                 logging.error(traceback.format_exc())
-                logging.info("Initializing with default state.")
                 self._initialize_default_state()
                 return False
         else:
@@ -1286,16 +1323,24 @@ class LLaMA32TensorRTTool:
     
         if self.emotional_state is None:
             self.emotional_state = EmotionalState(device=self.device)
-        
+    
         self.emotional_state.position = torch.zeros(1, len(self.emotional_state.dimensions), device=self.device)
-        
-        if self.memory_manager is None:
-            self.memory_manager = AdvancedMemoryManager(max_context_length=2048, tokenizer=self.tokenizer, device=self.device)
-        
+    
+        # Ensure model is properly initialized before using it in AdvancedMemoryManager
+        if self.model is None:
+            self.model = self._initialize_model_full_gpu()
+    
+        self.memory_manager = AdvancedMemoryManager(
+            max_context_length=2048,
+            tokenizer=self.tokenizer,
+            device=self.device,
+            model=self.model  # Pass the model parameter here
+        )
+    
         self.memory_manager.memory_buffer.clear()
         self.memory_manager.important_memory_buffer.clear()
         self.memory_manager.sliding_window.clear()
-        
+    
         self.interaction_count = 0
         self.best_loss = float('inf')
         self.wait = 0
@@ -1309,7 +1354,6 @@ class LLaMA32TensorRTTool:
             self.entropy_manager.global_entropy = 0.0
         self.visualization_data = {'entropy': [], 'emotion': [], 'memory_importance': []}
     
-
     def main(self):
         self.load_base_state()
         print("LLaMA32TensorRTTool initialized. Type 'exit' to end the conversation or 'visualize' to see the current data visualization.")
