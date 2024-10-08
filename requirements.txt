@@ -7,8 +7,7 @@ matplotlib
 # GUI
 tk
 
-# Logging and error handling
-logging
+
 
 # File handling
 pathlib

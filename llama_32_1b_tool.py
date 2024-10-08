@@ -415,7 +415,8 @@ class LLaMA32TensorRTTool:
             num_emotional_dimensions = len(self.emotional_state.dimensions)
 
             self.tokenizer = self._initialize_tokenizer()
-            self.model = self._initialize_model()
+            self.model = self._initialize_model() # Initialize model first
+            hidden_size = self.model.config.hidden_size # Access hidden_size after model init
             
             vocab_size = len(self.tokenizer)
             self.kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, self.device).to(self.device)
@@ -433,40 +434,45 @@ class LLaMA32TensorRTTool:
             raise RuntimeError("Failed to initialize components.")
 
     def _initialize_tokenizer(self):
-        tokenizer = AutoTokenizer.from_pretrained(
-            self.model_path,
-            use_fast=True,
-            trust_remote_code=True,
-        )
-        self._ensure_special_tokens(tokenizer)
+        tokenizer_config_path = os.path.join(self.model_path, "tokenizer_config.json")
+
+        if not os.path.exists(tokenizer_config_path) or os.stat(tokenizer_config_path).st_size == 0:
+            # Handle missing or empty config
+            logging.warning(f"Tokenizer config file missing or empty at: {tokenizer_config_path}. Creating a default tokenizer.")
+            tokenizer = AutoTokenizer.from_pretrained(self.model_path, use_fast=True, trust_remote_code=True)  # Let HF create a default
+            tokenizer.save_pretrained(self.model_path)  # Save the created default config
+
+        else: # If config exists, proceed as usual but with error handling:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_path, use_fast=True, trust_remote_code=True, padding_side='left'
+                )
+
+            except json.JSONDecodeError as e:
+                logging.error(f"Error decoding tokenizer config: {e}")
+                logging.warning("Attempting to create a default tokenizer...")
+                tokenizer = AutoTokenizer.from_pretrained(self.model_path, use_fast=True, trust_remote_code=True)
+                tokenizer.save_pretrained(self.model_path)  # Overwrite potentially corrupted config
+
+        tokenizer.pad_token = tokenizer.eos_token  # Set padding token AFTER loading/creating
+        tokenizer.save_pretrained(self.model_path)  # Save in case a default was created
         return tokenizer
 
     def _initialize_model(self):
+        config = AutoConfig.from_pretrained(self.model_path) # Load config directly here
         with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(self.config)
-        model.config.use_cache = False
-    
-        model.tie_weights()
-    
+            model = AutoModelForCausalLM.from_config(config)
+
+        model.tie_weights() # Call tie_weights *before* loading checkpoint
+
         model = load_checkpoint_and_dispatch(
-            model,
-            self.model_path,
-            device_map="auto",
-            no_split_module_classes=["LlamaDecoderLayer"],
-            dtype=torch.float16
+            model, self.model_path, device_map="auto",  # no dtype here, let accelerate handle it
+            no_split_module_classes=["LlamaDecoderLayer"]
         )
-    
         model.gradient_checkpointing_enable()
-    
         model.resize_token_embeddings(len(self.tokenizer))
-    
-        logging.debug(f"Model loaded on device: {self.device}")
-        logging.debug(f"Tokenizer vocab size: {len(self.tokenizer)}")
-        logging.debug(f"Model vocab size: {model.config.vocab_size}")
-    
-        for param in model.parameters():
-            param.requires_grad = True
-    
+
+        # Model is now properly initialized and loaded onto the device.
         return model
 
     def _ensure_special_tokens(self, tokenizer):
@@ -510,10 +516,14 @@ class LLaMA32TensorRTTool:
         try:
             current_emotion = self.emotional_state.get_emotion()
             context = self.memory_manager.get_context(current_emotion)
-            prompt = f"{context}\nUser: {user_input}\nCowgirl assistant:"
+            prompt = f"{context}\nUser: {user_input}\nAssistant:"
     
             input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
             
+            if input_ids.shape[1] > self.model.config.max_position_embeddings:
+                input_ids = input_ids[:, -self.model.config.max_position_embeddings:]
+                logging.warning("Truncated context window to fit model's maximum position embeddings.")
+
             response_tokens = []
             total_entropy = 0
             
@@ -689,7 +699,7 @@ class LLaMA32TensorRTTool:
         self.optimizer.zero_grad()
     
         try:
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True)
                 hidden_states = outputs.hidden_states[-1]
     
