@@ -3,6 +3,7 @@ torch
 transformers==4.45.1
 numpy
 matplotlib
+scikit-learn
 
 # GUI
 tk
