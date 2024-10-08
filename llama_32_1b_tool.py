@@ -855,16 +855,23 @@ class LLaMA32TensorRTTool:
             self.kan.to(torch.float16)  # Convert to half precision
             self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
    
-    def _initialize_kan(self):
-        if self.kan is None:
-            logging.info("Lazy initializing KAN...")
-            vocab_size = len(self.tokenizer)
-            hidden_size = self.config.hidden_size
-            num_emotional_dimensions = len(self.emotional_state.dimensions)
-            self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
-            self.kan.to(torch.float16)  # Convert to half precision
-            self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
-        
+    def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size):
+        logging.info("Initializing KAN...")
+        try:
+            kan = EnhancedKAN(
+                hidden_size=hidden_size,
+                num_emotional_dimensions=num_emotional_dimensions,
+                vocab_size=vocab_size,
+                device=self.device
+            )
+            kan.to(self.device)
+            logging.info("KAN initialized successfully.")
+            return kan
+        except Exception as e:
+            logging.error(f"Error initializing KAN: {str(e)}")
+            logging.error(traceback.format_exc())
+            raise RuntimeError("Failed to initialize KAN") from e
+            
     def _lazy_initialize_refusal_detector(self):
         if self.refusal_detector is None:
             logging.info("Lazy initializing Refusal Detector...")
