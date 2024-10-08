@@ -853,7 +853,17 @@ class LLaMA32TensorRTTool:
             self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
             self.kan.to(torch.float16)  # Convert to half precision
             self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
-    
+   
+    def _initialize_kan(self):
+        if self.kan is None:
+            logging.info("Lazy initializing KAN...")
+            vocab_size = len(self.tokenizer)
+            hidden_size = self.config.hidden_size
+            num_emotional_dimensions = len(self.emotional_state.dimensions)
+            self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
+            self.kan.to(torch.float16)  # Convert to half precision
+            self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
+        
     def _lazy_initialize_refusal_detector(self):
         if self.refusal_detector is None:
             logging.info("Lazy initializing Refusal Detector...")
