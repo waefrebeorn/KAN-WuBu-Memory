@@ -967,51 +967,76 @@ class LLaMA32TensorRTTool:
         logging.debug(f"Input IDs shape: {input_ids.shape if isinstance(input_ids, torch.Tensor) else 'Not a tensor'}")
         logging.debug(f"Target IDs shape: {target_ids.shape if isinstance(target_ids, torch.Tensor) else 'Not a tensor'}")
     
+        # Ensure the input IDs and target IDs are tensors
         if isinstance(input_ids, list):
             input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
         if isinstance(target_ids, list):
             target_ids = torch.tensor(target_ids, dtype=torch.long, device=self.device)
     
+        # Set the KAN model to training mode
         self.kan.train()
+        # Reset gradients
         self.optimizer.zero_grad()
     
         try:
+            # Use autocast for mixed-precision training with float16
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True)
+                # Call the model with use_cache=False to avoid returning past key values
+                outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True, use_cache=False)
     
-                # Modify unpacking to match actual output structure
+                # Debugging: Log the type and number of outputs
+                logging.debug(f"Outputs type: {type(outputs)}, Outputs length: {len(outputs) if isinstance(outputs, tuple) else 'dict'}")
+    
+                # Handle different possible output structures
                 if isinstance(outputs, dict) and 'hidden_states' in outputs:
                     hidden_states = outputs['hidden_states'][-1]  # Use the last hidden state layer
-                elif isinstance(outputs, tuple) and len(outputs) >= 2:
-                    hidden_states = outputs[1]  # In some configurations, hidden states are the second element in the tuple
+                    loss = outputs.get("loss", torch.tensor(0.0, device=self.device))  # Default to zero loss if not found
+                elif isinstance(outputs, tuple):
+                    # Adjust based on the number of elements in the tuple
+                    if len(outputs) == 2:
+                        loss, hidden_states = outputs  # Unpack loss and hidden states
+                    elif len(outputs) == 3:
+                        loss, hidden_states, _ = outputs  # Handle an extra value
+                    else:
+                        raise ValueError(f"Unexpected number of outputs: {len(outputs)}")
                 else:
                     raise ValueError(f"Unexpected output format: {type(outputs)} with outputs: {outputs}")
     
-                # Ensure hidden_states is a 3D tensor
+                # Ensure hidden_states is a 3D tensor: (batch_size, seq_length, hidden_size)
                 if len(hidden_states.size()) != 3:
                     raise ValueError(f"Unexpected hidden states shape: {hidden_states.size()}")
     
+                # Log the hidden states shape
+                logging.debug(f"Hidden states shape: {hidden_states.shape}")
+    
+                # Modify hidden states using KAN (Knowledge Augmentation Network)
                 modified_hidden_states, kan_refusal_scores = self.kan(
                     hidden_states, self.encode_user_intent(self.tokenizer.decode(input_ids[0])), self.emotional_state
                 )
     
+                # Calculate language modeling loss using cross-entropy
                 lm_logits = self.model.lm_head(modified_hidden_states)
                 lm_loss = F.cross_entropy(lm_logits.view(-1, lm_logits.size(-1)), target_ids.view(-1), ignore_index=-100)
     
+                # Calculate refusal score loss using binary cross-entropy
                 refusal_loss = F.binary_cross_entropy_with_logits(
                     kan_refusal_scores.squeeze(), torch.tensor([refusal_score], device=self.device)
                 )
     
+                # Combine the LM loss and refusal loss with a specific weight
                 loss = lm_loss + self.kan_loss_weight * refusal_loss
     
+            # Use gradient scaling for stable mixed-precision training
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
     
-            logging.debug("Exiting train_kan_step successfully.")
+            # Log the final loss values
+            logging.debug(f"Exiting train_kan_step successfully. LM Loss: {lm_loss.item()}, Refusal Loss: {refusal_loss.item()}")
             return lm_loss.item(), refusal_loss.item()
     
         except Exception as e:
+            # Catch and log any exceptions that occur during training
             logging.error(f"Error during KAN training step: {str(e)}")
             logging.error(traceback.format_exc())
             return 0.0, 0.0
