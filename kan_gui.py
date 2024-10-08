@@ -95,6 +95,9 @@ class LLAMA32GUI:
 
         self.initialize_tool()
 
+        self.llama_tool_ready = threading.Event()  # Add an Event for synchronization
+        self.initialize_tool()
+
     def run_async_loop(self):
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
@@ -191,7 +194,8 @@ class LLAMA32GUI:
         def init():
             try:
                 self.llama_tool = LLaMA32TensorRTTool()
-                self.master.after(0, self.load_or_initialize_conversation)
+                self.llama_tool_ready.set() # Signal that initialization is complete
+                self.master.after(0, self.load_or_initialize_conversation)  # Call this *after* the tool is ready
             except Exception as e:
                 error_msg = f"Error initializing tool: {str(e)}\n{traceback.format_exc()}"
                 self.master.after(0, lambda: self.display_error(error_msg))
@@ -199,6 +203,9 @@ class LLAMA32GUI:
         threading.Thread(target=init, daemon=True).start()
 
     def load_or_initialize_conversation(self):
+        if not self.llama_tool_ready.is_set(): # Check readiness here too
+            self.master.after(100, self.load_or_initialize_conversation) # Check again later
+            return
         try:
             if self.llama_tool.load_base_state():
                 self.display_message("Previous conversation state loaded.")
@@ -225,6 +232,10 @@ class LLAMA32GUI:
             return
         self.input_field.delete(0, tk.END)
         self.display_message(f"You: {user_input}")
+
+        if not self.llama_tool_ready.is_set(): # Check if the tool is ready
+            self.display_message("Tool is still initializing. Please wait.")
+            return
 
         self.send_button.config(state='disabled')
         self.update_status("Generating response...")
@@ -466,13 +477,14 @@ class LLAMA32GUI:
             ax.clear()
         self.canvas.draw()
 
-    def on_closing(self):
-        if self.llama_tool:
-            self.llama_tool.save_base_state()
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.background_thread.join(timeout=1.0)
-        self.master.quit()
-        self.master.destroy()
+    def on_closing(self):  # Make sure to join the background threads
+        if hasattr(self, 'loop') and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+
+        if hasattr(self, 'background_thread'):
+            self.background_thread.join(timeout=1.0)  # Wait for thread to finish
+
+        self.master.destroy()  # Destroy the main window
 
 def main():
     root = tk.Tk()
