@@ -76,11 +76,11 @@ class EmotionalState:
     def __init__(self, dimensions=('valence', 'arousal', 'dominance'), device="cuda"):
         self.dimensions = dimensions
         self.device = device
-        self.position = torch.zeros(1, len(dimensions), device=device, dtype=torch.float32)
-        self.velocity = torch.zeros(1, len(dimensions), device=device, dtype=torch.float32)
+        self.position = torch.zeros(1, len(dimensions), device=device, dtype=torch.float16)
+        self.velocity = torch.zeros(1, len(dimensions), device=device, dtype=torch.float16)
 
     def update(self, feedback, max_speed=0.1):
-        feedback_vector = torch.as_tensor(feedback, device=self.device, dtype=torch.float32)
+        feedback_vector = torch.as_tensor(feedback, device=self.device, dtype=torch.float16)
         if feedback_vector.dim() == 1:
             feedback_vector = feedback_vector.unsqueeze(0)
         if feedback_vector.size(0) != self.position.size(0):
@@ -91,6 +91,7 @@ class EmotionalState:
         self.position += self.velocity
         norm = torch.norm(self.position, dim=1, keepdim=True)
         self.position = torch.where(norm > 1, self.position / norm, self.position)
+
 
     def get_emotion(self):
         valence, arousal, dominance = self.position.squeeze().tolist()
@@ -318,13 +319,13 @@ class RefusalDetector:
         except ValueError:
             return 0.5
 
+
 class EnhancedKAN(nn.Module):
     def __init__(self, hidden_size, num_emotional_dimensions, vocab_size, device):
         super().__init__()
         self.device = device
         dtype = torch.float16
 
-        # Adjust the input dimensions for the refusal_override layer
         input_size = hidden_size + hidden_size + num_emotional_dimensions + 1
         self.refusal_override = nn.Linear(input_size, hidden_size, dtype=dtype).to(device)
         self.output_modifier = nn.Linear(hidden_size, vocab_size, dtype=dtype).to(device)
@@ -336,9 +337,9 @@ class EnhancedKAN(nn.Module):
                 hidden_states = hidden_states.requires_grad_()
 
             # Ensure consistent dtype for all inputs
-            hidden_states = hidden_states.to(self.device).to(self.refusal_override.weight.dtype)
-            user_intent = user_intent.to(self.device).to(self.refusal_override.weight.dtype)
-            position = emotional_state.get_embedding().to(self.device).to(self.refusal_override.weight.dtype)
+            hidden_states = hidden_states.to(self.device).to(torch.float16)
+            user_intent = user_intent.to(self.device).to(torch.float16)
+            position = emotional_state.get_embedding().to(self.device).to(torch.float16)
 
             if hidden_states.dim() == 3:
                 batch_size, seq_length, hidden_dim = hidden_states.shape
@@ -501,14 +502,13 @@ class LLaMA32TensorRTTool:
         self.day_cycle = None
         self.tensor_swapper = None
 
-        self.scaler = torch.amp.GradScaler('cuda')
+        self.scaler = torch.amp.GradScaler()
 
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
 
         self.entropy_manager = None
         self.memory_manager = AdvancedMemoryManager(max_context_length=2048, tokenizer=None, device=self.device)
-        
 
         self.visualization_data = {
             'entropy': [],
@@ -733,7 +733,7 @@ class LLaMA32TensorRTTool:
         available_memory = total_memory - memory_used
     
         # Estimate memory needed per sample (this is a rough estimate, adjust as needed)
-        memory_per_sample = input_length * 2 * 4  # 2 for input_ids and attention_mask, 4 bytes per float32
+        memory_per_sample = input_length * 2 * 4  # 2 for input_ids and attention_mask, 4 bytes per float16
     
         max_batch_size = available_memory // memory_per_sample
         return max(1, min(32, max_batch_size))  # Clamp between 1 and 32
@@ -779,7 +779,14 @@ class LLaMA32TensorRTTool:
                 break
     
             response_tokens.append(next_token.item())
-            input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
+            
+            # Modify this line:
+            next_token = next_token.view(1, 1)  # Reshape to [1, 1]
+            try:
+                input_ids = torch.cat([input_ids, next_token], dim=-1)
+            except RuntimeError as e:
+                logging.error(f"Concatenation error. input_ids shape: {input_ids.shape}, next_token shape: {next_token.shape}")
+                raise e
     
             del outputs, next_token_logits
             torch.cuda.empty_cache()
@@ -788,7 +795,7 @@ class LLaMA32TensorRTTool:
         quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
     
         return response_tokens, quality_metrics
-    
+        
     def _calculate_quality_metrics(self, response_tokens, user_input):
         response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
         return {
@@ -827,8 +834,9 @@ class LLaMA32TensorRTTool:
             logits[:, indices_to_remove] = float('-inf')
         
         probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1)
-
+        next_token = torch.multinomial(probs, num_samples=1)
+        return next_token.squeeze(-1)  # Ensure the output is 1D
+        
     def is_valid_response(self, tokens):
         # Check if the response is empty or exceeds the maximum length
         if len(tokens) == 0:
