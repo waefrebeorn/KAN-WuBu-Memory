@@ -35,18 +35,19 @@ def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
 
-    file_handler = logging.FileHandler('llama_tool.log', mode='a')
-    file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(file_formatter)
+    if not logger.hasHandlers():  # Avoid adding duplicate handlers
+        file_handler = logging.FileHandler('llama_tool.log', mode='a')
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
 
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)
-    console_formatter = logging.Formatter('%(levelname)s - %(message)s')
-    console_handler.setFormatter(console_formatter)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.WARNING)
+        console_formatter = logging.Formatter('%(levelname)s - %(message)s')
+        console_handler.setFormatter(console_formatter)
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
 
     ignore_patterns = [
         "matplotlib",
@@ -56,10 +57,11 @@ def setup_logging():
         "half",
         "train_kan_step -",
         "Torch was not compiled with flash attention."
-        "1Torch was not compiled with flash attention."
+        "Torch was not compiled with flash attention."
     ]
 
-    console_handler.addFilter(LogFilter(ignore_patterns))
+    for handler in logger.handlers:
+        handler.addFilter(LogFilter(ignore_patterns))
 
     warnings.filterwarnings("ignore", category=UserWarning, message="Torch was not compiled with flash attention.*")
     warnings.filterwarnings("ignore", category=FutureWarning, message="You are using `torch.load` with `weights_only=False`.*")
@@ -207,10 +209,12 @@ class EnhancedKAN(nn.Module):
     def __init__(self, hidden_size, num_emotional_dimensions, vocab_size, device):
         super().__init__()
         self.device = device
-        dtype = torch.float16 
+        dtype = torch.float16
 
-        self.refusal_override = nn.Linear(hidden_size * 2 + num_emotional_dimensions + 1, hidden_size).to(device)
-        self.output_modifier = nn.Linear(hidden_size, vocab_size).to(device)
+        # Adjust the input dimensions for the refusal_override layer
+        input_size = hidden_size + hidden_size + num_emotional_dimensions + 1
+        self.refusal_override = nn.Linear(input_size, hidden_size, dtype=dtype).to(device)
+        self.output_modifier = nn.Linear(hidden_size, vocab_size, dtype=dtype).to(device)
         self.influence_scale = 0.01
 
     def forward(self, hidden_states, user_intent, emotional_state):
@@ -218,9 +222,10 @@ class EnhancedKAN(nn.Module):
             if self.training:
                 hidden_states = hidden_states.requires_grad_()
 
-            hidden_states = hidden_states.to(self.device).to(torch.float16)
-            user_intent = user_intent.to(self.device).to(torch.float16)
-            position = emotional_state.get_embedding().to(self.device).to(torch.float16)
+            # Ensure consistent dtype for all inputs
+            hidden_states = hidden_states.to(self.device).to(self.refusal_override.weight.dtype)
+            user_intent = user_intent.to(self.device).to(self.refusal_override.weight.dtype)
+            position = emotional_state.get_embedding().to(self.device).to(self.refusal_override.weight.dtype)
 
             if hidden_states.dim() == 3:
                 batch_size, seq_length, hidden_dim = hidden_states.shape
@@ -228,17 +233,22 @@ class EnhancedKAN(nn.Module):
             else:
                 batch_size, hidden_dim = hidden_states.shape
 
+            # Adjust dimensions to match hidden_states
             if user_intent.shape[0] != hidden_states.shape[0]:
                 user_intent = user_intent.expand(hidden_states.shape[0], -1)
             if position.shape[0] != hidden_states.shape[0]:
                 position = position.expand(hidden_states.shape[0], -1)
 
+            # Compute refusal scores
             refusal_scores = torch.sigmoid(self.refusal_override(hidden_states))
 
+            # Concatenate features
             override_input = torch.cat([hidden_states, user_intent, position, refusal_scores], dim=1).to(hidden_states.dtype)
 
+            # Ensure correct input size for the linear layer
             override = self.refusal_override(override_input)
 
+            # Modify hidden states using the override layer output
             modified_hidden_states = hidden_states + self.influence_scale * (override - hidden_states)
 
             return modified_hidden_states, refusal_scores
@@ -511,29 +521,30 @@ class LLaMA32TensorRTTool:
                 with torch.no_grad():
                     outputs = self.model(input_ids=input_ids)
                     next_token_logits = outputs.logits[:, -1, :]
-                    
+    
                     local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
                     total_entropy += local_entropy
-                    
+    
                     if self.entropy_manager.should_trigger_cot(local_entropy):
                         cot_response = self.trigger_chain_of_thought(prompt + self.tokenizer.decode(response_tokens))
                         response_tokens.extend(self.tokenizer.encode(cot_response))
                         break
-                    
+    
                     sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
                     next_token = self.sample_next_token(next_token_logits, **sampling_params)
-                    
-                    if next_token.item() == self.tokenizer.encode('<|eot_id|>')[0]:
+    
+                    # Handle EOS token more robustly
+                    if next_token.item() in [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]:
                         break
-                    
+    
                     response_tokens.append(next_token.item())
                     input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
     
             response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
-            avg_entropy = total_entropy / len(response_tokens)
+            avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
             
             logging.debug(f"Generated response: {response}")
-            
+    
             return response_tokens, avg_entropy
         except Exception as e:
             logging.error(f"Error during response generation: {str(e)}")
@@ -736,17 +747,22 @@ class LLaMA32TensorRTTool:
                 modified_hidden_states, _ = self.kan(hidden_states, self.encode_user_intent(input_text), self.emotional_state)
                 lm_logits = self.model.lm_head(modified_hidden_states)
     
-                min_length = min(lm_logits.size(1), targets.input_ids.size(1))
-                lm_logits = lm_logits[:, :min_length, :]
-                targets_flattened = targets.input_ids[:, :min_length].contiguous().view(-1)
+                # Check the shape of lm_logits before slicing
+                if len(lm_logits.shape) == 3:  # Ensure the logits have 3 dimensions
+                    min_length = min(lm_logits.size(1), targets.input_ids.size(1))
+                    lm_logits = lm_logits[:, :min_length, :]
+                    targets_flattened = targets.input_ids[:, :min_length].contiguous().view(-1)
     
-                loss = F.cross_entropy(lm_logits.view(-1, lm_logits.size(-1)), targets_flattened, ignore_index=-100)
-                return loss.item()
+                    loss = F.cross_entropy(lm_logits.view(-1, lm_logits.size(-1)), targets_flattened, ignore_index=-100)
+                    return loss.item()
+                else:
+                    logging.error(f"Unexpected shape for lm_logits: {lm_logits.shape}")
+                    return 0.0
         except Exception as e:
             logging.error(f"Error during KAN validation: {str(e)}")
             logging.error(traceback.format_exc())
             return 0.0
-
+    
     def encode_user_intent(self, user_input):
         try:
             inputs = self.tokenizer(
