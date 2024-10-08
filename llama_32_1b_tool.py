@@ -676,34 +676,21 @@ class LLaMA32TensorRTTool:
         logging.info("Attempting full GPU initialization with enforced max_memory...")
     
         max_memory = {i: "98GB" for i in range(torch.cuda.device_count())}
-        checkpoint_path = str(self.model_path)
+        checkpoint_dir = str(self.model_path)
     
-        logging.info(f"Checkpoint path: {checkpoint_path}")
+        logging.info(f"Checkpoint directory: {checkpoint_dir}")
         logging.info(f"Current working directory: {os.getcwd()}")
         logging.info(f"User running the script: {os.getlogin()}")
     
         try:
-            logging.info(f"Directory contents: {os.listdir(os.path.dirname(checkpoint_path))}")
+            logging.info(f"Directory contents: {os.listdir(checkpoint_dir)}")
         except Exception as e:
             logging.error(f"Error listing directory contents: {str(e)}")
     
         try:
-            file_stat = os.stat(checkpoint_path)
-            logging.info(f"File stats: size={file_stat.st_size}, permissions={oct(file_stat.st_mode)}")
-        except Exception as e:
-            logging.error(f"Error getting file stats: {str(e)}")
-    
-        try:
-            # Try to open the file directly
-            with open(checkpoint_path, 'rb') as f:
-                logging.info(f"File opened successfully, first 100 bytes: {f.read(100).hex()}")
-        except Exception as e:
-            logging.error(f"Error opening file directly: {str(e)}")
-    
-        try:
             # Initialize model with empty weights
             with init_empty_weights():
-                config = AutoConfig.from_pretrained(checkpoint_path)
+                config = AutoConfig.from_pretrained(checkpoint_dir)
                 model = AutoModelForCausalLM.from_config(config)
             logging.info("Model initialized with empty weights")
     
@@ -711,13 +698,17 @@ class LLaMA32TensorRTTool:
             model = model.to_empty(device='cuda')
             logging.info("Empty model moved to GPU")
     
-            # Load the model weights
-            logging.info("Attempting to load state dict...")
-            state_dict = torch.load(checkpoint_path)
-            logging.info("State dict loaded successfully")
-    
-            model.load_state_dict(state_dict)
-            logging.info("State dict applied to model")
+            # Load the model weights using SafeTensors
+            for filename in os.listdir(checkpoint_dir):
+                if filename.endswith('.safetensors'):
+                    file_path = os.path.join(checkpoint_dir, filename)
+                    logging.info(f"Loading weights from {file_path}")
+                    try:
+                        state_dict = load_file(file_path)
+                        model.load_state_dict(state_dict, strict=False)
+                        logging.info(f"Weights loaded successfully from {filename}")
+                    except Exception as e:
+                        logging.error(f"Error loading weights from {filename}: {str(e)}")
     
             # Enable gradient checkpointing for memory efficiency
             model.gradient_checkpointing_enable()
@@ -743,15 +734,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             
-            # Additional error information
-            if isinstance(e, RuntimeError) and "CUDA out of memory" in str(e):
-                logging.error("CUDA out of memory error. Consider reducing model size or batch size.")
-            elif isinstance(e, FileNotFoundError):
-                logging.error(f"Model file not found. Ensure the path is correct: {checkpoint_path}")
-            elif isinstance(e, PermissionError):
-                logging.error(f"Permission denied when accessing the model file. Check file permissions.")
-    
-            raise RuntimeError("Failed to initialize model on GPU.") 
+            raise RuntimeError("Failed to initialize model on GPU.")
             
     def _verify_tied_weights(self, model):
         # Add a method to verify if weights are tied
