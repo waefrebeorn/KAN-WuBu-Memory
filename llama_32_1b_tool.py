@@ -332,67 +332,78 @@ class EnhancedKAN(nn.Module):
     def __init__(self, hidden_size, num_emotional_dimensions, vocab_size, device):
         super().__init__()
         self.device = device
-        dtype = torch.float16
-
+        self.dtype = torch.float16
         self.hidden_size = hidden_size
         self.emotional_size = num_emotional_dimensions
         self.input_size = hidden_size + hidden_size + num_emotional_dimensions
-
-        self.refusal_override = nn.Linear(self.input_size, hidden_size, dtype=dtype).to(device)
-        self.output_modifier = nn.Linear(hidden_size, vocab_size, dtype=dtype).to(device)
+        self.vocab_size = vocab_size
         self.influence_scale = 0.01
+        
+        # Lazy initialization
+        self.refusal_override = None
+        self.output_modifier = None
+
+    def _lazy_init(self):
+        if self.refusal_override is None:
+            self.refusal_override = nn.Linear(self.input_size, self.hidden_size, dtype=self.dtype).to(self.device)
+        if self.output_modifier is None:
+            self.output_modifier = nn.Linear(self.hidden_size, self.vocab_size, dtype=self.dtype).to(self.device)
+
+    @torch.jit.script_method
+    def optimize_memory(self):
+        torch.cuda.empty_cache()
 
     def forward(self, hidden_states, user_intent, emotional_state):
         try:
-            if self.training:
-                hidden_states = hidden_states.requires_grad_()
+            self._lazy_init()
 
-            # Ensure all inputs are on the correct device and dtype
-            hidden_states = hidden_states.to(self.device, dtype=torch.float16)
-            user_intent = user_intent.to(self.device, dtype=torch.float16)
-            position = emotional_state.get_embedding(hidden_states.size(0)).to(self.device, dtype=torch.float16)
+            # Use torch.cuda.amp.autocast for mixed precision
+            with torch.cuda.amp.autocast(dtype=self.dtype):
+                # Ensure all inputs are on the correct device and dtype
+                hidden_states = hidden_states.to(self.device, dtype=self.dtype)
+                user_intent = user_intent.to(self.device, dtype=self.dtype)
+                position = emotional_state.get_embedding(hidden_states.size(0)).to(self.device, dtype=self.dtype)
 
-            # Debug shapes before processing
-            print(f"Hidden States Shape: {hidden_states.shape}")
-            print(f"User Intent Shape: {user_intent.shape}")
-            print(f"Emotional State Shape: {position.shape}")
+                # Handle different input shapes
+                if hidden_states.dim() == 3:
+                    batch_size, seq_length, _ = hidden_states.size()
+                elif hidden_states.dim() == 2:
+                    batch_size, _ = hidden_states.size()
+                    seq_length = 1
+                    hidden_states = hidden_states.unsqueeze(1)
+                else:
+                    raise ValueError(f"Unexpected hidden_states dimension: {hidden_states.dim()}")
 
-            # Ensure all inputs have a consistent sequence dimension
-            if hidden_states.dim() == 3:
-                batch_size, seq_length, hidden_size = hidden_states.size()
-            elif hidden_states.dim() == 2:
-                batch_size, hidden_size = hidden_states.size()
-                seq_length = 1
-                hidden_states = hidden_states.unsqueeze(1)
-            else:
-                raise ValueError(f"Unexpected hidden_states dimension: {hidden_states.dim()}")
+                # Ensure user_intent is broadcastable
+                if user_intent.dim() == 2:
+                    user_intent = user_intent.unsqueeze(1).expand(batch_size, seq_length, -1)
+                elif user_intent.dim() == 1:
+                    user_intent = user_intent.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_length, -1)
 
-            # Ensure user_intent is broadcastable to (batch_size, seq_length, hidden_size)
-            if user_intent.dim() == 2:
-                user_intent = user_intent.unsqueeze(1).expand(batch_size, seq_length, -1)
-            elif user_intent.dim() == 1:
-                user_intent = user_intent.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_length, -1)
+                # Expand position embedding to match sequence length
+                position = position.unsqueeze(1).expand(batch_size, seq_length, -1)
 
-            # Expand position embedding to match sequence length
-            position = position.unsqueeze(1).expand(batch_size, seq_length, -1)
+                # Concatenate inputs
+                kan_input = torch.cat([hidden_states, user_intent, position], dim=-1)
 
-            # Concatenate hidden_states, user_intent, and position
-            kan_input = torch.cat([hidden_states, user_intent, position], dim=-1)
+                # Apply refusal override and influence scale
+                refusal_scores = torch.sigmoid(self.refusal_override(kan_input))
+                modified_hidden_states = hidden_states + self.influence_scale * refusal_scores
 
-            # Debug shape of concatenated input
-            print(f"KAN Input Shape: {kan_input.shape}")
-
-            # Apply refusal override and influence scale
-            refusal_scores = torch.sigmoid(self.refusal_override(kan_input))
-            modified_hidden_states = hidden_states + self.influence_scale * refusal_scores
-
-            # Return the modified hidden states and refusal scores
             return modified_hidden_states, refusal_scores.squeeze(1)
+
         except Exception as e:
-            logging.error(f"Error in EnhancedKAN.forward: {str(e)}")
-            logging.error(traceback.format_exc())
-            return hidden_states, torch.zeros(batch_size, hidden_size, device=self.device)
-            
+            print(f"Error in EnhancedKAN.forward: {str(e)}")
+            return hidden_states, torch.zeros(batch_size, self.hidden_size, device=self.device, dtype=self.dtype)
+
+    def to(self, *args, **kwargs):
+        device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(*args, **kwargs)
+        if device is not None:
+            self.device = device
+        if dtype is not None:
+            self.dtype = dtype
+        return super().to(*args, **kwargs)
+        
 class EntropyManager:
     def __init__(self, model, tokenizer, device):
         self.model = model
@@ -403,9 +414,10 @@ class EntropyManager:
         self.low_entropy_threshold = 0.5
         self.high_entropy_threshold = 2.0
 
+    @torch.no_grad()
     def calculate_entropy(self, logits):
         probs = F.softmax(logits, dim=-1)
-        entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1)
+        entropy = -torch.sum(probs * torch.log2(probs + 1e-9), dim=-1)
         return entropy.mean().item()
 
     def update_global_entropy(self, local_entropy):
@@ -414,13 +426,13 @@ class EntropyManager:
 
     def should_trigger_cot(self, local_entropy):
         entropy_increase = local_entropy - self.global_entropy
-        probability = 1 / (1 + np.exp(-entropy_increase))  # Sigmoid function
+        probability = 1 / (1 + np.exp(-entropy_increase))
         return np.random.random() < probability
 
     def adjust_sampling_parameters(self, local_entropy):
         entropy_ratio = local_entropy / (self.global_entropy + 1e-9)
-        temperature = max(0.1, min(1.5, entropy_ratio))
-        top_p = max(0.1, min(0.9, 1.0 - entropy_ratio))
+        temperature = np.clip(entropy_ratio, 0.1, 1.5)
+        top_p = np.clip(1.0 - entropy_ratio, 0.1, 0.9)
         return {"temperature": temperature, "top_p": top_p}
 
 class AdvancedMemoryManager:
@@ -428,16 +440,16 @@ class AdvancedMemoryManager:
         self.max_context_length = max_context_length
         self.tokenizer = tokenizer
         self.device = device
-        self.model = model 
+        self.model = model
         self.memory_buffer = deque(maxlen=max_context_length)
         self.important_memory_buffer = deque(maxlen=max_context_length // 2)
         self.sliding_window = deque(maxlen=max_context_length)
-        self.tfidf_vectorizer = TfidfVectorizer()
-        self.kmeans = KMeans(n_clusters=5)
+        self.tfidf_vectorizer = TfidfVectorizer(max_features=1000)
+        self.kmeans = KMeans(n_clusters=5, n_init=10)
 
     def update_memory(self, message, entropy):
-        tokens = self.tokenizer.encode(message['content'])
-        self.memory_buffer.extend(tokens)
+        tokens = self.tokenizer.encode(message['content'], add_special_tokens=False)
+        self.memory_buffer.extend(tokens[:self.max_context_length - len(self.memory_buffer)])
         self.sliding_window.append(message)
         
         importance_score = self.calculate_importance_score(message, entropy)
@@ -449,6 +461,9 @@ class AdvancedMemoryManager:
             self.consolidate_memories()
 
     def calculate_importance_score(self, message, entropy):
+        if not self.sliding_window:
+            return 0.0
+        
         memory_vector = self.tfidf_vectorizer.fit_transform([message['content']])
         recent_context = ' '.join([m['content'] for m in self.sliding_window])
         context_vector = self.tfidf_vectorizer.transform([recent_context])
@@ -456,9 +471,12 @@ class AdvancedMemoryManager:
         similarity_score = cosine_similarity(memory_vector, context_vector)[0][0]
         entropy_factor = np.tanh(entropy)
         
-        return similarity_score * (1 + entropy_factor)
+        return float(similarity_score * (1 + entropy_factor))
 
     def consolidate_memories(self):
+        if len(self.sliding_window) < self.kmeans.n_clusters:
+            return
+
         memories = [m['content'] for m in self.sliding_window]
         vectors = self.tfidf_vectorizer.fit_transform(memories)
         clusters = self.kmeans.fit_predict(vectors)
@@ -466,16 +484,26 @@ class AdvancedMemoryManager:
         consolidated_memories = []
         for cluster_id in range(self.kmeans.n_clusters):
             cluster_memories = [mem for mem, clust in zip(self.sliding_window, clusters) if clust == cluster_id]
-            summary = self.summarize_cluster(cluster_memories)
-            consolidated_memories.append(summary)
+            if cluster_memories:
+                summary = self.summarize_cluster(cluster_memories)
+                consolidated_memories.append(summary)
         
         self.sliding_window = deque(consolidated_memories, maxlen=self.max_context_length)
 
+    @torch.no_grad()
     def summarize_cluster(self, cluster_memories):
         cluster_text = " ".join([mem['content'] for mem in cluster_memories])
         summary_prompt = f"Summarize the following text concisely:\n\n{cluster_text}\n\nSummary:"
-        summary_ids = self.tokenizer.encode(summary_prompt, return_tensors='pt').to(self.device)
-        summary_output = self.model.generate(summary_ids, max_length=100, num_return_sequences=1, no_repeat_ngram_size=2)
+        
+        inputs = self.tokenizer(summary_prompt, return_tensors='pt', truncation=True, max_length=512).to(self.device)
+        summary_output = self.model.generate(
+            **inputs,
+            max_new_tokens=100,
+            num_return_sequences=1,
+            no_repeat_ngram_size=2,
+            temperature=0.7,
+            top_p=0.95
+        )
         summary = self.tokenizer.decode(summary_output[0], skip_special_tokens=True)
         return {"role": "system", "content": summary}
 
@@ -490,6 +518,7 @@ class AdvancedMemoryManager:
             context += f"<|start_header_id|>{message['role']}<|end_header_id|>\n{message['content']}<|eot_id|>"
 
         return context
+
 
 class LLaMA32TensorRTTool:
     def __init__(self):
@@ -571,18 +600,33 @@ class LLaMA32TensorRTTool:
                     raise RuntimeError("Failed to initialize tokenizer")
     
                 self.clear_memory()
+                
+                # Initialize model with gradient checkpointing for memory efficiency
                 with self.amp_context:
                     self.model = self._initialize_model_full_gpu()
+                    self.model.gradient_checkpointing_enable()
                 self.clear_memory()
     
                 if self.model is None:
                     raise RuntimeError("Model initialization failed")
     
                 vocab_size = len(self.tokenizer)
+                
+                # Initialize KAN with half precision
                 self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
-                self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
+                self.kan.to(torch.float16)
+                self.clear_memory()
+    
+                # Use a memory-efficient optimizer
+                self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate, eps=1e-8, betas=(0.9, 0.999), weight_decay=0.01)
+                self.clear_memory()
+    
+                # Initialize other components
                 self.refusal_detector = self._initialize_refusal_detector()
+                self.clear_memory()
+    
                 self.entropy_manager = self._initialize_entropy_manager()
+                self.clear_memory()
     
                 self.memory_manager = AdvancedMemoryManager(
                     max_context_length=2048,
@@ -590,12 +634,16 @@ class LLaMA32TensorRTTool:
                     device=self.device,
                     model=self.model
                 )
+                self.clear_memory()
     
                 self.overfit_detector = OverfitDetector()
                 self.day_cycle = SyntheticDayCycle()
                 self.tensor_swapper = TensorSwapper(self.device)
     
                 self.clear_memory()
+    
+                # Set up gradient scaler for mixed precision training
+                self.scaler = torch.cuda.amp.GradScaler()
     
                 self.components_initialized = True
                 logging.info("All components initialized successfully on GPU.")
@@ -617,6 +665,12 @@ class LLaMA32TensorRTTool:
     
         logging.error("Failed to initialize components after maximum attempts.")
         raise RuntimeError("Component initialization failed after multiple GPU-only attempts")
+    
+    def clear_memory(self):
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.synchronize()
+        logging.info(f"GPU memory cleared and synchronized. Current memory usage: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
     def _initialize_model_full_gpu(self):
         logging.info("Attempting full GPU initialization with enforced max_memory...")
@@ -749,13 +803,6 @@ class LLaMA32TensorRTTool:
             raise RuntimeError("Failed to initialize model with quantization.")
     
     
-    def clear_memory(self):
-        torch.cuda.empty_cache()
-        gc.collect()
-        torch.cuda.synchronize()
-        logging.info("GPU memory cleared and synchronized.")
-
-
   
     def _initialize_tokenizer(self):
         try:
@@ -775,14 +822,25 @@ class LLaMA32TensorRTTool:
     
             
 
-    def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size):
-        return EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, self.device).to(self.device)
-
-    def _initialize_refusal_detector(self):
-        return RefusalDetector(self.tokenizer, self.model)
-
-    def _initialize_entropy_manager(self):
-        return EntropyManager(self.model, self.tokenizer, self.device)
+    def _lazy_initialize_kan(self):
+        if self.kan is None:
+            logging.info("Lazy initializing KAN...")
+            vocab_size = len(self.tokenizer)
+            hidden_size = self.config.hidden_size
+            num_emotional_dimensions = len(self.emotional_state.dimensions)
+            self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
+            self.kan.to(torch.float16)  # Convert to half precision
+            self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
+    
+    def _lazy_initialize_refusal_detector(self):
+        if self.refusal_detector is None:
+            logging.info("Lazy initializing Refusal Detector...")
+            self.refusal_detector = self._initialize_refusal_detector()
+    
+    def _lazy_initialize_entropy_manager(self):
+        if self.entropy_manager is None:
+            logging.info("Lazy initializing Entropy Manager...")
+            self.entropy_manager = self._initialize_entropy_manager()
 
     def _initialize_memory_manager(self):
         return AdvancedMemoryManager(2048, self.tokenizer, self.device)
