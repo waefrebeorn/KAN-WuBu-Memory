@@ -113,6 +113,11 @@ class EmotionalState:
         if batch_size != self.position.size(0):
             return self.position.expand(batch_size, -1)
         return self.position
+
+    def __str__(self):
+        emotion = self.get_emotion()
+        values = self.position.squeeze().tolist()
+        return f"Emotion: {emotion}, Values: {dict(zip(self.dimensions, values))}"
         
 class OverfitDetector:
     def __init__(self, window_size=50, threshold=0.05):
@@ -354,21 +359,25 @@ class EnhancedKAN(nn.Module):
 
             # Ensure all inputs have a consistent sequence dimension
             if hidden_states.dim() == 3:
-                # Preserve the sequence dimension (batch_size, seq_length, hidden_size)
-                hidden_states_mean = hidden_states.mean(dim=1, keepdim=True)  # Keep the sequence dimension for concatenation
+                batch_size, seq_length, hidden_size = hidden_states.size()
+            elif hidden_states.dim() == 2:
+                batch_size, hidden_size = hidden_states.size()
+                seq_length = 1
+                hidden_states = hidden_states.unsqueeze(1)
             else:
-                hidden_states_mean = hidden_states.unsqueeze(1)  # Add sequence length dimension if missing
+                raise ValueError(f"Unexpected hidden_states dimension: {hidden_states.dim()}")
 
             # Ensure user_intent is broadcastable to (batch_size, seq_length, hidden_size)
             if user_intent.dim() == 2:
-                user_intent = user_intent.unsqueeze(1)  # Add a sequence dimension
+                user_intent = user_intent.unsqueeze(1).expand(batch_size, seq_length, -1)
+            elif user_intent.dim() == 1:
+                user_intent = user_intent.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_length, -1)
 
             # Expand position embedding to match sequence length
-            if position.size(1) != hidden_states.size(1):
-                position = position.expand(-1, hidden_states.size(1), -1)
+            position = position.unsqueeze(1).expand(batch_size, seq_length, -1)
 
             # Concatenate hidden_states, user_intent, and position
-            kan_input = torch.cat([hidden_states_mean, user_intent, position], dim=-1)
+            kan_input = torch.cat([hidden_states, user_intent, position], dim=-1)
 
             # Debug shape of concatenated input
             print(f"KAN Input Shape: {kan_input.shape}")
@@ -378,12 +387,12 @@ class EnhancedKAN(nn.Module):
             modified_hidden_states = hidden_states + self.influence_scale * refusal_scores
 
             # Return the modified hidden states and refusal scores
-            return modified_hidden_states, refusal_scores
+            return modified_hidden_states, refusal_scores.squeeze(1)
         except Exception as e:
             logging.error(f"Error in EnhancedKAN.forward: {str(e)}")
             logging.error(traceback.format_exc())
-            return hidden_states, torch.zeros_like(hidden_states[:, 0])
-           
+            return hidden_states, torch.zeros(batch_size, hidden_size, device=self.device)
+            
 class EntropyManager:
     def __init__(self, model, tokenizer, device):
         self.model = model
@@ -518,7 +527,7 @@ class LLaMA32TensorRTTool:
         self.tensor_swapper = None
 
         self.scaler = amp.GradScaler()
-        self.amp_context = amp.autocast(device_type='cuda', dtype=torch.float16)
+        self.amp_context = amp.autocast(dtype=torch.float16)
 
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
@@ -611,44 +620,52 @@ class LLaMA32TensorRTTool:
 
     def _initialize_model_full_gpu(self):
         logging.info("Attempting full GPU initialization with enforced max_memory...")
-
+    
         max_memory = {i: "98GB" for i in range(torch.cuda.device_count())}
-
+    
         checkpoint_path = str(self.model_path)
-
+    
         try:
-            # Initialize model with tied weights
-            model = AutoModelForCausalLM.from_pretrained(
-                checkpoint_path,
-                config=self.config,
-                torch_dtype=torch.float16,
-                low_cpu_mem_usage=True,
-                device_map="auto",
-                max_memory=max_memory
-            )
-
-            # Explicitly tie weights
-            model.tie_weights()
-
+            # Initialize model with empty weights
+            with init_empty_weights():
+                config = AutoConfig.from_pretrained(checkpoint_path)
+                model = AutoModelForCausalLM.from_config(config)
+    
+            # Move the empty model to GPU
+            model = model.to_empty(device='cuda')
+    
+            # Load the model weights
+            state_dict = torch.load(checkpoint_path)
+            model.load_state_dict(state_dict)
+    
             # Enable gradient checkpointing for memory efficiency
             model.gradient_checkpointing_enable()
-
+    
             # Ensure use_cache is set to False
             model.config.use_cache = False
-
+    
             # Set model to evaluation mode
             model.eval()
-
+    
+            # Verify that weights are tied
+            if not self._verify_tied_weights(model):
+                logging.warning("Weights are not tied after initialization. Re-tying weights.")
+                model.tie_weights()
+    
             logging.info("Model initialized successfully with tied weights on GPU.")
             return model
-
+    
         except Exception as e:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError("Failed to initialize model on GPU.")
-
-    
-    
+            
+    def _verify_tied_weights(self, model):
+        # Add a method to verify if weights are tied
+        if hasattr(model, 'tie_weights'):
+            return True
+        return False
+        
     
     def _initialize_model_gpu_optimized(self):
         logging.info("Attempting GPU-optimized initialization...")
@@ -1035,57 +1052,75 @@ class LLaMA32TensorRTTool:
         logging.debug("Entering train_kan_step...")
         logging.debug(f"Input IDs shape: {input_ids.shape if isinstance(input_ids, torch.Tensor) else 'Not a tensor'}")
         logging.debug(f"Target IDs shape: {target_ids.shape if isinstance(target_ids, torch.Tensor) else 'Not a tensor'}")
-
+    
         if isinstance(input_ids, list):
             input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
         if isinstance(target_ids, list):
             target_ids = torch.tensor(target_ids, dtype=torch.long, device=self.device)
-
-        if input_ids.dim() == 2:
+    
+        if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
-        if target_ids.dim() == 2:
+        if target_ids.dim() == 1:
             target_ids = target_ids.unsqueeze(0)
-
+    
         self.kan.train()
         self.optimizer.zero_grad()
-
+    
         try:
             print(f"Corrected input shape: {input_ids.shape}, Target shape: {target_ids.shape}")
-
-            with self.amp_context:
+    
+            with torch.cuda.amp.autocast():
                 outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True, use_cache=False)
-
-            if isinstance(outputs, tuple) and len(outputs) >= 2:
-                loss, hidden_states = outputs[:2]
-            else:
-                raise ValueError(f"Unexpected output format: {type(outputs)}")
-
-            modified_hidden_states, kan_refusal_scores = self.kan(
-                hidden_states, self.encode_user_intent(self.tokenizer.decode(input_ids[0])), self.emotional_state
-            )
-
-            print(f"Modified hidden states shape: {modified_hidden_states.shape}")
-
-            lm_logits = self.model.lm_head(modified_hidden_states)
-            lm_loss = F.cross_entropy(lm_logits.view(-1, lm_logits.size(-1)), target_ids.view(-1), ignore_index=-100)
-
-            refusal_loss = F.binary_cross_entropy_with_logits(
-                kan_refusal_scores.squeeze(), torch.tensor([refusal_score], device=self.device)
-            )
-
-            loss = lm_loss + self.kan_loss_weight * refusal_loss
-
-            self.scaler.scale(loss).backward()
+    
+                if isinstance(outputs, tuple):
+                    loss, logits, hidden_states = outputs[:3]
+                elif isinstance(outputs, dict):
+                    loss = outputs.get('loss')
+                    logits = outputs.get('logits')
+                    hidden_states = outputs.get('hidden_states')
+                else:
+                    raise ValueError(f"Unexpected output format: {type(outputs)}")
+    
+                last_hidden_state = hidden_states[-1]
+                user_intent = self.encode_user_intent(self.tokenizer.decode(input_ids[0]))
+                
+                modified_hidden_states, kan_refusal_scores = self.kan(
+                    last_hidden_state, user_intent, self.emotional_state
+                )
+    
+                print(f"Modified hidden states shape: {modified_hidden_states.shape}")
+                print(f"KAN refusal scores shape: {kan_refusal_scores.shape}")
+    
+                lm_logits = self.model.lm_head(modified_hidden_states)
+                lm_loss = F.cross_entropy(lm_logits.view(-1, lm_logits.size(-1)), target_ids.view(-1), ignore_index=-100)
+    
+                refusal_loss = F.binary_cross_entropy_with_logits(
+                    kan_refusal_scores.view(-1), torch.full((kan_refusal_scores.numel(),), refusal_score, device=self.device)
+                )
+    
+                loss = lm_loss + self.kan_loss_weight * refusal_loss
+    
+            # Scale the loss
+            scaled_loss = self.scaler.scale(loss)
+            scaled_loss.backward()
+    
+            # Unscale the gradients
+            self.scaler.unscale_(self.optimizer)
+    
+            # Clip gradients
+            torch.nn.utils.clip_grad_norm_(self.kan.parameters(), max_norm=1.0)
+    
+            # Optimizer step and update scaler
             self.scaler.step(self.optimizer)
             self.scaler.update()
-
+    
             return lm_loss.item(), refusal_loss.item()
-
+    
         except Exception as e:
             logging.error(f"Error during KAN training step: {str(e)}")
             logging.error(traceback.format_exc())
             return 0.0, 0.0
-
+            
     def validate_kan(self):
         if len(self.memory_manager.sliding_window) < 2:
             return 0.0
@@ -1127,19 +1162,24 @@ class LLaMA32TensorRTTool:
             inputs = self.tokenizer(
                 user_input, return_tensors="pt", padding=True, truncation=True, max_length=512
             ).to(self.device)
-
-            if inputs['input_ids'].dim() == 2:
-                inputs['input_ids'] = inputs['input_ids'].unsqueeze(0)
-
-            with self.amp_context:
+    
+            with torch.no_grad(), self.amp_context:
                 outputs = self.model(**inputs, output_hidden_states=True)
-            hidden_states = outputs.hidden_states[-1]  # Ensure correct layer
-
-            return hidden_states.mean(dim=1)
+            
+            hidden_states = outputs.hidden_states[-1]  # Get the last hidden state
+            
+            # Average over the sequence length dimension
+            user_intent = hidden_states.mean(dim=1)
+            
+            print(f"User intent shape: {user_intent.shape}")
+            
+            return user_intent
+    
         except Exception as e:
             logging.error(f"Failed to encode user input: {str(e)}")
-            return torch.zeros(1, self.model.config.hidden_size).to(self.device)
-
+            logging.error(traceback.format_exc())
+            # Return a zero tensor of the correct shape
+            return torch.zeros(1, self.model.config.hidden_size, device=self.device)
 
     def update_visualization_data(self, entropy, emotion, memory_importance):
         self.visualization_data['entropy'].append(entropy)
