@@ -1070,6 +1070,14 @@ class LLaMA32TensorRTTool:
     
         return response_tokens, quality_metrics
     
+    def is_garbage_output(self, entropy, partial_tokens):
+        """Detect garbage outputs based on entropy spikes and partial token patterns."""
+        if entropy > 3.0:  # Threshold for detecting excessive entropy (indicates randomness)
+            return True
+        if len(partial_tokens) > 10 and partial_tokens[-10:] == partial_tokens[-20:-10]:  # Repetitive pattern detection
+            return True
+        return False
+        
     def _is_response_complete(self, partial_response):
         # Check if the response seems complete based on content
         sentences = re.split(r'(?<=[.!?])\s+', partial_response.strip())
