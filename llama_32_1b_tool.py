@@ -447,7 +447,7 @@ class RefusalDetector:
 
 
 class EnhancedKAN(nn.Module):
-    def __init__(self, hidden_size, num_emotional_dimensions, vocab_size, device):
+    def __init__(self, hidden_size, num_emotional_dimensions, vocab_size, device, base_model):
         super().__init__()
         self.device = device
         self.hidden_size = hidden_size
@@ -1217,7 +1217,7 @@ class LLaMA32TensorRTTool:
             vocab_size = len(self.tokenizer)
             hidden_size = self.config.hidden_size
             num_emotional_dimensions = len(self.emotional_state.dimensions)
-            self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
+            self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size, self.model)
             self.kan.to(torch.float16)  # Convert to half precision
             self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
    
