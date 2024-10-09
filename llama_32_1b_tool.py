@@ -870,7 +870,7 @@ class LLaMA32TensorRTTool:
             logging.info("Model initialized with empty weights")
     
             # Move the empty model to GPU
-            model = model.to(self.device)
+            model = model.to_empty(device=self.device)
             logging.info("Empty model moved to GPU")
     
             # Load the model weights using SafeTensors
@@ -886,7 +886,7 @@ class LLaMA32TensorRTTool:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
     
             # Ensure all model parameters are on the correct device
-            model = model.to(self.device)
+            model = model.to_empty(device=self.device)
     
             # Enable gradient checkpointing for memory efficiency
             model.gradient_checkpointing_enable()
