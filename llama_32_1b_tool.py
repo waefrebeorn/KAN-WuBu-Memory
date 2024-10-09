@@ -880,10 +880,12 @@ class LLaMA32TensorRTTool:
                     logging.info(f"Loading weights from {file_path}")
                     try:
                         state_dict = load_file(file_path, device="cpu")  # Load to CPU first
-                        model.load_state_dict(state_dict, strict=False, assign=True)  # Use assign=True
+                        # Use a custom loading function to handle potential shape mismatches
+                        self._load_state_dict_with_mismatch_size(model, state_dict)
                         logging.info(f"Weights loaded successfully from {filename}")
                     except Exception as e:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
+                        raise  # Re-raise the exception to stop the process if loading fails
     
             # Move the model with loaded weights to GPU
             model = model.to(self.device)
@@ -920,13 +922,38 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError("Failed to initialize model on GPU.")
-            
-           
+    
+    def _load_state_dict_with_mismatch_size(self, model, state_dict):
+        model_state_dict = model.state_dict()
+        for name, param in state_dict.items():
+            if name not in model_state_dict:
+                logging.warning(f"Unexpected key in state_dict: {name}")
+                continue
+            if param.shape != model_state_dict[name].shape:
+                logging.warning(f"Shape mismatch for {name}: expected {model_state_dict[name].shape}, got {param.shape}")
+                # Attempt to reshape or pad the parameter
+                if param.numel() == model_state_dict[name].numel():
+                    param = param.reshape(model_state_dict[name].shape)
+                else:
+                    # If shapes are incompatible, skip this parameter
+                    logging.warning(f"Skipping parameter {name} due to incompatible shape")
+                    continue
+            model_state_dict[name].copy_(param)
+        model.load_state_dict(model_state_dict, strict=False)
+    
     def _verify_tied_weights(self, model):
-        # Add a method to verify if weights are tied
-        if hasattr(model, 'tie_weights'):
-            return True
-        return False
+        # Implement a more thorough check for tied weights
+        if not hasattr(model, 'tie_weights'):
+            return False
+        
+        # Check if embedding weights are tied
+        if hasattr(model, 'get_input_embeddings') and hasattr(model, 'get_output_embeddings'):
+            input_embeddings = model.get_input_embeddings().weight
+            output_embeddings = model.get_output_embeddings().weight
+            if not torch.equal(input_embeddings, output_embeddings):
+                return False
+        
+        return True
         
     
     def _initialize_model_gpu_optimized(self):
