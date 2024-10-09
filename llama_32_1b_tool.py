@@ -879,8 +879,13 @@ class LLaMA32TensorRTTool:
                     file_path = os.path.join(checkpoint_dir, filename)
                     logging.info(f"Loading weights from {file_path}")
                     try:
-                        state_dict = load_file(file_path, device=self.device)
-                        model.load_state_dict(state_dict, strict=False)
+                        state_dict = load_file(file_path, device="cpu")
+                        for param_name, param in state_dict.items():
+                            if param_name in model.state_dict():
+                                if model.state_dict()[param_name].is_meta:
+                                    model.get_parameter(param_name).data = param.to(self.device)
+                                else:
+                                    model.state_dict()[param_name].copy_(param.to(self.device))
                         logging.info(f"Weights loaded successfully from {filename}")
                     except Exception as e:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
@@ -888,7 +893,7 @@ class LLaMA32TensorRTTool:
     
             # Move all existing parameters to the correct device
             for name, param in model.named_parameters():
-                if not param.is_meta and param.device != self.device:
+                if param.device != self.device:
                     param.data = param.data.to(self.device)
                     logging.info(f"Moved parameter '{name}' to {self.device}")
     
@@ -913,10 +918,10 @@ class LLaMA32TensorRTTool:
             for name, param in model.named_parameters():
                 if param.device != self.device:
                     raise RuntimeError(f"Parameter '{name}' is on {param.device}, expected {self.device}")
-                if not param.is_meta and param.numel() == 0:
-                    raise RuntimeError(f"Parameter '{name}' has no data")
+                if param.is_meta:
+                    raise RuntimeError(f"Parameter '{name}' is still a meta tensor")
     
-            logging.info(f"All model parameters verified to be on {self.device} with data")
+            logging.info(f"All model parameters verified to be on {self.device}")
     
             return model
     
