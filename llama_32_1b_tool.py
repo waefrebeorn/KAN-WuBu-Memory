@@ -730,7 +730,7 @@ class LLaMA32TensorRTTool:
                 logging.info("ResponseQualityManager initialized successfully.")
     
                 # Set up gradient scaler for mixed precision training
-                self.scaler = torch.amp.GradScaler('cuda')
+                self.scaler = torch.amp.GradScaler()
     
                 self.components_initialized = True
                 logging.info("All components initialized successfully on GPU.")
@@ -809,6 +809,10 @@ class LLaMA32TensorRTTool:
             # Set model to evaluation mode
             model.eval()
             logging.info("Model set to evaluation mode")
+    
+            # Set model dtype to float16
+            model = model.to(dtype=torch.float16)
+            logging.info("Model converted to float16")
     
             # Verify that weights are tied
             if not self._verify_tied_weights(model):
@@ -959,10 +963,25 @@ class LLaMA32TensorRTTool:
     def _update_model_for_tokenizer(self):
         if self.model is not None:
             try:
-                # Resize token embeddings
-                self.model.resize_token_embeddings(len(self.tokenizer))
-                logging.info("Model token embeddings resized.")
-    
+                # Get the current embedding layer
+                old_embeddings = self.model.get_input_embeddings()
+                
+                # Create new embeddings with the correct size
+                new_num_tokens = len(self.tokenizer)
+                new_embeddings = nn.Embedding(new_num_tokens, old_embeddings.embedding_dim)
+                
+                # Copy the weights for the existing tokens
+                num_tokens_to_copy = min(old_embeddings.num_embeddings, new_num_tokens)
+                new_embeddings.weight.data[:num_tokens_to_copy, :] = old_embeddings.weight.data[:num_tokens_to_copy, :]
+                
+                # Set the new embedding layer
+                self.model.set_input_embeddings(new_embeddings)
+                
+                # Tie weights if necessary
+                self.model.tie_weights()
+                
+                logging.info(f"Model embeddings resized to {new_num_tokens}")
+                
                 # Set pad_token_id in model config
                 self.model.config.pad_token_id = self.tokenizer.pad_token_id
                 logging.info(f"Set pad_token_id in model config: {self.model.config.pad_token_id}")
@@ -971,6 +990,7 @@ class LLaMA32TensorRTTool:
                 logging.error(traceback.format_exc())
         else:
             logging.warning("Model not initialized. Skipping model-specific tokenizer updates.")
+    
             
     
     
