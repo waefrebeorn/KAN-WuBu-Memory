@@ -961,7 +961,7 @@ class LLaMA32TensorRTTool:
     
     def _validate_model_device_placement(self):
         for name, param in self.model.named_parameters():
-            if param.device != self.device:
+            if param.device != torch.device(self.device):
                 logging.error(f"Parameter '{name}' is on {param.device}, expected {self.device}")
                 raise RuntimeError(f"Parameter '{name}' is not on the expected device: {self.device}. Found on {param.device}.")
         logging.info("All model parameters are correctly placed on the specified GPU device.")
