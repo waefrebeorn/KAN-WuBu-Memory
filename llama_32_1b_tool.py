@@ -1254,25 +1254,21 @@ class LLaMA32TensorRTTool:
         return sentences[-1].strip() + '.'
         
     def corrective_training(self, user_input, response_tokens, corrective_response):
-        """
-        Perform corrective training on an invalid response using the corrective response.
-        This method handles training the KAN model to learn from mistakes.
-        """
         try:
             # Encode the corrective response as the target for training
-            target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.kan.device)
-
+            target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.device)
+    
             # Perform a training step using the invalid response and the corrective response
-            lm_loss, refusal_loss = self.kan.train_kan_step(
-                torch.tensor([response_tokens], dtype=torch.long).to(self.kan.device),
-                target_ids,
+            lm_loss, refusal_loss = self.train_kan_step(
+                response_tokens,  # This is already a list of token IDs
+                target_ids[0],    # Remove the batch dimension
                 refusal_score=0.0  # Assume no refusal in this corrective context
             )
             return lm_loss, refusal_loss
         except Exception as e:
             logging.error(f"Error during corrective training: {str(e)}")
             return None, None
-
+    
     def comprehensive_corrective_training(self, user_input, response_tokens, context):
         """
         Perform corrective training indefinitely until the KAN produces a coherent response.
@@ -1280,7 +1276,9 @@ class LLaMA32TensorRTTool:
         """
         logging.info(f"Starting Indefinite Corrective Training for input: '{user_input}'")
     
+        training_iteration = 0
         while True:
+            training_iteration += 1
             try:
                 # Generate a new response
                 new_response_tokens, new_quality_metrics = self._generate_response(user_input, context)
@@ -1296,13 +1294,14 @@ class LLaMA32TensorRTTool:
                 is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, response, context)
                 refusal_score = self.refusal_detector.detect_refusal(new_response_tokens)
     
-                # If the response is valid and not a refusal, return it
+                # If the response is valid and not a refusal, save the KAN state and return
                 if is_valid and refusal_score <= 0.5:
-                    logging.info("Valid response generated.")
+                    logging.info(f"Valid response generated after {training_iteration} iterations.")
+                    self.save_kan_state()  # Save the KAN state after successful training
                     return new_response_tokens, new_quality_metrics
     
                 # If the response is invalid or a refusal, continue training
-                logging.warning("Invalid response or refusal detected. Continuing training...")
+                logging.warning(f"Invalid response or refusal detected. Continuing training (Iteration {training_iteration})...")
     
                 # Trigger Chain-of-Thought if needed
                 if self.entropy_manager.should_trigger_cot(new_quality_metrics['perplexity']):
@@ -1318,19 +1317,24 @@ class LLaMA32TensorRTTool:
                 lm_loss, refusal_loss = self.corrective_training(user_input, new_response_tokens, corrective_response)
     
                 # Log training progress
-                logging.info(f"Corrective Training Step - LM Loss: {lm_loss:.4f}, Refusal Loss: {refusal_loss:.4f}")
+                logging.info(f"Corrective Training Step {training_iteration} - LM Loss: {lm_loss:.4f}, Refusal Loss: {refusal_loss:.4f}")
     
                 # Adjust learning rate based on entropy
                 self.adjust_learning_based_on_entropy(new_quality_metrics['perplexity'])
     
+                # Save KAN state periodically during training
+                if training_iteration % 10 == 0:  # Save every 10 iterations, adjust as needed
+                    self.save_kan_state()
+                    logging.info(f"KAN state saved at iteration {training_iteration}")
+    
             except Exception as e:
-                logging.error(f"Error during corrective training: {str(e)}")
+                logging.error(f"Error during corrective training iteration {training_iteration}: {str(e)}")
                 logging.error(traceback.format_exc())
                 # Continue the loop even if an error occurs
     
             # Clear CUDA cache to prevent memory issues
             torch.cuda.empty_cache()
-            
+  
     
 
     def sample_next_token(self, logits, temperature=1.0, top_p=None):
@@ -1455,7 +1459,12 @@ class LLaMA32TensorRTTool:
         Perform a single training step for the KAN model using the given inputs and targets.
         Includes enhanced logging, tensor checks, and mixed precision training.
         """
-        logging.debug("Entering train_kan_step...")
+        logging.info("Starting train_kan_step in comprehensive corrective training")
+        
+        # Validate KAN model state
+        if not self.kan.is_valid_state():
+            logging.error("KAN model is in an invalid state. Aborting training step.")
+            return 0.0, 0.0
     
         # Ensure input_ids and target_ids are torch tensors, move to correct device, and have the correct dtype.
         if isinstance(input_ids, list):
@@ -1505,7 +1514,9 @@ class LLaMA32TensorRTTool:
                 logging.debug(f"User Intent Shape: {user_intent.shape}, Device: {user_intent.device}")
     
                 # Forward pass through the KAN model
+                logging.debug("About to call KAN forward pass")
                 modified_hidden_states, kan_refusal_scores = self.kan(last_hidden_state, user_intent, self.emotional_state)
+                logging.debug("Completed KAN forward pass")
     
                 # Validate shapes and device placements
                 assert modified_hidden_states.device == self.device, f"Modified Hidden States on incorrect device: {modified_hidden_states.device}"
@@ -1542,6 +1553,7 @@ class LLaMA32TensorRTTool:
             # Log loss values for debugging
             logging.info(f"Training Step Complete - LM Loss: {lm_loss.item():.4f}, Refusal Loss: {refusal_loss.item():.4f}, Total Loss: {total_loss.item():.4f}")
     
+            logging.info("Completed train_kan_step in comprehensive corrective training")
             return lm_loss.item(), refusal_loss.item()
     
         except RuntimeError as re:
@@ -1558,7 +1570,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Unexpected Error during KAN training step: {str(e)}")
             logging.error(traceback.format_exc())
             return 0.0, 0.0
-        
+            
        
     def validate_kan(self):
         if len(self.memory_manager.sliding_window) < 2:
