@@ -187,55 +187,43 @@ class ResponseQualityManager:
 
         # Combine all quality metrics into a final decision
         is_valid = self.is_valid_response(quality_metrics)
+        
+        # Detect garbled or anomalous output
+        if self.detect_garbled_output(response):
+            quality_metrics['garbled_output'] = True
+            is_valid = False  # Mark the response as invalid if garbled
+        else:
+            quality_metrics['garbled_output'] = False
+
         return is_valid, quality_metrics
-    
-    def calculate_perplexity(self, tokens):
-        try:
-            with torch.no_grad():
-                inputs = torch.tensor([tokens]).to(self.kan_model.device)
-                outputs = self.kan_model.model(inputs)
-                logits = outputs.logits[:, :-1, :].contiguous()
-                target = inputs[:, 1:].contiguous()
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1), reduction='mean')
-            return torch.exp(loss).item()
-        except Exception as e:
-            logging.error(f"Error calculating perplexity: {str(e)}")
-            return float('inf')
 
-    
-    def calculate_relevance(self, input_text, response_text):
-        """Calculate the relevance between the user's input and the generated response."""
-        input_tokens = set(self.tokenizer.encode(input_text))
-        response_tokens = set(self.tokenizer.encode(response_text))
-        overlap = len(input_tokens.intersection(response_tokens))
-        return overlap / max(len(input_tokens), len(response_tokens))
-
-    def has_proper_structure(self, response):
-        """Check if the response has proper sentence structure."""
-        sentences = re.split(r'(?<=[.!?])\s+', response.strip())
-        return all(sentence[0].isupper() and sentence[-1] in '.!?' for sentence in sentences)
-
-    def is_valid_response(self, quality_metrics):
-        """Evaluate if the response passes all quality criteria."""
-        return (
-            not quality_metrics['is_refusal'] and
-            quality_metrics['length'] >= 5 and
-            quality_metrics['structure'] and
-            quality_metrics['perplexity'] < 50  # Example threshold for perplexity
-        )
+    def detect_garbled_output(self, response):
+        """Detect if the response contains garbled or nonsensical text."""
+        # Implement specific rules to identify garbled output patterns
+        if re.search(r'[^\x00-\x7F]+', response):  # Check for non-ASCII characters
+            return True
+        if len(response.split()) < 3:  # Too few words in a long sequence
+            return True
+        if response.count('.') / len(response.split()) > 0.5:  # Excessive use of punctuation
+            return True
+        return False
 
     def corrective_training(self, user_input, response_tokens, corrective_response):
         """Perform corrective training on an invalid response."""
-        # Encode the corrective response as the target for training
-        target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.kan_model.device)
+        try:
+            # Encode the corrective response as the target for training
+            target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.kan_model.device)
 
-        # Perform a training step using the invalid response and the corrective response
-        lm_loss, refusal_loss = self.kan_model.train_kan_step(
-            torch.tensor([response_tokens], dtype=torch.long).to(self.kan_model.device),
-            target_ids,
-            refusal_score=0.0  # Assume no refusal in this corrective context
-        )
-        return lm_loss, refusal_loss
+            # Perform a training step using the invalid response and the corrective response
+            lm_loss, refusal_loss = self.kan_model.train_kan_step(
+                torch.tensor([response_tokens], dtype=torch.long).to(self.kan_model.device),
+                target_ids,
+                refusal_score=0.0  # Assume no refusal in this corrective context
+            )
+            return lm_loss, refusal_loss
+        except Exception as e:
+            logging.error(f"Error during corrective training: {str(e)}")
+            return None, None
 
     def adaptive_regeneration(self, user_input, context, max_attempts=3):
         """Regenerate a response until a valid one is found or maximum attempts are reached."""
@@ -248,12 +236,14 @@ class ResponseQualityManager:
             if is_valid:
                 return response_tokens, quality_metrics
 
-            # Perform corrective training with a predefined corrective response
+            # Log invalid response and corrective training information
+            logging.warning(f"Invalid response detected. Attempt {attempt + 1}/{max_attempts}. Triggering corrective training.")
             corrective_response = "I misunderstood. Can you rephrase that?"
             self.corrective_training(user_input, response_tokens, corrective_response)
 
         # After max attempts, return the last generated response
         return response_tokens, quality_metrics
+
 
 
 class SyntheticDayCycle:
@@ -332,16 +322,14 @@ class EnhancedKAN(nn.Module):
     def __init__(self, hidden_size, num_emotional_dimensions, vocab_size, device):
         super().__init__()
         self.device = device
-        self.dtype = torch.float16
         self.hidden_size = hidden_size
         self.emotional_size = num_emotional_dimensions
-        self.input_size = hidden_size + hidden_size + num_emotional_dimensions
         self.vocab_size = vocab_size
         self.influence_scale = 0.01
 
-        # Initialize layers with correct device
-        self.refusal_override = nn.Linear(self.input_size, self.hidden_size, dtype=self.dtype, device=self.device)
-        self.output_modifier = nn.Linear(self.hidden_size, self.vocab_size, dtype=self.dtype, device=self.device)
+        # Initialize layers directly on the specified device to avoid meta issues
+        self.refusal_override = nn.Linear(hidden_size + hidden_size + num_emotional_dimensions, hidden_size, dtype=torch.float16).to(self.device)
+        self.output_modifier = nn.Linear(hidden_size, vocab_size, dtype=torch.float16).to(self.device)
 
     def forward(self, hidden_states, user_intent, emotional_state):
         """
@@ -349,41 +337,26 @@ class EnhancedKAN(nn.Module):
         """
         try:
             # Move tensors to the specified device
-            hidden_states = hidden_states.to(self.device, dtype=self.dtype)
-            user_intent = user_intent.to(self.device, dtype=self.dtype)
-            position = emotional_state.get_embedding(hidden_states.size(0)).to(self.device, dtype=self.dtype)
+            hidden_states = hidden_states.to(self.device, dtype=torch.float16)
+            user_intent = user_intent.to(self.device, dtype=torch.float16)
+            position = emotional_state.get_embedding(hidden_states.size(0)).to(self.device, dtype=torch.float16)
 
-            # Validate tensor devices and dimensions
-            assert hidden_states.device == self.device, f"Hidden states not on expected device! Found: {hidden_states.device}"
-            assert user_intent.device == self.device, f"User intent not on expected device! Found: {user_intent.device}"
-            assert position.device == self.device, f"Position embeddings not on expected device! Found: {position.device}"
-
-            # Check KAN state before performing operations
-            if not self.is_valid_state():
-                logging.warning("Invalid KAN state detected. Skipping KAN operations.")
-                return hidden_states, torch.zeros(hidden_states.size(0), self.hidden_size, device=self.device, dtype=self.dtype)
-
-            # Expand position embedding to match sequence length
+            # Ensure tensor dimensions are correct
             batch_size, seq_length = hidden_states.shape[:2]
             position = position.unsqueeze(1).expand(batch_size, seq_length, -1)
 
-            # Adjust dimensions if necessary
+            # Adjust dimensions of user intent
             if user_intent.dim() == 2:
                 user_intent = user_intent.unsqueeze(1).expand(batch_size, seq_length, -1)
             elif user_intent.dim() == 1:
                 user_intent = user_intent.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_length, -1)
 
-            # Concatenate inputs
+            # Concatenate the inputs
             kan_input = torch.cat([hidden_states, user_intent, position], dim=-1)
-            logging.debug(f"KAN Input Shape: {kan_input.shape}, Device: {kan_input.device}")
 
-            # Apply KAN transformations
+            # Apply transformations
             refusal_scores = torch.sigmoid(self.refusal_override(kan_input))
             modified_hidden_states = hidden_states + self.influence_scale * refusal_scores
-
-            # Log output tensor shapes
-            logging.debug(f"Modified Hidden States Shape: {modified_hidden_states.shape}, Device: {modified_hidden_states.device}")
-            logging.debug(f"Refusal Scores Shape: {refusal_scores.shape}, Device: {refusal_scores.device}")
 
             return modified_hidden_states, refusal_scores.squeeze(1)
 
@@ -397,18 +370,17 @@ class EnhancedKAN(nn.Module):
         This includes ensuring layers are on the correct device and parameters are initialized.
         """
         try:
-            # Check if the primary components are on the right device
             for name, param in self.named_parameters():
                 if param.device != self.device:
                     logging.warning(f"Parameter {name} is on device {param.device} instead of {self.device}.")
                     return False
 
-            # Additional state checks can be added here
             return True
         except Exception as e:
             logging.error(f"Error validating KAN state: {str(e)}")
             return False
-    
+
+  
 class EntropyManager:
     def __init__(self, model, tokenizer, device):
         self.model = model
