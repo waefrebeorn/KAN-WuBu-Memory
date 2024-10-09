@@ -1240,9 +1240,9 @@ class LLaMA32TensorRTTool:
             target_ids = torch.tensor(target_ids, device=self.device, dtype=torch.long)
     
         # Validate input tensor shapes and devices
-        assert input_ids.device == self.device, f"Input IDs are on {input_ids.device} instead of {self.device}"
-        assert target_ids.device == self.device, f"Target IDs are on {target_ids.device} instead of {self.device}"
-    
+        assert input_ids.device.type == self.device.type, f"Input IDs are on {input_ids.device} instead of {self.device}"
+        assert target_ids.device.type == self.device.type, f"Target IDs are on {target_ids.device} instead of {self.device}"
+        
         # Adjust dimensions to match expected format (batch_size, seq_length)
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
