@@ -1448,18 +1448,43 @@ class LLaMA32TensorRTTool:
         """
         prompt = f"{context}\nUser: {user_input}\nAssistant:"
         input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                input_ids,
-                max_length=2000,
-                num_return_sequences=1,
-                no_repeat_ngram_size=2,
-                temperature=0.7,
-                top_p=0.95
-            )
-        
+    
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    input_ids,
+                    max_length=2000,
+                    num_return_sequences=1,
+                    no_repeat_ngram_size=2,
+                    temperature=0.7,
+                    top_p=0.95
+                )
+        except RuntimeError as e:
+            # Check for device mismatch errors
+            if "expected" in str(e):
+                logging.warning("Detected device mismatch during generation. Attempting to recover...")
+    
+                # Attempt to move input_ids to the GPU if they are on CPU
+                if input_ids.device != self.device:
+                    input_ids = input_ids.to(self.device)
+                    logging.info("Moved input_ids to GPU")
+    
+                # Retry generation after moving inputs
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        input_ids,
+                        max_length=2000,
+                        num_return_sequences=1,
+                        no_repeat_ngram_size=2,
+                        temperature=0.7,
+                        top_p=0.95
+                    )
+            else:
+                logging.error(f"Unexpected RuntimeError during generation: {str(e)}")
+                raise  # Re-raise for unhandled exceptions
+    
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
         
     
     def is_garbage_output(self, entropy, partial_tokens):
