@@ -580,10 +580,12 @@ class AdvancedMemoryManager:
 
 class LLaMA32TensorRTTool:
     def __init__(self):
-        self.device = torch.device("cuda")  # Always use CUDA
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available. This tool requires a GPU.")
         
+        self.device = torch.device("cuda:0")  # Use the first CUDA device
+        torch.cuda.set_device(self.device)  # Set the default CUDA device
+    
         self.model_path = self._get_model_path()
         self.tokenizer = None
         self.components_initialized = False
@@ -788,7 +790,7 @@ class LLaMA32TensorRTTool:
             logging.info("Model initialized with empty weights")
     
             # Move the empty model to GPU
-            model = model.to_empty(device='cuda')
+            model = model.to_empty(device=self.device)
             logging.info("Empty model moved to GPU")
     
             # Load the model weights using SafeTensors
@@ -825,7 +827,7 @@ class LLaMA32TensorRTTool:
                 model.tie_weights()
     
             # Ensure model is on CUDA
-            assert next(model.parameters()).is_cuda, "Model not on CUDA"
+            assert next(model.parameters()).device == self.device, "Model not on CUDA"
     
             logging.info("Model initialized successfully with tied weights on GPU.")
             return model
@@ -1531,8 +1533,8 @@ class LLaMA32TensorRTTool:
         target_ids = self._ensure_cuda(target_ids)
     
         # Validate input tensor shapes and devices
-        assert input_ids.device.type == "cuda", f"Input IDs are on {input_ids.device} instead of CUDA"
-        assert target_ids.device.type == "cuda", f"Target IDs are on {target_ids.device} instead of CUDA"
+        assert input_ids.device == self.device, f"Input IDs are on {input_ids.device} instead of {self.device}"
+        assert target_ids.device == self.device, f"Target IDs are on {target_ids.device} instead of {self.device}"
         
         # Adjust dimensions to match expected format (batch_size, seq_length)
         if input_ids.dim() == 1:
@@ -1848,6 +1850,7 @@ class LLaMA32TensorRTTool:
     def save_base_state(self):
         try:
             state_dict = {
+                'device': str(self.device),
                 'kan_state_dict': self.kan.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'emotional_state': self.emotional_state.position.cpu().numpy().tolist(),
