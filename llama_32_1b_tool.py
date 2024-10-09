@@ -907,6 +907,7 @@ class LLaMA32TensorRTTool:
     
             # Manually map devices for all parts of the model
             device_map = {name: target_device for name, _ in self.model.named_parameters()}
+            device_map["lm_head"] = target_device  # Explicitly assign lm_head to the target device
     
             # Load checkpoint and dispatch using `accelerate`
             logging.info(f"Loading model checkpoint and dispatching to device: {target_device}")
@@ -928,12 +929,14 @@ class LLaMA32TensorRTTool:
             if hasattr(self.model, "tie_weights"):
                 self.model.tie_weights()
                 logging.info("Model weights tied successfully.")
-            else:
-                logging.info("Model does not require tying weights.")
     
             # Set the model to evaluation mode
             self.model.eval()
             logging.info("Model set to evaluation mode.")
+    
+            # Verify that the `lm_head.weight` is on the correct device
+            if not any(param.device == self.device for name, param in self.model.named_parameters() if "lm_head" in name):
+                raise RuntimeError("lm_head.weight not correctly assigned to the specified device.")
     
             return self.model
     
@@ -1211,7 +1214,8 @@ class LLaMA32TensorRTTool:
     def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size):
         try:
             # Step 1: Initialize the KAN model directly on the GPU without using `meta` or CPU
-            kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size).to(self.device, dtype=torch.float16, non_blocking=True)
+            kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device=self.device).to(self.device, dtype=torch.float16, non_blocking=True)
+
     
             # Step 2: Verify if all parameters are on the correct GPU device
             for name, param in kan.named_parameters():
