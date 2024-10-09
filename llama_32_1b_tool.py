@@ -201,10 +201,24 @@ class ResponseQualityManager:
 
     def evaluate_response(self, user_input, response_tokens, context):
         """Evaluate the quality of the response based on multiple criteria."""
+        # Handle different input types for response_tokens
+        if isinstance(response_tokens, str):
+            # If response_tokens is a string, encode it to get token IDs
+            response_tokens = self.tokenizer.encode(response_tokens, add_special_tokens=False)
+        elif isinstance(response_tokens, torch.Tensor):
+            # If it's a tensor, ensure it's on the correct device
+            if response_tokens.device != self.kan_model.device:
+                response_tokens = response_tokens.to(self.kan_model.device)
+            response_tokens = response_tokens.cpu().tolist()
+        elif not isinstance(response_tokens, list):
+            raise ValueError(f"Unsupported type for response_tokens: {type(response_tokens)}")
+
+        # Decode the response tokens
         response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
 
         # Check refusal score using the existing refusal detector
         refusal_score = self.refusal_detector.detect_refusal(response_tokens)
+
         quality_metrics = {
             'is_refusal': refusal_score > 0.5,
             'relevance_score': self.calculate_relevance(user_input, response),
@@ -224,6 +238,28 @@ class ResponseQualityManager:
             quality_metrics['garbled_output'] = False
 
         return is_valid, quality_metrics
+
+    def calculate_perplexity(self, response_tokens):
+        """Calculate the perplexity of the response based on the logits."""
+        try:
+            # Ensure response_tokens is a tensor on the correct device
+            if isinstance(response_tokens, list):
+                response_tokens = torch.tensor(response_tokens, dtype=torch.long, device=self.kan_model.device)
+            elif isinstance(response_tokens, torch.Tensor):
+                response_tokens = response_tokens.to(self.kan_model.device)
+
+            inputs = response_tokens.unsqueeze(0)  # Add batch dimension
+            
+            with torch.no_grad():
+                outputs = self.kan_model.model(inputs, labels=inputs)
+                loss = outputs.loss
+                perplexity = torch.exp(loss)
+            return perplexity.item()
+        except Exception as e:
+            logging.error(f"Error calculating perplexity: {str(e)}")
+            return float('inf')
+
+
 
     def calculate_relevance(self, user_input, response):
         """Calculate the relevance score between the user input and the generated response."""
@@ -283,19 +319,6 @@ class ResponseQualityManager:
             logging.error(f"Error in has_proper_structure: {str(e)}")
             return False
             
-
-    def calculate_perplexity(self, response_tokens):
-        """Calculate the perplexity of the response based on the logits."""
-        try:
-            inputs = torch.tensor([response_tokens]).to(self.kan_model.device)
-            with torch.no_grad():
-                outputs = self.kan_model.model(inputs, labels=inputs)
-                loss = outputs.loss
-                perplexity = torch.exp(loss)
-            return perplexity.item()
-        except Exception as e:
-            logging.error(f"Error calculating perplexity: {str(e)}")
-            return float('inf')
 
     def is_valid_response(self, quality_metrics):
         """Determine if a response is valid based on quality metrics."""
@@ -1284,7 +1307,7 @@ class LLaMA32TensorRTTool:
             inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings)
     
             # Ensure all inputs are on the correct device
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            inputs = self.ensure_cuda(inputs)
     
             response_tokens = []
             total_entropy = 0
@@ -1353,7 +1376,7 @@ class LLaMA32TensorRTTool:
         finally:
             # Ensure we always clean up, even if an exception occurs
             torch.cuda.empty_cache()
-            
+      
     
     def ensure_cuda(self, tensor_or_dict):
         if isinstance(tensor_or_dict, torch.Tensor):
@@ -1655,8 +1678,8 @@ class LLaMA32TensorRTTool:
             return 0.0, 0.0
     
         # Ensure input_ids and target_ids are torch tensors, move to correct device, and have the correct dtype.
-        input_ids = self._ensure_cuda(input_ids)
-        target_ids = self._ensure_cuda(target_ids)
+        input_ids = self.ensure_cuda(input_ids)
+        target_ids = self.ensure_cuda(target_ids)
     
         # Validate input tensor shapes and devices
         assert input_ids.device == self.device, f"Input IDs are on {input_ids.device} instead of {self.device}"
@@ -1691,7 +1714,7 @@ class LLaMA32TensorRTTool:
                     raise ValueError(f"Unexpected output format: {type(outputs)}")
     
                 # Check and ensure hidden states are on CUDA
-                last_hidden_state = hidden_states[-1].to(self.device, dtype=torch.float16)
+                last_hidden_state = self.ensure_cuda(hidden_states[-1])
                 logging.debug(f"Last Hidden State Shape: {last_hidden_state.shape}, Device: {last_hidden_state.device}")
     
                 # Encode the user intent for use in the KAN forward pass
@@ -1753,7 +1776,8 @@ class LLaMA32TensorRTTool:
             logging.error(f"Unexpected Error during KAN training step: {str(e)}")
             logging.error(traceback.format_exc())
             return 0.0, 0.0
-        
+
+         
        
     def validate_kan(self):
         if len(self.memory_manager.sliding_window) < 2:
