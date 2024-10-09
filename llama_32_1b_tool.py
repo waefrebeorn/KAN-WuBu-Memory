@@ -1793,46 +1793,36 @@ class LLaMA32TensorRTTool:
     
     def _calculate_perplexity(self, tokens):
         if not tokens:
-            return float('inf')  # Return a high perplexity for empty responses
+            return 1.0  # Return lowest perplexity for empty responses
         try:
             with torch.no_grad():
                 inputs = torch.tensor([tokens], dtype=torch.long).to(self.device)
                 outputs = self.model(inputs)
-                logits = outputs.logits[:, :-1, :].contiguous()
-                target = inputs[:, 1:].contiguous()
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1), reduction='mean')
-            return torch.exp(loss).item()
+                loss = outputs.loss
+                perplexity = torch.exp(loss)
+            return perplexity.item()
         except Exception as e:
             logging.error(f"Error calculating perplexity: {str(e)}")
-            return float('inf')
+            return float('inf')  # Return highest perplexity for error cases
     
     def has_proper_structure(self, tokens):
         try:
-            if isinstance(tokens, str):
-                # If tokens is already a string, use it directly
-                decoded_text = tokens
-            elif isinstance(tokens, list):
-                # If tokens is a list of token IDs, decode it
-                decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
-            else:
-                # If tokens is neither a string nor a list, raise an error
-                raise ValueError(f"Unexpected type for tokens: {type(tokens)}")
-    
+            decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
             sentences = re.split(r'(?<=[.!?])\s+', decoded_text.strip())
             
             if not sentences:
                 logging.warning("No complete sentences found in the response.")
                 return False
         
-            if not sentences[0][0].isupper():
+            if not sentences[0] or not sentences[0][0].isupper():
                 logging.warning(f"First sentence doesn't start with a capital letter: '{sentences[0]}'")
                 return False
         
-            if sentences[-1][-1] not in '.!?':
+            if not sentences[-1] or sentences[-1][-1] not in '.!?':
                 logging.warning(f"Last sentence doesn't end with proper punctuation: '{sentences[-1]}'")
                 return False
         
-            proper_sentences = sum(1 for s in sentences if s[0].isupper() and s[-1] in '.!?')
+            proper_sentences = sum(1 for s in sentences if s and s[0].isupper() and s[-1] in '.!?')
             proper_ratio = proper_sentences / len(sentences)
         
             if proper_ratio < 0.5:
@@ -1840,7 +1830,6 @@ class LLaMA32TensorRTTool:
                 return False
                 
             return True
-        
         except Exception as e:
             logging.error(f"Error in has_proper_structure: {str(e)}")
             return False
