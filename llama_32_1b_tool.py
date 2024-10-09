@@ -227,7 +227,7 @@ class ResponseQualityManager:
         while True:
             # Generate a new response
             response_tokens, response_entropy = self.kan_model.generate_response(user_input)
-            is_valid, quality_metrics = self.evaluate_response(user_input, response_tokens, context)
+            is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
     
             # If valid response is found, return it
             if is_valid:
@@ -1123,7 +1123,7 @@ class LLaMA32TensorRTTool:
         attempt_count = 0
     
         # Initial evaluation of the response
-        is_valid, quality_metrics = self.evaluate_response(user_input, response_tokens, context)
+        is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
         refusal_score = self.refusal_detector.detect_refusal(response_tokens)
     
         # Loop indefinitely until a coherent response is generated
@@ -1152,7 +1152,7 @@ class LLaMA32TensorRTTool:
             new_response_tokens, new_quality_metrics = self._generate_response(user_input, context)
     
             # Re-evaluate the newly generated response
-            is_valid, quality_metrics = self.evaluate_response(user_input, new_response_tokens, context)
+            is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, new_response_tokens, context)
             refusal_score = self.refusal_detector.detect_refusal(new_response_tokens)
     
             # If response is coherent and valid, exit the loop
