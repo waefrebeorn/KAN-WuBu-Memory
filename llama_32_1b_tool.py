@@ -1380,7 +1380,7 @@ class LLaMA32TensorRTTool:
         max_response_length = 2000
     
         # Step 3: Generate response using mixed precision and ensure memory is handled efficiently
-        with torch.no_grad(), torch.amp.autocast(enabled=True):
+        with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             for step in range(max_response_length):
                 try:
                     # Ensure all inputs are fully on GPU to prevent device mismatch errors
@@ -1452,7 +1452,7 @@ class LLaMA32TensorRTTool:
             
             # Retry response generation after corrective adjustments
             return self._generate_response(user_input, context)
-    
+            
     
     def _reload_model_parameters(self):
         """Reload model parameters to ensure they are on the correct device."""
