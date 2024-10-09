@@ -905,8 +905,13 @@ class LLaMA32TensorRTTool:
                     self.model_path,
                     device_map="auto",
                     dtype=torch.float16,
-                    no_split_module_classes=["LlamaDecoderLayer"]
+                    no_split_module_classes=["LlamaDecoderLayer"],
+                    offload_folder=None,  # Ensure no CPU offloading
+                    offload_state_dict=False  # Prevent offloading to CPU
                 )
+    
+            # Ensure the model is on the correct device
+            model = model.to(self.device)
     
             # Tie weights if necessary
             if hasattr(model, "tie_weights"):
