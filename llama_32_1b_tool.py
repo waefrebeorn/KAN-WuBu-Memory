@@ -38,12 +38,13 @@ def setup_logging():
     logger.setLevel(logging.DEBUG)
 
     if not logger.hasHandlers():  # Avoid adding duplicate handlers
-        file_handler = logging.FileHandler('llama_tool.log', mode='a')
+        file_handler = logging.FileHandler('llama_tool.log', mode='a', encoding='utf-8')
+
         file_handler.setLevel(logging.DEBUG)
         file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(file_formatter)
 
-        console_handler = logging.StreamHandler()
+        console_handler = logging.StreamHandler(sys.stdout) 
         console_handler.setLevel(logging.WARNING)
         console_formatter = logging.Formatter('%(levelname)s - %(message)s')
         console_handler.setFormatter(console_formatter)
@@ -350,47 +351,37 @@ class EnhancedKAN(nn.Module):
 
     def forward(self, hidden_states, user_intent, emotional_state):
         try:
-            self._lazy_init()
-
             # Use torch.cuda.amp.autocast for mixed precision
             with torch.cuda.amp.autocast(dtype=self.dtype):
                 # Ensure all inputs are on the correct device and dtype
                 hidden_states = hidden_states.to(self.device, dtype=self.dtype)
                 user_intent = user_intent.to(self.device, dtype=self.dtype)
                 position = emotional_state.get_embedding(hidden_states.size(0)).to(self.device, dtype=self.dtype)
-
-                # Handle different input shapes
-                if hidden_states.dim() == 3:
-                    batch_size, seq_length, _ = hidden_states.size()
-                elif hidden_states.dim() == 2:
-                    batch_size, _ = hidden_states.size()
-                    seq_length = 1
-                    hidden_states = hidden_states.unsqueeze(1)
-                else:
-                    raise ValueError(f"Unexpected hidden_states dimension: {hidden_states.dim()}")
-
+    
+                batch_size, seq_length = hidden_states.shape[:2]
+    
                 # Ensure user_intent is broadcastable
                 if user_intent.dim() == 2:
                     user_intent = user_intent.unsqueeze(1).expand(batch_size, seq_length, -1)
                 elif user_intent.dim() == 1:
                     user_intent = user_intent.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_length, -1)
-
+    
                 # Expand position embedding to match sequence length
                 position = position.unsqueeze(1).expand(batch_size, seq_length, -1)
-
+    
                 # Concatenate inputs
                 kan_input = torch.cat([hidden_states, user_intent, position], dim=-1)
-
+    
                 # Apply refusal override and influence scale
                 refusal_scores = torch.sigmoid(self.refusal_override(kan_input))
                 modified_hidden_states = hidden_states + self.influence_scale * refusal_scores
-
+    
             return modified_hidden_states, refusal_scores.squeeze(1)
-
+    
         except Exception as e:
-            print(f"Error in EnhancedKAN.forward: {str(e)}")
-            return hidden_states, torch.zeros(batch_size, self.hidden_size, device=self.device, dtype=self.dtype)
-
+            logging.error(f"Error in EnhancedKAN.forward: {str(e)}")
+            return hidden_states, torch.zeros(hidden_states.size(0), self.hidden_size, device=self.device, dtype=self.dtype)
+    
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(*args, **kwargs)
         if device is not None:
