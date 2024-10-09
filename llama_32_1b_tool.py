@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.cuda.amp as amp
 from safetensors.torch import load_file
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch, load_file
 import logging
 from pathlib import Path
 import json
@@ -906,8 +906,8 @@ class LLaMA32TensorRTTool:
                         state_dict = load_file(file_path, device="cpu")
                         for param_name, param in state_dict.items():
                             if param_name in model.state_dict():
+                                # Handle meta tensor initialization
                                 if model.state_dict()[param_name].is_meta:
-                                    # Initialize and move meta tensor to GPU
                                     model.get_parameter(param_name).data = param.to(self.device)
                                     logging.info(f"Initialized and moved parameter '{param_name}' to {self.device}")
                                 else:
@@ -917,23 +917,16 @@ class LLaMA32TensorRTTool:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
                         raise
     
-            # Step 4: Move all remaining parameters to the correct device and handle meta tensors
+            # Step 4: Handle any remaining meta tensors by explicitly initializing them
             for name, param in model.named_parameters():
-                if param.device != self.device:
-                    if param.is_meta:
-                        # Replace the parameter using `register_parameter` in the correct submodule
-                        logging.warning(f"Parameter '{name}' is still a meta tensor. Replacing it with an initialized tensor.")
-                        submodule, param_name = self._get_submodule_and_param_name(model, name)
-                        param_dtype = torch.float16 if "float" in str(param.dtype) else param.dtype
-                        param_shape = param.shape
-    
-                        # Create a new initialized tensor with the same properties
-                        new_param = nn.Parameter(torch.empty(param_shape, dtype=param_dtype, device=self.device))
-                        submodule.register_parameter(param_name, new_param)
-                        logging.info(f"Initialized and replaced meta tensor '{name}' with a new parameter on {self.device}")
-                    else:
-                        param.data = param.data.to(self.device)
-                        logging.info(f"Moved parameter '{name}' to {self.device}")
+                if param.is_meta:
+                    logging.warning(f"Parameter '{name}' is still a meta tensor. Initializing it now.")
+                    submodule, param_name = self._get_submodule_and_param_name(model, name)
+                    param_dtype = torch.float16 if "float" in str(param.dtype) else param.dtype
+                    # Create a new tensor with the same shape and dtype, and register it
+                    new_param = nn.Parameter(torch.empty(param.shape, dtype=param_dtype, device=self.device))
+                    submodule._parameters[param_name] = new_param
+                    logging.info(f"Initialized and registered meta tensor '{name}' with a new parameter on {self.device}")
     
             # Step 5: Ensure use_cache is set to False
             model.config.use_cache = False
@@ -966,41 +959,8 @@ class LLaMA32TensorRTTool:
         except Exception as e:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
+            raise RuntimeError(f"Failed to initialize model on {self.device}.")
     
-            # Step 10: Attempt to move any remaining parameters to GPU
-            logging.info("Attempting to move any remaining parameters to GPU...")
-            for name, param in model.named_parameters():
-                if param.device != self.device:
-                    if param.is_meta:
-                        # Replace the meta tensor properly
-                        logging.warning(f"Parameter '{name}' is still a meta tensor. Initializing it now.")
-                        submodule, param_name = self._get_submodule_and_param_name(model, name)
-                        param_dtype = torch.float16 if "float" in str(param.dtype) else param.dtype
-                        new_param = nn.Parameter(torch.empty(param.shape, dtype=param_dtype, device=self.device))
-                        submodule.register_parameter(param_name, new_param)
-                        logging.info(f"Initialized and replaced meta tensor '{name}' with a new parameter on {self.device}")
-                    else:
-                        param.data = param.data.to(self.device)
-                        logging.info(f"Moved parameter '{name}' to {self.device}")
-    
-            # Retry the initialization to verify if the model can now be initialized
-            try:
-                logging.info("Retrying model initialization after moving parameters...")
-                for name, param in model.named_parameters():
-                    if param.device != self.device:
-                        raise RuntimeError(f"Parameter '{name}' is on {param.device}, expected {self.device}")
-                    if param.is_meta:
-                        raise RuntimeError(f"Parameter '{name}' is still a meta tensor")
-    
-                logging.info(f"Model initialized successfully on {self.device} after retrying.")
-                return model
-    
-            except Exception as retry_error:
-                logging.error(f"Retry initialization failed: {str(retry_error)}")
-                logging.error(traceback.format_exc())
-                raise RuntimeError(f"Failed to initialize model on {self.device}.")
-    
-    # Helper method to navigate submodules and replace parameters correctly
     def _get_submodule_and_param_name(self, model, param_name):
         """Locate the submodule and parameter name for a given full parameter path."""
         parts = param_name.split(".")
