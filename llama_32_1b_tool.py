@@ -340,15 +340,9 @@ class EnhancedKAN(nn.Module):
         self.vocab_size = vocab_size
         self.influence_scale = 0.01
         
-        # Lazy initialization
-        self.refusal_override = None
-        self.output_modifier = None
-
-    def _lazy_init(self):
-        if self.refusal_override is None:
-            self.refusal_override = nn.Linear(self.input_size, self.hidden_size, dtype=self.dtype).to(self.device)
-        if self.output_modifier is None:
-            self.output_modifier = nn.Linear(self.hidden_size, self.vocab_size, dtype=self.dtype).to(self.device)
+        # Initialize layers directly instead of using lazy initialization
+        self.refusal_override = nn.Linear(self.input_size, self.hidden_size, dtype=self.dtype).to(self.device)
+        self.output_modifier = nn.Linear(self.hidden_size, self.vocab_size, dtype=self.dtype).to(self.device)
 
     @torch.jit.script_method
     def optimize_memory(self):
