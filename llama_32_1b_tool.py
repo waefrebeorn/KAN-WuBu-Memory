@@ -97,7 +97,7 @@ class EmotionalState:
             raise RuntimeError("No NVIDIA GPUs found.")
 
         # Set the selected GPU as the device
-        self.device = torch.device(f"cuda:{best_gpu_id}")
+        self.device = f"cuda:{best_gpu_id}"
         torch.cuda.set_device(self.device)
 
         # Emotional state initialization
@@ -662,7 +662,7 @@ class LLaMA32TensorRTTool:
             raise RuntimeError("No NVIDIA GPUs found.")
         
         # Set the device to the best NVIDIA GPU found
-        self.device = torch.device(f"cuda:{best_gpu_id}")
+        self.device = f"cuda:{best_gpu_id}"
         torch.cuda.set_device(self.device)
         
         logging.info(f"Selected GPU: {torch.cuda.get_device_name(self.device)}")
@@ -903,7 +903,7 @@ class LLaMA32TensorRTTool:
                 raise RuntimeError(f"Invalid device specified: {self.device}")
     
             # Ensure that `cuda:0` is explicitly used for the model's device if self.device is `cuda`
-            target_device = self.device if "cuda" in self.device else "cuda:0"
+            target_device = self.device 
             logging.info(f"Target device for model dispatch: {target_device}")
     
             # Manually map devices for all parts of the model
