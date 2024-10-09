@@ -883,35 +883,26 @@ class LLaMA32TensorRTTool:
         try:
             logging.info(f"Initializing the model on device: {self.device}")
             
-            # Check for CUDA availability and set the device
+            # Ensure CUDA is available
             assert torch.cuda.is_available(), "CUDA is not available. This tool requires a GPU."
             torch.cuda.set_device(self.device)
             
-            # Load model configuration
+            # Load the model configuration
             config = AutoConfig.from_pretrained(self.model_path)
+    
+            # Initialize the model on 'meta' device to prevent memory allocation during initialization
+            model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16, low_cpu_mem_usage=True).to_empty()
             
-            # Directly load the model on the specified GPU using low_cpu_mem_usage=True to avoid meta tensor issues
-            model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                config=config,
-                torch_dtype=torch.float16,
-                device_map={"": self.device},  # Map all layers to the specified GPU
-                low_cpu_mem_usage=True,
-                offload_folder=None,  # Ensure no CPU or disk offloading
-            )
-            
-            # Explicitly move the model to the GPU using `to_empty` to handle meta tensors safely
-            model.to_empty(self.device)
-            
-            # Ensure all model parameters are on the correct device and in evaluation mode
+            # Manually move each parameter from meta to GPU
+            for name, param in model.named_parameters():
+                if param.device == torch.device("meta"):
+                    param.data = torch.empty(param.shape, dtype=param.dtype, device=self.device)
+                    logging.info(f"Allocated memory for parameter '{name}' on {self.device}.")
+    
+            # Set the model to evaluation mode
             model.eval()
-            
-            # Confirm model is fully moved to GPU memory
-            for param in model.parameters():
-                assert param.device == torch.device(self.device), f"Parameter {param} not on GPU {self.device}"
-            
-            logging.info("Model loaded successfully on GPU and set to evaluation mode.")
-            
+    
+            logging.info("Model successfully initialized on GPU and set to evaluation mode.")
             return model
     
         except Exception as e:
@@ -1226,20 +1217,17 @@ class LLaMA32TensorRTTool:
     def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size, base_model):
         try:
             logging.info(f"Initializing the KAN model with base model on device: {self.device}")
-            
-            # Initialize the KAN model with the base model on 'meta' device to avoid immediate allocation
-            kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device='meta', base_model=base_model)
-            
-            # Allocate an empty model structure on the specified GPU device using `to_empty`
-            kan.to_empty(self.device)
     
-            # Manually move each parameter to GPU to avoid "no data" meta tensor issues
+            # Initialize the KAN model with 'meta' device to avoid immediate memory allocation
+            kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device='meta', base_model=base_model).to_empty()
+            
+            # Manually allocate each parameter tensor on the GPU
             for name, param in kan.named_parameters():
                 if param.device == torch.device("meta"):
                     param.data = torch.empty(param.shape, dtype=param.dtype, device=self.device)
-                    logging.info(f"Initialized parameter '{name}' with empty tensor on {self.device}.")
+                    logging.info(f"Allocated memory for parameter '{name}' on {self.device}.")
             
-            # Convert to half precision after initializing parameters
+            # Convert to half precision
             kan = kan.half()
             
             logging.info(f"KAN model successfully initialized and moved to {self.device}.")
@@ -1250,8 +1238,6 @@ class LLaMA32TensorRTTool:
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize KAN model on {self.device}.")
     
-            
-            
 
     
             
