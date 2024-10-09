@@ -608,20 +608,20 @@ class LLaMA32TensorRTTool:
                 vocab_size = len(self.tokenizer)
                 
                 # Initialize KAN with half precision
-                self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
-                self.kan.to(torch.float16)
-                
-                # Add this check
-                if list(self.kan.parameters()):
-                    self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate, eps=1e-8, betas=(0.9, 0.999), weight_decay=0.01)
-                else:
-                    logging.error("KAN model has no parameters. Cannot initialize optimizer.")
-                    raise ValueError("KAN model has no parameters")
+                try:
+                    self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
+                    self.kan.to(torch.float16)
+                    if list(self.kan.parameters()):
+                        self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate, eps=1e-8, betas=(0.9, 0.999), weight_decay=0.01)
+                    else:
+                        logging.error("KAN model has no parameters. Cannot initialize optimizer.")
+                        raise ValueError("KAN model has no parameters")
+                except Exception as e:
+                    logging.error(f"Error initializing KAN or optimizer: {str(e)}")
+                    raise
+                               
                 self.clear_memory()
-    
-                # Use a memory-efficient optimizer
-                self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate, eps=1e-8, betas=(0.9, 0.999), weight_decay=0.01)
-                self.clear_memory()
+   
     
                 # Initialize other components
                 self.refusal_detector = self._initialize_refusal_detector()
