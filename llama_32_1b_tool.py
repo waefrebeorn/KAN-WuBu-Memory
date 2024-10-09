@@ -933,7 +933,26 @@ class LLaMA32TensorRTTool:
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model on {self.device}.")
     
+    def _move_parameters_to_gpu(self):
+        """Ensure all model parameters, including `lm_head.weight`, are explicitly moved to the GPU."""
+        try:
+            # Explicitly move all parameters to the specified GPU
+            for name, param in self.model.named_parameters():
+                if param.device != self.device:
+                    logging.warning(f"Moving parameter '{name}' from {param.device} to {self.device}.")
+                    param.data = param.data.to(self.device, non_blocking=True)
+                    logging.info(f"Successfully moved parameter '{name}' to {self.device}.")
+        except Exception as e:
+            logging.error(f"Failed to move parameters to GPU: {str(e)}")
+            raise
     
+    def _validate_model_device_placement(self):
+        """Check if all parameters are on the specified GPU device."""
+        for name, param in self.model.named_parameters():
+            if param.device != self.device:
+                raise RuntimeError(f"Parameter '{name}' is not on the expected device: {self.device}. Found on {param.device}.")
+        logging.info("All model parameters are correctly placed on the specified GPU device.")
+        
     def _update_model_for_tokenizer(self):
         if self.model is not None:
             try:
