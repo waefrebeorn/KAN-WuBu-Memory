@@ -456,59 +456,51 @@ class EnhancedKAN(nn.Module):
         self.influence_scale = 0.01
         self.model = base_model
 
-        # Initialize layers directly on the specified device to avoid meta issues
-        self.refusal_override = nn.Linear(hidden_size + hidden_size + num_emotional_dimensions, hidden_size, dtype=torch.float16).to(self.device)
-        self.output_modifier = nn.Linear(hidden_size, vocab_size, dtype=torch.float16).to(self.device)
+        # Initialize layers without moving to device yet
+        self.refusal_override = nn.Linear(hidden_size + hidden_size + num_emotional_dimensions, hidden_size)
+        self.output_modifier = nn.Linear(hidden_size, vocab_size)
+
+    def to_empty(self, device):
+        self.device = device
+        self = super().to(device)
+        self.refusal_override = self.refusal_override.to_empty(device=device)
+        self.output_modifier = self.output_modifier.to_empty(device=device)
+        return self
 
     def forward(self, hidden_states, user_intent, emotional_state):
-        """
-        Forward pass of the KAN model with strict device checks and integration safety.
-        """
         try:
-            # Move tensors to the specified device
             hidden_states = hidden_states.to(self.device, dtype=torch.float16)
             user_intent = user_intent.to(self.device, dtype=torch.float16)
             position = emotional_state.get_embedding(hidden_states.size(0)).to(self.device, dtype=torch.float16)
 
-            # Ensure tensor dimensions are correct
             batch_size, seq_length = hidden_states.shape[:2]
             position = position.unsqueeze(1).expand(batch_size, seq_length, -1)
 
-            # Adjust dimensions of user intent
             if user_intent.dim() == 2:
                 user_intent = user_intent.unsqueeze(1).expand(batch_size, seq_length, -1)
             elif user_intent.dim() == 1:
                 user_intent = user_intent.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_length, -1)
 
-            # Concatenate the inputs
             kan_input = torch.cat([hidden_states, user_intent, position], dim=-1)
 
-            # Apply transformations
             refusal_scores = torch.sigmoid(self.refusal_override(kan_input))
             modified_hidden_states = hidden_states + self.influence_scale * refusal_scores
 
             return modified_hidden_states, refusal_scores.squeeze(1)
-
         except Exception as e:
             logging.error(f"Error in EnhancedKAN.forward: {str(e)}")
             raise
 
     def is_valid_state(self):
-        """
-        Check if the KAN model's state is valid.
-        This includes ensuring layers are on the correct device and parameters are initialized.
-        """
         try:
             for name, param in self.named_parameters():
                 if param.device != self.device:
                     logging.warning(f"Parameter {name} is on device {param.device} instead of {self.device}.")
                     return False
-
             return True
         except Exception as e:
             logging.error(f"Error validating KAN state: {str(e)}")
             return False
-
   
 class EntropyManager:
     def __init__(self, model, tokenizer, device):
@@ -889,24 +881,24 @@ class LLaMA32TensorRTTool:
         try:
             logging.info(f"Initializing the model on device: {self.device}")
             
-            # Ensure we're using CUDA
             assert torch.cuda.is_available(), "CUDA is not available. This tool requires a GPU."
             torch.cuda.set_device(self.device)
     
-            # Load the model configuration
             config = AutoConfig.from_pretrained(self.model_path)
             
-            # Load the model directly to GPU, avoiding meta tensors
+            # Use device_map='auto' for better handling of large models
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 config=config,
                 torch_dtype=torch.float16,
-                device_map={"": self.device},  # Map all layers to the specified GPU
+                device_map='auto',
                 low_cpu_mem_usage=True,
             )
     
-            # Ensure the model is in evaluation mode
             model.eval()
+            
+            # Ensure all model parameters are on the correct device
+            model = model.to(self.device)
             
             logging.info("Model loaded successfully on GPU and set to evaluation mode.")
             
@@ -1223,17 +1215,22 @@ class LLaMA32TensorRTTool:
    
     def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size, base_model):
         try:
-            # Initialize the KAN model directly on the GPU
-            kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device=self.device, base_model=base_model).to(self.device, dtype=torch.float16, non_blocking=True)
-    
-            # Verify if all parameters are on the correct GPU device
+            # Initialize the KAN model
+            kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device='cpu', base_model=base_model)
+            
+            # Move the model to GPU using to_empty() to avoid copying uninitialized data
+            kan = kan.to_empty(device=self.device)
+            
+            # Initialize parameters on the GPU
             for name, param in kan.named_parameters():
                 if param.device != self.device:
-                    param.data = param.data.to(self.device, non_blocking=True)
-                    logging.info(f"Moved parameter '{name}' to {self.device}.")
+                    param.data = torch.empty_like(param.data, device=self.device)
+                    logging.info(f"Initialized parameter '{name}' on {self.device}.")
+            
+            # Convert to half precision
+            kan = kan.half()
     
             logging.info(f"KAN model successfully initialized and moved to {self.device}.")
-    
             return kan
         except RuntimeError as re:
             logging.error(f"Runtime Error during KAN initialization: {str(re)}")
@@ -1243,6 +1240,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Unexpected error initializing KAN: {str(e)}")
             logging.error(traceback.format_exc())
             raise
+            
             
 
     
