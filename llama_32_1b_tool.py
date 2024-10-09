@@ -1249,7 +1249,7 @@ class LLaMA32TensorRTTool:
             inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings)
     
             # Ensure all inputs are on the correct device
-            inputs = self.ensure_cuda(inputs)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
     
             response_tokens = []
             total_entropy = 0
@@ -1258,31 +1258,42 @@ class LLaMA32TensorRTTool:
     
             with torch.no_grad():
                 for step in range(max_response_length):
-                    # Ensure inputs are on the correct device before each iteration
-                    inputs = self.ensure_cuda(inputs)
-                    
-                    outputs = self.model(**inputs)
-                    next_token_logits = outputs.logits[:, -1, :]
+                    try:
+                        outputs = self.model(**inputs)
+                        next_token_logits = outputs.logits[:, -1, :].to(self.device)
     
-                    local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
-                    total_entropy += local_entropy
+                        local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
+                        total_entropy += local_entropy
     
-                    if self.is_garbage_output(local_entropy, response_tokens):
-                        logging.warning(f"Garbage detected mid-generation at step {step}. Engaging corrective training.")
-                        break
+                        if self.is_garbage_output(local_entropy, response_tokens):
+                            logging.warning(f"Garbage detected mid-generation at step {step}. Engaging corrective training.")
+                            break
     
-                    sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
-                    next_token = self.sample_next_token(next_token_logits, **sampling_params)
+                        sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
+                        next_token = self.sample_next_token(next_token_logits, **sampling_params)
     
-                    if next_token.item() in stop_sequences or len(response_tokens) >= max_response_length:
-                        break
+                        if next_token.item() in stop_sequences or len(response_tokens) >= max_response_length:
+                            break
     
-                    response_tokens.append(next_token.item())
-                    inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1)
-                    inputs['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones((1, 1), device=self.device)], dim=-1)
+                        response_tokens.append(next_token.item())
+                        inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1).to(self.device)
+                        inputs['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones((1, 1), device=self.device)], dim=-1)
     
-                    del outputs, next_token_logits
-                    torch.cuda.empty_cache()
+                        del outputs, next_token_logits
+                        torch.cuda.empty_cache()
+    
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            logging.warning(f"CUDA out of memory at step {step}. Attempting to recover...")
+                            torch.cuda.empty_cache()
+                            if step > 0:
+                                # Try to continue with what we have so far
+                                break
+                            else:
+                                # If we're at the first step, we need to raise the error
+                                raise
+                        else:
+                            raise
     
             avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
             quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
@@ -1299,21 +1310,17 @@ class LLaMA32TensorRTTool:
                 # Retry generation after corrective training
                 return self._generate_response(user_input, context)
     
-        except RuntimeError as e:
-            if "CUDA out of memory" in str(e):
-                logging.warning("CUDA out of memory during generation. Clearing cache and retrying...")
-                torch.cuda.empty_cache()
-                time.sleep(1)  # Give some time for memory to be freed
-                return self._generate_response(user_input, context)  # Retry
-            else:
-                logging.error(f"Runtime error during generation: {str(e)}")
-                logging.error(traceback.format_exc())
-                raise
-    
         except Exception as e:
             logging.error(f"Unexpected error during generation: {str(e)}")
             logging.error(traceback.format_exc())
             raise
+    
+        finally:
+            # Ensure we always clean up, even if an exception occurs
+            torch.cuda.empty_cache()
+    
+        return response_tokens, quality_metrics
+    
     
     def ensure_cuda(self, tensor_or_dict):
         if isinstance(tensor_or_dict, torch.Tensor):
