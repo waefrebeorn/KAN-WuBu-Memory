@@ -989,6 +989,19 @@ class LLaMA32TensorRTTool:
             raise RuntimeError("Failed to initialize model with quantization.")
     
     
+    def move_to_device(tensor, device):
+        """
+        Recursively move a tensor, list of tensors, or dictionary of tensors to the specified device.
+        """
+        if isinstance(tensor, torch.Tensor):
+            return tensor.to(device)
+        elif isinstance(tensor, dict):
+            return {k: move_to_device(v, device) for k, v in tensor.items()}
+        elif isinstance(tensor, list):
+            return [move_to_device(t, device) for t in tensor]
+        else:
+            return tensor
+            
   
     def _initialize_tokenizer(self):
         try:
@@ -1226,9 +1239,9 @@ class LLaMA32TensorRTTool:
             try:
                 prompt = f"{context}\nUser: {user_input}\nAssistant:"
                 inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings)
-                
-                # Ensure all tensors in inputs are moved to the correct device
-                inputs = self._ensure_cuda(inputs)
+    
+                # Move all tensors to the correct device
+                inputs = self.move_to_device(inputs, self.device)
     
                 response_tokens = []
                 total_entropy = 0
@@ -1254,7 +1267,7 @@ class LLaMA32TensorRTTool:
                             break
     
                         response_tokens.append(next_token.item())
-                        inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1)
+                        inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0).to(self.device)], dim=-1)  # Ensure new token is on the same device
                         inputs['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones((1, 1), device=self.device)], dim=-1)
     
                         del outputs, next_token_logits
@@ -1292,7 +1305,8 @@ class LLaMA32TensorRTTool:
                 corrective_response = self._generate_corrective_response(user_input, context)
                 self.corrective_training(user_input, [], corrective_response)  # Empty response_tokens due to error
                 continue  # Retry generation after corrective training
-                
+    
+            
   
     def _generate_corrective_response(self, user_input, context):
         """
@@ -1351,17 +1365,15 @@ class LLaMA32TensorRTTool:
         
     def trigger_chain_of_thought(self, context):
         cot_prompt = f"{context}\nLet's think this through step-by-step:\n1."
-        cot_input_ids = self.tokenizer.encode(cot_prompt, return_tensors='pt')
+        cot_input_ids = self.tokenizer.encode(cot_prompt, return_tensors='pt').to(self.device)  # Explicitly move to the correct device
         
-        # Ensure cot_input_ids is moved to the correct device
-        cot_input_ids = self._ensure_cuda(cot_input_ids)
-    
         cot_output = self.model.generate(cot_input_ids, max_length=500, num_return_sequences=1, no_repeat_ngram_size=2)
         thought_process = self.tokenizer.decode(cot_output[0], skip_special_tokens=True)
     
         # Extract final response from thought process
         final_response = self._extract_final_response(thought_process)
         return final_response
+    
 
     
     def _extract_final_response(self, thought_process):
