@@ -1195,6 +1195,13 @@ class LLaMA32TensorRTTool:
 
     def train_kan_step(self, input_ids, target_ids, refusal_score):
         logging.debug("Entering train_kan_step...")
+    
+        # Ensure input_ids and target_ids are tensors
+        if isinstance(input_ids, list):
+            input_ids = torch.tensor(input_ids, device=self.device)
+        if isinstance(target_ids, list):
+            target_ids = torch.tensor(target_ids, device=self.device)
+    
         logging.debug(f"Input IDs shape: {input_ids.shape if isinstance(input_ids, torch.Tensor) else 'Not a tensor'}")
         logging.debug(f"Target IDs shape: {target_ids.shape if isinstance(target_ids, torch.Tensor) else 'Not a tensor'}")
     
@@ -1202,23 +1209,25 @@ class LLaMA32TensorRTTool:
         input_ids = input_ids.to(self.device) if input_ids.device != self.device else input_ids
         target_ids = target_ids.to(self.device) if target_ids.device != self.device else target_ids
     
-        # Adjust dimensions to match expected format
+        # Adjust dimensions to match expected format (batch_size, seq_length)
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
         if target_ids.dim() == 1:
             target_ids = target_ids.unsqueeze(0)
     
+        # Set the KAN model to training mode and zero out gradients
         self.kan.train()
         self.optimizer.zero_grad()
     
         try:
             logging.debug(f"Corrected input shape: {input_ids.shape}, Target shape: {target_ids.shape}")
     
-            # Use mixed precision for memory efficiency
+            # Use mixed precision for memory efficiency and faster training
             with torch.amp.autocast(device_type='cuda', dtype=self.dtype):
                 # Forward pass through the base model to get the hidden states
                 outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True, use_cache=False)
     
+                # Extract the loss, logits, and hidden states from the model outputs
                 if isinstance(outputs, tuple):
                     loss, logits, hidden_states = outputs[:3]
                 elif isinstance(outputs, dict):
@@ -1229,6 +1238,8 @@ class LLaMA32TensorRTTool:
                     raise ValueError(f"Unexpected output format: {type(outputs)}")
     
                 last_hidden_state = hidden_states[-1].to(self.device)  # Ensure hidden states are on the correct device
+    
+                # Encode the user intent for use in the KAN forward pass
                 user_intent = self.encode_user_intent(self.tokenizer.decode(input_ids[0])).to(self.device)
     
                 # Forward pass through the KAN model
@@ -1239,7 +1250,7 @@ class LLaMA32TensorRTTool:
                 logging.debug(f"Modified hidden states shape: {modified_hidden_states.shape}")
                 logging.debug(f"KAN refusal scores shape: {kan_refusal_scores.shape}")
     
-                # Compute the language modeling loss
+                # Compute the language modeling loss using the modified hidden states
                 lm_logits = self.model.lm_head(modified_hidden_states)
                 lm_loss = F.cross_entropy(lm_logits.view(-1, lm_logits.size(-1)), target_ids.view(-1), ignore_index=-100)
     
@@ -1248,23 +1259,23 @@ class LLaMA32TensorRTTool:
                     kan_refusal_scores.view(-1), torch.full((kan_refusal_scores.numel(),), refusal_score, device=self.device)
                 )
     
-                # Combine losses with a weighted sum
-                loss = lm_loss + self.kan_loss_weight * refusal_loss
+                # Combine the losses with a weighted sum
+                total_loss = lm_loss + self.kan_loss_weight * refusal_loss
     
             # Scale the loss for mixed precision training
-            scaled_loss = self.scaler.scale(loss)
+            scaled_loss = self.scaler.scale(total_loss)
             scaled_loss.backward()
     
             # Unscale gradients and apply clipping
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.kan.parameters(), max_norm=1.0)
     
-            # Perform optimizer step and update the scaler
+            # Perform the optimizer step and update the scaler
             self.scaler.step(self.optimizer)
             self.scaler.update()
     
             # Log loss values for debugging
-            logging.info(f"Language Model Loss: {lm_loss.item():.4f}, Refusal Loss: {refusal_loss.item():.4f}, Total Loss: {loss.item():.4f}")
+            logging.info(f"Language Model Loss: {lm_loss.item():.4f}, Refusal Loss: {refusal_loss.item():.4f}, Total Loss: {total_loss.item():.4f}")
     
             return lm_loss.item(), refusal_loss.item()
     
@@ -1272,7 +1283,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during KAN training step: {str(e)}")
             logging.error(traceback.format_exc())
             return 0.0, 0.0
-            
+        
     def validate_kan(self):
         if len(self.memory_manager.sliding_window) < 2:
             return 0.0
