@@ -825,6 +825,11 @@ class LLaMA32TensorRTTool:
             # Ensure the special tokens are set correctly
             self._ensure_special_tokens(tokenizer)
     
+            # Add padding token manually if not already present
+            if tokenizer.pad_token is None:
+                tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                logging.info(f"Added [PAD] token to tokenizer.")
+    
             # Override eos_token_id with pad_token_id if necessary
             if tokenizer.pad_token_id is not None and tokenizer.pad_token_id != tokenizer.eos_token_id:
                 tokenizer.eos_token_id = tokenizer.pad_token_id
@@ -1402,32 +1407,38 @@ class LLaMA32TensorRTTool:
     def interact(self, user_input):
         if not self.components_initialized:
             raise RuntimeError("Components not initialized. Call _initialize_components() first.")
-
+    
         self.interaction_count += 1
         context = self.memory_manager.get_context(self.emotional_state.get_emotion())
-
+    
         try:
             with self.amp_context:
                 response_tokens, quality_metrics = self._generate_response(user_input, context)
+            
+            # Continue refining the response until coherence is achieved
+            while not self.is_valid_response(response_tokens):
+                logging.warning("Garbled output detected, regenerating response.")
+                response_tokens, quality_metrics = self._generate_response(user_input, context)
+    
         except Exception as e:
             logging.error(f"Error generating response: {str(e)}")
             logging.error(traceback.format_exc())
             return {"response": "I apologize, but I encountered an error while generating a response."}
-
+    
         response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
         self.memory_manager.update_memory({"role": "assistant", "content": response}, quality_metrics['relevance_score'])
         refusal_score = self.refusal_detector.detect_refusal(response_tokens)
         self.update_emotional_state(response, quality_metrics['perplexity'])
-
-        lm_loss, refusal_loss = self._train_or_warmup(response_tokens[:-1], response_tokens[1:], refusal_score)
+    
+        lm_loss, refusal_loss = self.train_kan_step(response_tokens[:-1], response_tokens[1:], refusal_score)
         validation_loss = self.validate_kan()
-
+    
         self.update_training_metrics(lm_loss, validation_loss)
         interaction_result = self.create_interaction_result(response, refusal_score, lm_loss, refusal_loss, validation_loss)
         self._save_interaction_state(interaction_result)
-
+    
         return interaction_result
-
+    
     def _handle_invalid_response(self):
         logging.warning("Invalid response generated.")
         return {
