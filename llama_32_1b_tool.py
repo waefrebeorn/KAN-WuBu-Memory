@@ -869,7 +869,7 @@ class LLaMA32TensorRTTool:
                 model = AutoModelForCausalLM.from_config(config)
             logging.info("Model initialized with empty weights")
     
-            # Move the empty model to GPU
+            # Move the empty model to GPU using to_empty()
             model = model.to_empty(device=self.device)
             logging.info("Empty model moved to GPU")
     
@@ -879,14 +879,15 @@ class LLaMA32TensorRTTool:
                     file_path = os.path.join(checkpoint_dir, filename)
                     logging.info(f"Loading weights from {file_path}")
                     try:
-                        state_dict = load_file(file_path, device=self.device)
-                        model.load_state_dict(state_dict, strict=False)
+                        state_dict = load_file(file_path, device="cpu")  # Load to CPU first
+                        model.load_state_dict(state_dict, strict=False, assign=True)  # Use assign=True
                         logging.info(f"Weights loaded successfully from {filename}")
                     except Exception as e:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
     
-            # Ensure all model parameters are on the correct device
-            model = model.to_empty(device=self.device)
+            # Move the model with loaded weights to GPU
+            model = model.to(self.device)
+            logging.info("Model with loaded weights moved to GPU")
     
             # Enable gradient checkpointing for memory efficiency
             model.gradient_checkpointing_enable()
