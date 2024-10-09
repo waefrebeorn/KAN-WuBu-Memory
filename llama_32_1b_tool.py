@@ -906,8 +906,9 @@ class LLaMA32TensorRTTool:
                         for param_name, param in state_dict.items():
                             if param_name in model.state_dict():
                                 if model.state_dict()[param_name].is_meta:
-                                    # Move to GPU if the parameter is on meta
+                                    # Initialize the meta tensor
                                     model.get_parameter(param_name).data = param.to(self.device)
+                                    logging.info(f"Initialized and moved parameter '{param_name}' to {self.device}")
                                 else:
                                     model.state_dict()[param_name].copy_(param.to(self.device))
                         logging.info(f"Weights loaded successfully from {filename}")
@@ -915,14 +916,14 @@ class LLaMA32TensorRTTool:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
                         raise
     
-            # Move all existing parameters to the correct device and handle meta parameters
+            # Move all existing parameters to the correct device
             for name, param in model.named_parameters():
                 if param.device != self.device:
                     if param.is_meta:
-                        param.data = param.data.to(self.device)  # Move meta parameters to GPU
-                        logging.info(f"Moved parameter '{name}' from meta to {self.device}")
+                        # If it's still a meta tensor, log a warning
+                        logging.warning(f"Parameter '{name}' is still a meta tensor and cannot be moved.")
                     else:
-                        param.data = param.data.to(self.device)  # Normal parameter move
+                        param.data = param.data.to(self.device)
                         logging.info(f"Moved parameter '{name}' to {self.device}")
     
             # Ensure use_cache is set to False
@@ -960,9 +961,12 @@ class LLaMA32TensorRTTool:
             # Attempt to move any remaining parameters to GPU
             logging.info("Attempting to move any remaining parameters to GPU...")
             for name, param in model.named_parameters():
-                if param.device != self.device or param.is_meta:
-                    param.data = param.data.to(self.device)  # Move to GPU
-                    logging.info(f"Moved parameter '{name}' to {self.device}")
+                if param.device != self.device:
+                    if not param.is_meta:  # Move only if it's not a meta tensor
+                        param.data = param.data.to(self.device)
+                        logging.info(f"Moved parameter '{name}' to {self.device}")
+                    else:
+                        logging.warning(f"Parameter '{name}' is still a meta tensor and cannot be moved.")
     
             # Retry the initialization to verify if the model can now be initialized
             try:
