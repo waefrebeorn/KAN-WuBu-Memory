@@ -1488,13 +1488,32 @@ class LLaMA32TensorRTTool:
     def trigger_chain_of_thought(self, context):
         cot_prompt = f"{context}\nLet's think this through step-by-step:\n1."
         cot_input_ids = self.tokenizer.encode(cot_prompt, return_tensors='pt').to(self.device)  # Explicitly move to the correct device
-        
-        cot_output = self.model.generate(cot_input_ids, max_length=500, num_return_sequences=1, no_repeat_ngram_size=2)
+    
+        try:
+            # Ensure the input IDs are on the correct device before generating
+            cot_output = self.model.generate(cot_input_ids, max_length=500, num_return_sequences=1, no_repeat_ngram_size=2)
+        except RuntimeError as e:
+            # Check for device mismatch errors
+            if "expected" in str(e):
+                logging.warning("Detected device mismatch during generation. Attempting to recover...")
+    
+                # Attempt to move cot_input_ids to the GPU if they are on CPU
+                if cot_input_ids.device != self.device:
+                    cot_input_ids = cot_input_ids.to(self.device)
+                    logging.info("Moved cot_input_ids to GPU")
+    
+                # Retry generation after moving inputs
+                cot_output = self.model.generate(cot_input_ids, max_length=500, num_return_sequences=1, no_repeat_ngram_size=2)
+            else:
+                logging.error(f"Unexpected RuntimeError during generation: {str(e)}")
+                raise  # Re-raise for unhandled exceptions
+    
         thought_process = self.tokenizer.decode(cot_output[0], skip_special_tokens=True)
     
         # Extract final response from thought process
         final_response = self._extract_final_response(thought_process)
         return final_response
+    
     
 
     
