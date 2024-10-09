@@ -879,7 +879,7 @@ class LLaMA32TensorRTTool:
         else:
             return tensor_or_dict
         
-    
+        
     def _initialize_model_full_gpu(self):
         logging.info("Attempting full GPU initialization using `transformers` library...")
     
@@ -907,7 +907,18 @@ class LLaMA32TensorRTTool:
             )
             logging.info(f"Model loaded successfully on {self.device} using `transformers`.")
     
-            # Step 4: Ensure that all tensors are on the GPU and no meta tensors are left
+            # Step 4: Handle `lm_head.weight` if not loaded
+            if 'lm_head.weight' in [name for name, _ in self.model.named_parameters()]:
+                logging.info("`lm_head.weight` found in model parameters.")
+            else:
+                logging.warning("`lm_head.weight` missing in loaded model. Manually initializing `lm_head`.")
+                self.model.lm_head.weight = torch.nn.Parameter(
+                    torch.empty((self.model.config.vocab_size, self.model.config.hidden_size), device=self.device)
+                )
+                torch.nn.init.xavier_uniform_(self.model.lm_head.weight)
+                logging.info("`lm_head.weight` manually initialized.")
+    
+            # Step 5: Ensure that all tensors are on the GPU and no meta tensors are left
             for name, param in self.model.named_parameters():
                 if param.device != self.device:
                     logging.warning(f"Parameter '{name}' is on {param.device}. Moving to {self.device}.")
@@ -916,10 +927,10 @@ class LLaMA32TensorRTTool:
                 if param.is_meta:
                     raise RuntimeError(f"Parameter '{name}' is still a meta tensor. Initialization failed.")
     
-            # Step 5: Validate model, set to eval mode, and tie weights if necessary
+            # Step 6: Validate model, set to eval mode, and tie weights if necessary
             self.model.eval()
             logging.info("Model set to evaluation mode.")
-            
+    
             # Check and tie weights if not tied
             if not self._verify_tied_weights(self.model):
                 logging.warning("Weights are not tied after initialization. Re-tying weights.")
@@ -932,7 +943,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model using `transformers` on {self.device}.")
- 
+
    
     def _get_submodule_and_param_name(self, model, param_name):
         """Locate the submodule and parameter name for a given full parameter path."""
@@ -1304,7 +1315,8 @@ class LLaMA32TensorRTTool:
         stop_sequences = [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]
         max_response_length = 2000
     
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, device_type='cuda'):
+        # Replace with updated autocast context
+        with torch.no_grad(), torch.amp.autocast(enabled=True):
             for step in range(max_response_length):
                 try:
                     # Ensure all inputs are on the correct GPU device
