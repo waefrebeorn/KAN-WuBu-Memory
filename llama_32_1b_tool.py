@@ -731,8 +731,8 @@ class LLaMA32TensorRTTool:
     def _initialize_components(self):
         logging.info("Starting component initialization (GPU-only, prevent offloading)...")
         self.components_initialized = False
-        initialization_attempts = 0
-        max_attempts = 3
+        initialization_attempts = 10
+        max_attempts = 10
     
         while initialization_attempts < max_attempts:
             try:
@@ -1074,7 +1074,7 @@ class LLaMA32TensorRTTool:
                 logging.error(f"Failed to update model for tokenizer: {str(e)}")
                 logging.error(traceback.format_exc())
         else:
-            logging.warning("Model not initialized. Skipping model-specific tokenizer updates.")
+            logging.warning("Model not initialized YET. Delaying loading model-specific tokenizer updates.")
     
             
     
