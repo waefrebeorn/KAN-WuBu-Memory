@@ -898,7 +898,7 @@ class LLaMA32TensorRTTool:
                 self.model = AutoModelForCausalLM.from_config(config)
                 logging.info("Created model with empty weights (meta tensors).")
     
-            # Ensure device is correctly specified
+            # Ensure the device is correctly specified
             if self.device not in ["cpu", "cuda:0", "cuda"]:
                 raise RuntimeError(f"Invalid device specified: {self.device}")
     
@@ -910,10 +910,11 @@ class LLaMA32TensorRTTool:
     
             # Load checkpoint and dispatch using `accelerate`
             logging.info(f"Loading model checkpoint and dispatching to device: {target_device}")
-            
-            # Explicitly use `torch.nn.Module.to_empty` to move from meta to the right device
+    
+            # Explicitly use `torch.nn.Module.to_empty()` to move the meta tensors to the right device
             self.model.to_empty(device=target_device)
-            
+    
+            # Dispatch the model using the `accelerate` library
             self.model = load_checkpoint_and_dispatch(
                 self.model,
                 checkpoint=self.model_path,
@@ -923,10 +924,12 @@ class LLaMA32TensorRTTool:
     
             logging.info(f"Model successfully initialized on device: {target_device}")
     
-            # Tie weights if necessary
-            if not self.model.is_tied():
+            # Directly call `tie_weights` if the model supports it
+            if hasattr(self.model, "tie_weights"):
                 self.model.tie_weights()
                 logging.info("Model weights tied successfully.")
+            else:
+                logging.info("Model does not require tying weights.")
     
             # Set the model to evaluation mode
             self.model.eval()
