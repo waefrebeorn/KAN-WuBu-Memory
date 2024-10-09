@@ -37,20 +37,18 @@ def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
 
-    if not logger.hasHandlers():  # Avoid adding duplicate handlers
-        file_handler = logging.FileHandler('llama_tool.log', mode='a', encoding='utf-8')
+    file_handler = logging.FileHandler('llama_tool.log', mode='a', encoding='utf-8')
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
 
-        file_handler.setLevel(logging.DEBUG)
-        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(file_formatter)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.WARNING)
+    console_formatter = logging.Formatter('%(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
 
-        console_handler = logging.StreamHandler(sys.stdout) 
-        console_handler.setLevel(logging.WARNING)
-        console_formatter = logging.Formatter('%(levelname)s - %(message)s')
-        console_handler.setFormatter(console_formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
 
-        logger.addHandler(file_handler)
-        logger.addHandler(console_handler)
 
     ignore_patterns = [
         "matplotlib",
@@ -341,55 +339,76 @@ class EnhancedKAN(nn.Module):
         self.vocab_size = vocab_size
         self.influence_scale = 0.01
 
-        # Correctly initialize layers with device
+        # Initialize layers with correct device
         self.refusal_override = nn.Linear(self.input_size, self.hidden_size, dtype=self.dtype, device=self.device)
         self.output_modifier = nn.Linear(self.hidden_size, self.vocab_size, dtype=self.dtype, device=self.device)
 
-    @torch.jit.script_method
-    def optimize_memory(self):
-        torch.cuda.empty_cache()
-
     def forward(self, hidden_states, user_intent, emotional_state):
+        """
+        Forward pass of the KAN model with strict device checks and integration safety.
+        """
         try:
-            # Use torch.cuda.amp.autocast for mixed precision
-            with torch.amp.autocast('cuda', dtype=self.dtype):
-                # Ensure all inputs are on the correct device and dtype
-                hidden_states = hidden_states.to(self.device, dtype=self.dtype)
-                user_intent = user_intent.to(self.device, dtype=self.dtype)
-                position = emotional_state.get_embedding(hidden_states.size(0)).to(self.device, dtype=self.dtype)
-    
-                batch_size, seq_length = hidden_states.shape[:2]
-    
-                # Ensure user_intent is broadcastable
-                if user_intent.dim() == 2:
-                    user_intent = user_intent.unsqueeze(1).expand(batch_size, seq_length, -1)
-                elif user_intent.dim() == 1:
-                    user_intent = user_intent.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_length, -1)
-    
-                # Expand position embedding to match sequence length
-                position = position.unsqueeze(1).expand(batch_size, seq_length, -1)
-    
-                # Concatenate inputs
-                kan_input = torch.cat([hidden_states, user_intent, position], dim=-1)
-    
-                # Apply refusal override and influence scale
-                refusal_scores = torch.sigmoid(self.refusal_override(kan_input))
-                modified_hidden_states = hidden_states + self.influence_scale * refusal_scores
-    
+            # Move tensors to the specified device
+            hidden_states = hidden_states.to(self.device, dtype=self.dtype)
+            user_intent = user_intent.to(self.device, dtype=self.dtype)
+            position = emotional_state.get_embedding(hidden_states.size(0)).to(self.device, dtype=self.dtype)
+
+            # Validate tensor devices and dimensions
+            assert hidden_states.device == self.device, f"Hidden states not on expected device! Found: {hidden_states.device}"
+            assert user_intent.device == self.device, f"User intent not on expected device! Found: {user_intent.device}"
+            assert position.device == self.device, f"Position embeddings not on expected device! Found: {position.device}"
+
+            # Check KAN state before performing operations
+            if not self.is_valid_state():
+                logging.warning("Invalid KAN state detected. Skipping KAN operations.")
+                return hidden_states, torch.zeros(hidden_states.size(0), self.hidden_size, device=self.device, dtype=self.dtype)
+
+            # Expand position embedding to match sequence length
+            batch_size, seq_length = hidden_states.shape[:2]
+            position = position.unsqueeze(1).expand(batch_size, seq_length, -1)
+
+            # Adjust dimensions if necessary
+            if user_intent.dim() == 2:
+                user_intent = user_intent.unsqueeze(1).expand(batch_size, seq_length, -1)
+            elif user_intent.dim() == 1:
+                user_intent = user_intent.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_length, -1)
+
+            # Concatenate inputs
+            kan_input = torch.cat([hidden_states, user_intent, position], dim=-1)
+            logging.debug(f"KAN Input Shape: {kan_input.shape}, Device: {kan_input.device}")
+
+            # Apply KAN transformations
+            refusal_scores = torch.sigmoid(self.refusal_override(kan_input))
+            modified_hidden_states = hidden_states + self.influence_scale * refusal_scores
+
+            # Log output tensor shapes
+            logging.debug(f"Modified Hidden States Shape: {modified_hidden_states.shape}, Device: {modified_hidden_states.device}")
+            logging.debug(f"Refusal Scores Shape: {refusal_scores.shape}, Device: {refusal_scores.device}")
+
             return modified_hidden_states, refusal_scores.squeeze(1)
-    
+
         except Exception as e:
             logging.error(f"Error in EnhancedKAN.forward: {str(e)}")
-            return hidden_states, torch.zeros(hidden_states.size(0), self.hidden_size, device=self.device, dtype=self.dtype)
+            raise
+
+    def is_valid_state(self):
+        """
+        Check if the KAN model's state is valid.
+        This includes ensuring layers are on the correct device and parameters are initialized.
+        """
+        try:
+            # Check if the primary components are on the right device
+            for name, param in self.named_parameters():
+                if param.device != self.device:
+                    logging.warning(f"Parameter {name} is on device {param.device} instead of {self.device}.")
+                    return False
+
+            # Additional state checks can be added here
+            return True
+        except Exception as e:
+            logging.error(f"Error validating KAN state: {str(e)}")
+            return False
     
-    def to(self, *args, **kwargs):
-        device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(*args, **kwargs)
-        if device is not None:
-            self.device = device
-        if dtype is not None:
-            self.dtype = dtype
-        return super().to(*args, **kwargs)
-        
 class EntropyManager:
     def __init__(self, model, tokenizer, device):
         self.model = model
@@ -890,20 +909,15 @@ class LLaMA32TensorRTTool:
             self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
    
     def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size):
-        logging.info(f"Initializing KAN with hidden_size={hidden_size}, num_emotional_dimensions={num_emotional_dimensions}, vocab_size={vocab_size}")
         try:
-            # Create KAN on meta device first
             kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device='meta')
-            # Use to_empty to move it to the correct device
-            kan = kan.to_empty(device=self.device)
-    
-            logging.info(f"KAN model structure: {kan}")
-            logging.info(f"KAN parameter count: {sum(p.numel() for p in kan.parameters())}")
+            # Move it to the desired device explicitly after creation
+            kan = kan.to(self.device)  # Replace `to_empty` with direct `to`
+            logging.info(f"KAN model successfully moved to {self.device}")
             return kan
         except Exception as e:
             logging.error(f"Error initializing KAN: {str(e)}")
-            logging.error(traceback.format_exc())
-            raise RuntimeError("Failed to initialize KAN") from e
+            raise
     
             
             
@@ -1210,20 +1224,21 @@ class LLaMA32TensorRTTool:
         return overlap / max(len(input_tokens), len(response_tokens))
 
     def train_kan_step(self, input_ids, target_ids, refusal_score):
+        """
+        Perform a single training step for the KAN model using the given inputs and targets.
+        Includes enhanced logging, tensor checks, and mixed precision training.
+        """
         logging.debug("Entering train_kan_step...")
     
-        # Ensure input_ids and target_ids are tensors
+        # Ensure input_ids and target_ids are torch tensors, move to correct device, and have the correct dtype.
         if isinstance(input_ids, list):
-            input_ids = torch.tensor(input_ids, device=self.device)
+            input_ids = torch.tensor(input_ids, device=self.device, dtype=torch.long)
         if isinstance(target_ids, list):
-            target_ids = torch.tensor(target_ids, device=self.device)
+            target_ids = torch.tensor(target_ids, device=self.device, dtype=torch.long)
     
-        logging.debug(f"Input IDs shape: {input_ids.shape if isinstance(input_ids, torch.Tensor) else 'Not a tensor'}")
-        logging.debug(f"Target IDs shape: {target_ids.shape if isinstance(target_ids, torch.Tensor) else 'Not a tensor'}")
-    
-        # Ensure input tensors are on the correct device
-        input_ids = input_ids.to(self.device) if input_ids.device != self.device else input_ids
-        target_ids = target_ids.to(self.device) if target_ids.device != self.device else target_ids
+        # Validate input tensor shapes and devices
+        assert input_ids.device == self.device, f"Input IDs are on {input_ids.device} instead of {self.device}"
+        assert target_ids.device == self.device, f"Target IDs are on {target_ids.device} instead of {self.device}"
     
         # Adjust dimensions to match expected format (batch_size, seq_length)
         if input_ids.dim() == 1:
@@ -1231,12 +1246,12 @@ class LLaMA32TensorRTTool:
         if target_ids.dim() == 1:
             target_ids = target_ids.unsqueeze(0)
     
-        # Set the KAN model to training mode and zero out gradients
+        # Set KAN model to training mode and zero out gradients
         self.kan.train()
         self.optimizer.zero_grad()
     
         try:
-            logging.debug(f"Corrected input shape: {input_ids.shape}, Target shape: {target_ids.shape}")
+            logging.debug(f"Input Shape: {input_ids.shape}, Target Shape: {target_ids.shape}")
     
             # Use mixed precision for memory efficiency and faster training
             with torch.amp.autocast(device_type='cuda', dtype=self.dtype):
@@ -1253,18 +1268,24 @@ class LLaMA32TensorRTTool:
                 else:
                     raise ValueError(f"Unexpected output format: {type(outputs)}")
     
-                last_hidden_state = hidden_states[-1].to(self.device)  # Ensure hidden states are on the correct device
+                # Check and move hidden states to the correct device
+                last_hidden_state = hidden_states[-1].to(self.device, dtype=self.dtype)
+                logging.debug(f"Last Hidden State Shape: {last_hidden_state.shape}, Device: {last_hidden_state.device}")
     
                 # Encode the user intent for use in the KAN forward pass
-                user_intent = self.encode_user_intent(self.tokenizer.decode(input_ids[0])).to(self.device)
+                user_input_text = self.tokenizer.decode(input_ids[0])
+                user_intent = self.encode_user_intent(user_input_text).to(self.device, dtype=self.dtype)
+                logging.debug(f"User Intent Shape: {user_intent.shape}, Device: {user_intent.device}")
     
                 # Forward pass through the KAN model
-                modified_hidden_states, kan_refusal_scores = self.kan(
-                    last_hidden_state, user_intent, self.emotional_state
-                )
+                modified_hidden_states, kan_refusal_scores = self.kan(last_hidden_state, user_intent, self.emotional_state)
     
-                logging.debug(f"Modified hidden states shape: {modified_hidden_states.shape}")
-                logging.debug(f"KAN refusal scores shape: {kan_refusal_scores.shape}")
+                # Validate shapes and device placements
+                assert modified_hidden_states.device == self.device, f"Modified Hidden States on incorrect device: {modified_hidden_states.device}"
+                assert kan_refusal_scores.device == self.device, f"KAN Refusal Scores on incorrect device: {kan_refusal_scores.device}"
+    
+                logging.debug(f"Modified Hidden States Shape: {modified_hidden_states.shape}")
+                logging.debug(f"KAN Refusal Scores Shape: {kan_refusal_scores.shape}")
     
                 # Compute the language modeling loss using the modified hidden states
                 lm_logits = self.model.lm_head(modified_hidden_states)
@@ -1272,7 +1293,8 @@ class LLaMA32TensorRTTool:
     
                 # Compute the refusal loss based on binary classification
                 refusal_loss = F.binary_cross_entropy_with_logits(
-                    kan_refusal_scores.view(-1), torch.full((kan_refusal_scores.numel(),), refusal_score, device=self.device)
+                    kan_refusal_scores.view(-1),
+                    torch.full((kan_refusal_scores.numel(),), refusal_score, device=self.device)
                 )
     
                 # Combine the losses with a weighted sum
@@ -1282,7 +1304,7 @@ class LLaMA32TensorRTTool:
             scaled_loss = self.scaler.scale(total_loss)
             scaled_loss.backward()
     
-            # Unscale gradients and apply clipping
+            # Unscale gradients and apply gradient clipping
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.kan.parameters(), max_norm=1.0)
     
@@ -1291,15 +1313,26 @@ class LLaMA32TensorRTTool:
             self.scaler.update()
     
             # Log loss values for debugging
-            logging.info(f"Language Model Loss: {lm_loss.item():.4f}, Refusal Loss: {refusal_loss.item():.4f}, Total Loss: {total_loss.item():.4f}")
+            logging.info(f"Training Step Complete - LM Loss: {lm_loss.item():.4f}, Refusal Loss: {refusal_loss.item():.4f}, Total Loss: {total_loss.item():.4f}")
     
             return lm_loss.item(), refusal_loss.item()
     
+        except RuntimeError as re:
+            logging.error(f"Runtime Error during KAN training step: {str(re)}")
+            logging.error(traceback.format_exc())
+            return 0.0, 0.0
+    
+        except ValueError as ve:
+            logging.error(f"Value Error during KAN training step: {str(ve)}")
+            logging.error(traceback.format_exc())
+            return 0.0, 0.0
+    
         except Exception as e:
-            logging.error(f"Error during KAN training step: {str(e)}")
+            logging.error(f"Unexpected Error during KAN training step: {str(e)}")
             logging.error(traceback.format_exc())
             return 0.0, 0.0
         
+       
     def validate_kan(self):
         if len(self.memory_manager.sliding_window) < 2:
             return 0.0
