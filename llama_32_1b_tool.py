@@ -1244,77 +1244,86 @@ class LLaMA32TensorRTTool:
     def _generate_response(self, user_input, context):
         logging.info(f"Generating response for input: '{user_input}' with context size: {len(context)}")
     
-        while True:
-            try:
-                prompt = f"{context}\nUser: {user_input}\nAssistant:"
-                inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings)
+        try:
+            prompt = f"{context}\nUser: {user_input}\nAssistant:"
+            inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings)
     
-                # Move all tensors to the correct device
-                inputs = self.move_to_device(inputs, self.device)
+            # Ensure all inputs are on the correct device
+            inputs = self.ensure_cuda(inputs)
     
-                response_tokens = []
-                total_entropy = 0
-                stop_sequences = [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]
-                max_response_length = 2000
+            response_tokens = []
+            total_entropy = 0
+            stop_sequences = [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]
+            max_response_length = 2000
     
-                with torch.no_grad():
-                    for step in range(max_response_length):
-                        outputs = self.model(**inputs)
-                        next_token_logits = outputs.logits[:, -1, :]
+            with torch.no_grad():
+                for step in range(max_response_length):
+                    # Ensure inputs are on the correct device before each iteration
+                    inputs = self.ensure_cuda(inputs)
+                    
+                    outputs = self.model(**inputs)
+                    next_token_logits = outputs.logits[:, -1, :]
     
-                        local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
-                        total_entropy += local_entropy
+                    local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
+                    total_entropy += local_entropy
     
-                        if self.is_garbage_output(local_entropy, response_tokens):
-                            logging.warning(f"Garbage detected mid-generation at step {step}. Engaging corrective training.")
-                            break
+                    if self.is_garbage_output(local_entropy, response_tokens):
+                        logging.warning(f"Garbage detected mid-generation at step {step}. Engaging corrective training.")
+                        break
     
-                        sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
-                        next_token = self.sample_next_token(next_token_logits, **sampling_params)
+                    sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
+                    next_token = self.sample_next_token(next_token_logits, **sampling_params)
     
-                        if next_token.item() in stop_sequences or len(response_tokens) >= max_response_length:
-                            break
+                    if next_token.item() in stop_sequences or len(response_tokens) >= max_response_length:
+                        break
     
-                        response_tokens.append(next_token.item())
-                        inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1)
-                        inputs['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones((1, 1), device=self.device)], dim=-1)
+                    response_tokens.append(next_token.item())
+                    inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1)
+                    inputs['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones((1, 1), device=self.device)], dim=-1)
     
-                        del outputs, next_token_logits
-                        torch.cuda.empty_cache()
-    
-                avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
-                quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
-    
-                is_valid, detailed_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
-                
-                if is_valid:
-                    logging.info("Valid response generated.")
-                    return response_tokens, quality_metrics
-                else:
-                    logging.warning("Invalid response generated. Engaging corrective training.")
-                    corrective_response = self._generate_corrective_response(user_input, context)
-                    self.corrective_training(user_input, response_tokens, corrective_response)
-                    continue  # Retry generation after corrective training
-    
-            except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    logging.warning("CUDA out of memory during generation. Clearing cache and retrying...")
+                    del outputs, next_token_logits
                     torch.cuda.empty_cache()
-                    time.sleep(1)  # Give some time for memory to be freed
-                else:
-                    logging.error(f"Runtime error during generation: {str(e)}")
-                    logging.error(traceback.format_exc())
-                    corrective_response = self._generate_corrective_response(user_input, context)
-                    self.corrective_training(user_input, [], corrective_response)  # Empty response_tokens due to error
-                    continue  # Retry generation after corrective training
     
-            except Exception as e:
-                logging.error(f"Unexpected error during generation: {str(e)}")
-                logging.error(traceback.format_exc())
+            avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
+            quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
+    
+            is_valid, detailed_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
+            
+            if is_valid:
+                logging.info("Valid response generated.")
+                return response_tokens, quality_metrics
+            else:
+                logging.warning("Invalid response generated. Engaging corrective training.")
                 corrective_response = self._generate_corrective_response(user_input, context)
-                self.corrective_training(user_input, [], corrective_response)  # Empty response_tokens due to error
-                continue  # Retry generation after corrective training
-                
+                self.corrective_training(user_input, response_tokens, corrective_response)
+                # Retry generation after corrective training
+                return self._generate_response(user_input, context)
+    
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                logging.warning("CUDA out of memory during generation. Clearing cache and retrying...")
+                torch.cuda.empty_cache()
+                time.sleep(1)  # Give some time for memory to be freed
+                return self._generate_response(user_input, context)  # Retry
+            else:
+                logging.error(f"Runtime error during generation: {str(e)}")
+                logging.error(traceback.format_exc())
+                raise
+    
+        except Exception as e:
+            logging.error(f"Unexpected error during generation: {str(e)}")
+            logging.error(traceback.format_exc())
+            raise
+    
+    def ensure_cuda(self, tensor_or_dict):
+        if isinstance(tensor_or_dict, torch.Tensor):
+            return tensor_or_dict.to(self.device)
+        elif isinstance(tensor_or_dict, dict):
+            return {k: self.ensure_cuda(v) for k, v in tensor_or_dict.items()}
+        elif isinstance(tensor_or_dict, list):
+            return [self.ensure_cuda(t) for t in tensor_or_dict]
+        else:
+            return tensor_or_dict
             
   
     def _generate_corrective_response(self, user_input, context):
