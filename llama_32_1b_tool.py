@@ -1498,29 +1498,61 @@ class LLaMA32TensorRTTool:
         cot_input_ids = self.tokenizer.encode(cot_prompt, return_tensors='pt').to(self.device)  # Explicitly move to the correct device
     
         try:
-            # Ensure the input IDs are on the correct device before generating
-            cot_output = self.model.generate(cot_input_ids, max_length=500, num_return_sequences=1, no_repeat_ngram_size=2)
+            # Step 1: Ensure the input IDs are on the correct device
+            cot_input_ids = self.ensure_cuda(cot_input_ids)  # Move cot_input_ids to GPU if not already
+            logging.info("cot_input_ids moved to GPU successfully.")
+    
+            # Step 2: Ensure all model parameters are on the correct device
+            for name, param in self.model.named_parameters():
+                if param.device != self.device:
+                    if param.is_meta:
+                        logging.warning(f"Parameter '{name}' is a meta tensor. Initializing it now.")
+                        # Initialize the meta tensor with empty values
+                        initialized_param = torch.empty(param.shape, dtype=param.dtype, device=self.device)
+                        param.data = initialized_param
+                        logging.info(f"Initialized meta tensor '{name}' with empty values.")
+                    else:
+                        # Move to GPU if the parameter is not on the right device
+                        param.data = param.data.to(self.device)
+                        logging.info(f"Moved parameter '{name}' to {self.device}.")
+    
+            # Step 3: Attempt to generate the chain-of-thought output
+            cot_output = self.model.generate(
+                cot_input_ids, 
+                max_length=500, 
+                num_return_sequences=1, 
+                no_repeat_ngram_size=2
+            )
+    
         except RuntimeError as e:
-            # Check for device mismatch errors
-            if "expected" in str(e):
-                logging.warning("Detected device mismatch during generation. Attempting to recover...")
+            # Step 4: Check for device mismatch or meta tensor errors
+            if "expected" in str(e) or "meta" in str(e):
+                logging.warning(f"Detected device or meta tensor issue during generation: {str(e)}. Attempting to recover...")
     
-                # Attempt to move cot_input_ids to the GPU if they are on CPU
-                if cot_input_ids.device != self.device:
-                    cot_input_ids = cot_input_ids.to(self.device)
-                    logging.info("Moved cot_input_ids to GPU")
+                # Attempt to reload model parameters to the correct device
+                self._reload_model_parameters()
     
-                # Retry generation after moving inputs
-                cot_output = self.model.generate(cot_input_ids, max_length=500, num_return_sequences=1, no_repeat_ngram_size=2)
+                # Retry moving cot_input_ids to the correct device
+                cot_input_ids = self.ensure_cuda(cot_input_ids)
+                logging.info("Moved cot_input_ids to GPU after catching error.")
+    
+                # Retry the generation process
+                cot_output = self.model.generate(
+                    cot_input_ids, 
+                    max_length=500, 
+                    num_return_sequences=1, 
+                    no_repeat_ngram_size=2
+                )
             else:
                 logging.error(f"Unexpected RuntimeError during generation: {str(e)}")
                 raise  # Re-raise for unhandled exceptions
     
+        # Step 5: Decode and extract the thought process from the generated response
         thought_process = self.tokenizer.decode(cot_output[0], skip_special_tokens=True)
-    
-        # Extract final response from thought process
         final_response = self._extract_final_response(thought_process)
+    
         return final_response
+    
     
     
 
