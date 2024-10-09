@@ -869,26 +869,28 @@ class LLaMA32TensorRTTool:
                 model = AutoModelForCausalLM.from_config(config)
             logging.info("Model initialized with empty weights")
     
-            # Instead of using to_empty(), we'll initialize the model on CPU first
-            model = model.to('cpu')
-            logging.info("Model moved to CPU for initialization")
+            # Use to_empty() to move the model to GPU without initializing weights
+            model = model.to_empty(device=self.device)
+            logging.info(f"Empty model structure moved to device: {self.device}")
     
-            # Load the model weights using SafeTensors
+            # Load the model weights using SafeTensors directly to GPU
             for filename in os.listdir(checkpoint_dir):
                 if filename.endswith('.safetensors'):
                     file_path = os.path.join(checkpoint_dir, filename)
                     logging.info(f"Loading weights from {file_path}")
                     try:
-                        state_dict = load_file(file_path, device='cpu')
+                        state_dict = load_file(file_path, device=self.device)
                         model.load_state_dict(state_dict, strict=False)
                         logging.info(f"Weights loaded successfully from {filename}")
                     except Exception as e:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
                         raise
     
-            # Now move the entire model to GPU and convert to float16
-            model = model.to(device=self.device, dtype=torch.float16)
-            logging.info(f"Model converted to float16 and moved to {self.device}")
+            # Move all existing parameters to the correct device
+            for name, param in model.named_parameters():
+                if not param.is_meta and param.device != self.device:
+                    param.data = param.data.to(self.device)
+                    logging.info(f"Moved parameter '{name}' to {self.device}")
     
             # Ensure use_cache is set to False
             model.config.use_cache = False
@@ -898,17 +900,23 @@ class LLaMA32TensorRTTool:
             model.eval()
             logging.info("Model set to evaluation mode")
     
+            # Convert model to float16
+            model = model.to(dtype=torch.float16)
+            logging.info("Model converted to float16")
+    
             # Verify that weights are tied
             if not self._verify_tied_weights(model):
                 logging.warning("Weights are not tied after initialization. Re-tying weights.")
                 model.tie_weights()
     
-            # Verify all model parameters are on the correct device
+            # Final verification of all model parameters
             for name, param in model.named_parameters():
                 if param.device != self.device:
                     raise RuntimeError(f"Parameter '{name}' is on {param.device}, expected {self.device}")
+                if not param.is_meta and param.numel() == 0:
+                    raise RuntimeError(f"Parameter '{name}' has no data")
     
-            logging.info(f"All model parameters verified to be on {self.device}")
+            logging.info(f"All model parameters verified to be on {self.device} with data")
     
             return model
     
