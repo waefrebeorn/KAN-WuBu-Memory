@@ -1795,19 +1795,35 @@ class LLaMA32TensorRTTool:
         if not tokens:
             return 1.0  # Return lowest perplexity for empty responses
         try:
+            # Ensure tokens is a tensor on the correct device
+            if isinstance(tokens, list):
+                tokens = torch.tensor(tokens, dtype=torch.long, device=self.device)
+            elif isinstance(tokens, torch.Tensor):
+                tokens = tokens.to(self.device)
+    
+            inputs = tokens.unsqueeze(0)  # Add batch dimension
+            
             with torch.no_grad():
-                inputs = torch.tensor([tokens], dtype=torch.long).to(self.device)
-                outputs = self.model(inputs)
+                outputs = self.model(inputs, labels=inputs)
                 loss = outputs.loss
                 perplexity = torch.exp(loss)
             return perplexity.item()
         except Exception as e:
             logging.error(f"Error calculating perplexity: {str(e)}")
             return float('inf')  # Return highest perplexity for error cases
-    
+        
     def has_proper_structure(self, tokens):
         try:
-            decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+            if isinstance(tokens, str):
+                # If tokens is already a string, use it directly
+                decoded_text = tokens
+            elif isinstance(tokens, list):
+                # If tokens is a list of token IDs, decode it
+                decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+            else:
+                # If tokens is neither a string nor a list, raise an error
+                raise ValueError(f"Unexpected type for tokens: {type(tokens)}")
+    
             sentences = re.split(r'(?<=[.!?])\s+', decoded_text.strip())
             
             if not sentences:
