@@ -1281,24 +1281,30 @@ class LLaMA32TensorRTTool:
     def _generate_response(self, user_input, context):
         logging.info(f"Generating response for input: '{user_input}' with context size: {len(context)}")
     
+        # Step 1: Create the input prompt and convert to tensor
         prompt = f"{context}\nUser: {user_input}\nAssistant:"
         inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, 
                                 max_length=self.model.config.max_position_embeddings)
-    
-        # Ensure all inputs are on the correct device
-        inputs = self.ensure_cuda(inputs)
+        
+        # Step 2: Move all inputs to GPU
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
     
         response_tokens = []
         total_entropy = 0
         stop_sequences = [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]
         max_response_length = 2000
     
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, device_type='cuda'):
             for step in range(max_response_length):
                 try:
+                    # Ensure all inputs are on the correct GPU device
+                    inputs = {key: value.to(self.device) for key, value in inputs.items()}
+                    
+                    # Step 3: Forward pass through the model
                     outputs = self.model(**inputs)
-                    next_token_logits = outputs.logits[:, -1, :]
+                    next_token_logits = outputs.logits[:, -1, :].to(self.device)
     
+                    # Calculate local entropy
                     local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
                     total_entropy += local_entropy
     
@@ -1306,6 +1312,7 @@ class LLaMA32TensorRTTool:
                         logging.warning(f"Garbage detected mid-generation at step {step}. Engaging corrective training.")
                         break
     
+                    # Step 4: Sampling the next token based on adjusted entropy parameters
                     sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
                     next_token = self.sample_next_token(next_token_logits, **sampling_params)
     
@@ -1313,39 +1320,36 @@ class LLaMA32TensorRTTool:
                         break
     
                     response_tokens.append(next_token.item())
-                    inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1)
+    
+                    # Step 5: Update inputs by appending the newly generated token
+                    inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0).to(self.device)], dim=-1)
                     inputs['attention_mask'] = torch.cat([inputs['attention_mask'], 
-                                                            torch.ones((1, 1), device=self.device)], dim=-1)
+                                                        torch.ones((1, 1), device=self.device)], dim=-1)
     
                 except RuntimeError as e:
-                    # Check if it's a CUDA OOM error or a device mismatch
                     if "out of memory" in str(e) or "expected" in str(e):
                         logging.warning(f"CUDA error at step {step}. Attempting to recover...")
                         torch.cuda.empty_cache()  # Clear CUDA cache to avoid OOM
     
-                        # Attempt to reload model parameters to the correct device
-                        self._reload_model_parameters()  # This method handles moving parameters to the GPU
-    
-                        # Ensure all inputs are on the GPU again
-                        inputs = self.ensure_cuda(inputs)
-    
+                        # Move inputs to GPU again in case of device mismatch
+                        inputs = {key: value.to(self.device) for key, value in inputs.items()}
                         continue  # Retry the current generation step
     
                     else:
                         logging.error(f"RuntimeError during generation: {str(e)}")
                         logging.error(traceback.format_exc())
-                        # Attempt to move all inputs to GPU if a device mismatch occurs
-                        self.ensure_cuda(inputs)
-                        continue  # Retry the current generation step
+                        continue  # Attempt to move forward despite the error
     
                 except Exception as e:
                     logging.error(f"Unexpected error during generation: {str(e)}")
                     logging.error(traceback.format_exc())
                     raise  # Re-raise for unhandled exceptions
     
+        # Step 6: Calculate average entropy and evaluate response quality
         avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
         quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
     
+        # Step 7: Check if response is valid; if not, trigger corrective training
         is_valid, detailed_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
     
         if is_valid:
