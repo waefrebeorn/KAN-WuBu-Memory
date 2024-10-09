@@ -895,39 +895,44 @@ class LLaMA32TensorRTTool:
             # Ensure all tensors are created on the correct device context
             torch.cuda.set_device(self.device)
             with torch.cuda.device(self.device):
-                # Set default tensor type to float16 on GPU for initialization
-                torch.set_default_tensor_type(torch.cuda.HalfTensor)
+                # Initialize model with empty weights
+                with init_empty_weights():
+                    model = AutoModelForCausalLM.from_config(config)
     
-                # Initialize model directly on GPU
-                self.model = AutoModelForCausalLM.from_pretrained(
+                # Load the model weights
+                model = load_checkpoint_and_dispatch(
+                    model,
                     self.model_path,
-                    config=config,
-                    torch_dtype=torch.float16,
                     device_map="auto",
-                    low_cpu_mem_usage=True
+                    dtype=torch.float16,
+                    no_split_module_classes=["LlamaDecoderLayer"]
                 )
     
-            # Explicitly move the entire model to the desired device
-            self.model = self.model.to(self.device)
-    
             # Tie weights if necessary
-            if hasattr(self.model, "tie_weights"):
-                self.model.tie_weights()
+            if hasattr(model, "tie_weights"):
+                model.tie_weights()
                 logging.info("Model weights tied successfully.")
     
             # Set model to evaluation mode
-            self.model.eval()
+            model.eval()
             logging.info("Model set to evaluation mode.")
     
             # Confirm all parameters are on GPU
-            self._validate_model_device_placement()
+            self._validate_model_device_placement(model)
     
-            return self.model
+            return model
     
         except Exception as e:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model on {self.device}.")
+    
+    def _validate_model_device_placement(self, model):
+        for name, param in model.named_parameters():
+            if param.device != self.device:
+                logging.error(f"Parameter '{name}' is on {param.device}, expected {self.device}")
+                raise RuntimeError(f"Parameter '{name}' is not on the expected device: {self.device}. Found on {param.device}.")
+        logging.info("All model parameters are correctly placed on the specified GPU device.")
         
     def _move_to_device(self, module, device=None):
         """Move all parameters and buffers of the module to the specified device."""
@@ -960,13 +965,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Failed to move parameters to GPU: {str(e)}")
             raise
     
-    def _validate_model_device_placement(self):
-        for name, param in self.model.named_parameters():
-            if param.device != torch.device(self.device):
-                logging.error(f"Parameter '{name}' is on {param.device}, expected {self.device}")
-                raise RuntimeError(f"Parameter '{name}' is not on the expected device: {self.device}. Found on {param.device}.")
-        logging.info("All model parameters are correctly placed on the specified GPU device.")
-        
+
     def _update_model_for_tokenizer(self):
         if self.model is not None:
             try:
