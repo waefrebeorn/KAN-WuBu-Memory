@@ -580,7 +580,10 @@ class AdvancedMemoryManager:
 
 class LLaMA32TensorRTTool:
     def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda")  # Always use CUDA
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available. This tool requires a GPU.")
+        
         self.model_path = self._get_model_path()
         self.tokenizer = None
         self.components_initialized = False
@@ -613,14 +616,13 @@ class LLaMA32TensorRTTool:
         self.overfit_detector = None
         self.day_cycle = None
         self.tensor_swapper = None
-
-        self.scaler = torch.amp.GradScaler()
-        self.amp_context = torch.amp.autocast(dtype=torch.float16, device_type='cuda')
-
-
+    
+        self.scaler = torch.cuda.amp.GradScaler()
+        self.amp_context = torch.cuda.amp.autocast(dtype=torch.float16, device_type='cuda')
+    
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
-
+    
         self.entropy_manager = None
         
         self.visualization_data = {
@@ -628,10 +630,12 @@ class LLaMA32TensorRTTool:
             'emotion': [],
             'memory_importance': []
         }
-
+    
         # Initialize components
         self._initialize_components()
-
+    
+        assert next(self.model.parameters()).device.type == "cuda", "Model not initialized on CUDA"
+        
     def _get_model_path(self):
         script_dir = Path(__file__).parent
         model_dir = script_dir / "models" / "Llama_32_1B"
@@ -760,6 +764,14 @@ class LLaMA32TensorRTTool:
         torch.cuda.synchronize()
         logging.info(f"GPU memory cleared and synchronized. Current memory usage: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
     
+    def _ensure_cuda(self, tensor_or_dict):
+        if isinstance(tensor_or_dict, dict):
+            return {k: self._ensure_cuda(v) for k, v in tensor_or_dict.items()}
+        elif isinstance(tensor_or_dict, torch.Tensor):
+            return tensor_or_dict.to(self.device)
+        else:
+            return tensor_or_dict
+        
     def _initialize_model_full_gpu(self):
         logging.info("Attempting full GPU initialization with enforced max_memory...")
     
@@ -785,7 +797,7 @@ class LLaMA32TensorRTTool:
                     file_path = os.path.join(checkpoint_dir, filename)
                     logging.info(f"Loading weights from {file_path}")
                     try:
-                        state_dict = load_file(file_path)
+                        state_dict = load_file(file_path, device=self.device) 
                         model.load_state_dict(state_dict, strict=False)
                         logging.info(f"Weights loaded successfully from {filename}")
                     except Exception as e:
@@ -1158,7 +1170,9 @@ class LLaMA32TensorRTTool:
                 prompt = f"{context}\nUser: {user_input}\nAssistant:"
                 inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings)
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                inputs['attention_mask'] = inputs['attention_mask'].to(self.device)
+                
+                assert all(tensor.device.type == "cuda" for tensor in inputs.values()), "Inputs not on CUDA"
+                assert next(self.model.parameters()).device.type == "cuda", "Model not on CUDA"
     
                 response_tokens = []
                 total_entropy = 0
@@ -1193,7 +1207,6 @@ class LLaMA32TensorRTTool:
                 avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
                 quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
     
-                # Check if the generated response is valid
                 is_valid, detailed_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
                 
                 if is_valid:
@@ -1213,7 +1226,6 @@ class LLaMA32TensorRTTool:
                 else:
                     logging.error(f"Runtime error during generation: {str(e)}")
                     logging.error(traceback.format_exc())
-                    # Engage corrective training
                     corrective_response = self._generate_corrective_response(user_input, context)
                     self.corrective_training(user_input, [], corrective_response)  # Empty response_tokens due to error
                     continue  # Retry generation after corrective training
@@ -1221,11 +1233,10 @@ class LLaMA32TensorRTTool:
             except Exception as e:
                 logging.error(f"Unexpected error during generation: {str(e)}")
                 logging.error(traceback.format_exc())
-                # Engage corrective training
                 corrective_response = self._generate_corrective_response(user_input, context)
                 self.corrective_training(user_input, [], corrective_response)  # Empty response_tokens due to error
                 continue  # Retry generation after corrective training
-    
+                
   
     def _generate_corrective_response(self, user_input, context):
         """
@@ -1513,14 +1524,12 @@ class LLaMA32TensorRTTool:
             return 0.0, 0.0
     
         # Ensure input_ids and target_ids are torch tensors, move to correct device, and have the correct dtype.
-        if isinstance(input_ids, list):
-            input_ids = torch.tensor(input_ids, device=self.device, dtype=torch.long)
-        if isinstance(target_ids, list):
-            target_ids = torch.tensor(target_ids, device=self.device, dtype=torch.long)
+        input_ids = self._ensure_cuda(input_ids)
+        target_ids = self._ensure_cuda(target_ids)
     
         # Validate input tensor shapes and devices
-        assert input_ids.device == self.device, f"Input IDs are on {input_ids.device} instead of {self.device}"
-        assert target_ids.device == self.device, f"Target IDs are on {target_ids.device} instead of {self.device}"
+        assert input_ids.device.type == "cuda", f"Input IDs are on {input_ids.device} instead of CUDA"
+        assert target_ids.device.type == "cuda", f"Target IDs are on {target_ids.device} instead of CUDA"
         
         # Adjust dimensions to match expected format (batch_size, seq_length)
         if input_ids.dim() == 1:
@@ -1536,7 +1545,7 @@ class LLaMA32TensorRTTool:
             logging.debug(f"Input Shape: {input_ids.shape}, Target Shape: {target_ids.shape}")
     
             # Use mixed precision for memory efficiency and faster training
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.cuda.amp.autocast():
                 # Forward pass through the base model to get the hidden states
                 outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True, use_cache=False)
     
@@ -1550,13 +1559,15 @@ class LLaMA32TensorRTTool:
                 else:
                     raise ValueError(f"Unexpected output format: {type(outputs)}")
     
-                # Check and move hidden states to the correct device
+                # Check and ensure hidden states are on CUDA
                 last_hidden_state = hidden_states[-1].to(self.device, dtype=torch.float16)
+                assert last_hidden_state.device.type == "cuda", "Last hidden state not on CUDA"
                 logging.debug(f"Last Hidden State Shape: {last_hidden_state.shape}, Device: {last_hidden_state.device}")
     
                 # Encode the user intent for use in the KAN forward pass
                 user_input_text = self.tokenizer.decode(input_ids[0])
-                user_intent = self.encode_user_intent(user_input_text).to(self.device, dtype=torch.float16)
+                user_intent = self.encode_user_intent(user_input_text)
+                assert user_intent.device.type == "cuda", "User intent not on CUDA"
                 logging.debug(f"User Intent Shape: {user_intent.shape}, Device: {user_intent.device}")
     
                 # Forward pass through the KAN model
@@ -1565,8 +1576,8 @@ class LLaMA32TensorRTTool:
                 logging.debug("Completed KAN forward pass")
     
                 # Validate shapes and device placements
-                assert modified_hidden_states.device == self.device, f"Modified Hidden States on incorrect device: {modified_hidden_states.device}"
-                assert kan_refusal_scores.device == self.device, f"KAN Refusal Scores on incorrect device: {kan_refusal_scores.device}"
+                assert modified_hidden_states.device.type == "cuda", f"Modified Hidden States not on CUDA"
+                assert kan_refusal_scores.device.type == "cuda", f"KAN Refusal Scores not on CUDA"
     
                 logging.debug(f"Modified Hidden States Shape: {modified_hidden_states.shape}")
                 logging.debug(f"KAN Refusal Scores Shape: {kan_refusal_scores.shape}")
@@ -1663,20 +1674,18 @@ class LLaMA32TensorRTTool:
             with torch.no_grad(), self.amp_context:
                 outputs = self.model(**inputs, output_hidden_states=True)
             
-            hidden_states = outputs.hidden_states[-1]  # Get the last hidden state
-            
-            # Average over the sequence length dimension
+            hidden_states = outputs.hidden_states[-1]
             user_intent = hidden_states.mean(dim=1)
             
-            print(f"User intent shape: {user_intent.shape}")
+            assert user_intent.device.type == "cuda", "User intent not on CUDA"
             
             return user_intent
     
         except Exception as e:
             logging.error(f"Failed to encode user input: {str(e)}")
             logging.error(traceback.format_exc())
-            # Return a zero tensor of the correct shape
             return torch.zeros(1, self.model.config.hidden_size, device=self.device)
+            
 
     def update_visualization_data(self, entropy, emotion, memory_importance):
         self.visualization_data['entropy'].append(entropy)
