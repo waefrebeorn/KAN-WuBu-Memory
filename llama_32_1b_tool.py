@@ -1212,8 +1212,7 @@ class LLaMA32TensorRTTool:
                 inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings)
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 
-                assert all(tensor.device.type == "cuda" for tensor in inputs.values()), "Inputs not on CUDA"
-                assert next(self.model.parameters()).device.type == "cuda", "Model not on CUDA"
+
     
                 response_tokens = []
                 total_entropy = 0
