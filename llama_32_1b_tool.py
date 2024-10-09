@@ -230,15 +230,34 @@ class ResponseQualityManager:
         return False
 
     def has_proper_structure(self, response):
-        """Check if the response has a proper structure (e.g., complete sentences)."""
-        sentences = re.split(r'(?<=[.!?])\s+', response.strip())
-        if not sentences:
+        try:
+            decoded_text = self.tokenizer.decode(response, skip_special_tokens=True)
+            sentences = re.split(r'(?<=[.!?])\s+', decoded_text.strip())
+            
+            if not sentences:
+                logging.warning("No complete sentences found in the response.")
+                return False
+        
+            if not sentences[0] or not sentences[0][0].isupper():
+                logging.warning(f"First sentence doesn't start with a capital letter: '{sentences[0]}'")
+                return False
+        
+            if not sentences[-1] or sentences[-1][-1] not in '.!?':
+                logging.warning(f"Last sentence doesn't end with proper punctuation: '{sentences[-1]}'")
+                return False
+        
+            proper_sentences = sum(1 for s in sentences if s and s[0].isupper() and s[-1] in '.!?')
+            proper_ratio = proper_sentences / len(sentences)
+        
+            if proper_ratio < 0.5:
+                logging.warning(f"Only {proper_ratio:.2f} of sentences have proper structure.")
+                return False
+                
+            return True
+        except Exception as e:
+            logging.error(f"Error in has_proper_structure: {str(e)}")
             return False
-        if not sentences[0][0].isupper():  # First sentence should start with a capital letter
-            return False
-        if sentences[-1][-1] not in '.!?':  # Last sentence should end with punctuation
-            return False
-        return True
+            
 
     def calculate_perplexity(self, response_tokens):
         """Calculate the perplexity of the response based on the logits."""
@@ -1085,9 +1104,6 @@ class LLaMA32TensorRTTool:
         return sentiment / len(words)
 
     def _generate_response(self, user_input, context):
-        """
-        Generate a response with indefinite attempts, engaging corrective training when issues are encountered.
-        """
         logging.info(f"Generating response for input: '{user_input}' with context size: {len(context)}")
         
         while True:
@@ -1163,7 +1179,7 @@ class LLaMA32TensorRTTool:
                 corrective_response = self._generate_corrective_response(user_input, context)
                 self.corrective_training(user_input, [], corrective_response)  # Empty response_tokens due to error
                 continue  # Retry generation after corrective training
-    
+                
     def _generate_corrective_response(self, user_input, context):
         """
         Generate a corrective response using the base model or chain-of-thought reasoning.
@@ -1393,7 +1409,7 @@ class LLaMA32TensorRTTool:
     def _calculate_perplexity(self, tokens):
         try:
             with torch.no_grad():
-                inputs = torch.tensor([tokens]).to(self.device)
+                inputs = torch.tensor([tokens], dtype=torch.long).to(self.device)  # Ensure long dtype
                 outputs = self.model(inputs)
                 logits = outputs.logits[:, :-1, :].contiguous()
                 target = inputs[:, 1:].contiguous()
@@ -1648,7 +1664,7 @@ class LLaMA32TensorRTTool:
             
             # If the response is invalid, invoke comprehensive corrective training
             if not self.is_valid_response(response_tokens):
-                logging.warning("Garbled output detected, triggering comprehensive corrective training.")
+                logging.warning("Invalid response detected, triggering comprehensive corrective training.")
                 response_tokens, quality_metrics = self.comprehensive_corrective_training(user_input, response_tokens, context)
     
         except Exception as e:
@@ -1669,7 +1685,7 @@ class LLaMA32TensorRTTool:
         self._save_interaction_state(interaction_result)
     
         return interaction_result
-    
+        
     def _handle_invalid_response(self):
         logging.warning("Invalid response generated.")
         return {
