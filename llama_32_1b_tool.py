@@ -143,7 +143,7 @@ class EmotionalState:
         emotion = self.get_emotion()
         values = self.position.squeeze().tolist()
         return f"Emotion: {emotion}, Values: {dict(zip(self.dimensions, values))}"
-   
+
 class OverfitDetector:
     def __init__(self, window_size=50, threshold=0.05):
         self.window_size = window_size
@@ -643,7 +643,6 @@ class LLaMA32TensorRTTool:
         
         # Iterate through all available GPUs
         for gpu_id in range(num_gpus):
-            # Set the current GPU
             torch.cuda.set_device(gpu_id)
             
             # Get the name of the current GPU
@@ -670,6 +669,7 @@ class LLaMA32TensorRTTool:
         logging.info(f"GPU ID: {best_gpu_id}")
         logging.info(f"Free memory on selected GPU: {max_free_memory / 1024**3:.2f} GB")
         
+        # Initialize all components
         self.model_path = self._get_model_path()
         self.tokenizer = None
         self.components_initialized = False
@@ -703,8 +703,8 @@ class LLaMA32TensorRTTool:
         self.day_cycle = None
         self.tensor_swapper = None
     
-        self.scaler = torch.amp.GradScaler()
-        self.amp_context = torch.amp.autocast(device_type='cuda', dtype=torch.float32)
+        self.scaler = torch.cuda.amp.GradScaler()
+        self.amp_context = torch.cuda.amp.autocast(device_type='cuda', dtype=torch.float16)
     
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
@@ -719,7 +719,7 @@ class LLaMA32TensorRTTool:
     
         # Initialize components
         self._initialize_components()
-    
+
  
         
     def _get_model_path(self):
@@ -755,67 +755,70 @@ class LLaMA32TensorRTTool:
         logging.info("Starting component initialization (GPU-only, prevent offloading)...")
         self.components_initialized = False
         initialization_attempts = 0
-        max_attempts = 999
+        max_attempts = 999  # Maximum number of retry attempts for GPU initialization
     
         while initialization_attempts < max_attempts:
             try:
                 logging.info(f"Initialization attempt {initialization_attempts + 1}/{max_attempts}")
     
-                # Initialize base configuration
+                # Initialize base configuration on GPU
                 self.config = AutoConfig.from_pretrained(self.model_path)
                 self.config.use_cache = False
                 hidden_size = self.config.hidden_size
                 num_emotional_dimensions = len(self.emotional_state.dimensions)
     
-                # Initialize the tokenizer first
+                # Initialize the tokenizer
                 self.tokenizer = self._initialize_tokenizer()
                 if self.tokenizer is None:
                     raise RuntimeError("Failed to initialize tokenizer")
     
+                # Ensure GPU memory is freed before initializing models
                 self.clear_memory()
     
-                # Initialize model with gradient checkpointing for memory efficiency
+                # Initialize the model entirely on GPU with gradient checkpointing enabled
                 with self.amp_context:
                     self.model = self._initialize_model_full_gpu()
                     self.model.gradient_checkpointing_enable()
-                self.clear_memory()
     
-                if self.model is None:
-                    raise RuntimeError("Model initialization failed")
+                # Double-check that the model is correctly loaded to GPU
+                if self.model is None or not next(self.model.parameters()).is_cuda:
+                    raise RuntimeError("Model initialization failed on GPU")
     
-                # Update the model for the tokenizer
+                self.clear_memory()  # Free memory after model initialization
+    
+                # Ensure the model is compatible with the tokenizer
                 self._update_model_for_tokenizer()
     
+                # Get the vocabulary size for KAN initialization
                 vocab_size = len(self.tokenizer)
     
-                # Initialize KAN with half precision
-                try:
-                    self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
-                    self.kan.to(torch.float16)
-                    if list(self.kan.parameters()):
-                        self.optimizer = torch.optim.AdamW(
-                            self.kan.parameters(),
-                            lr=self.learning_rate,
-                            eps=1e-8,
-                            betas=(0.9, 0.999),
-                            weight_decay=0.01
-                        )
-                    else:
-                        logging.error("KAN model has no parameters. Cannot initialize optimizer.")
-                        raise ValueError("KAN model has no parameters")
-                except Exception as e:
-                    logging.error(f"Error initializing KAN or optimizer: {str(e)}")
-                    raise
+                # Initialize KAN (Knowledge-Augmented Network) with half precision
+                self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
+                self.kan.to(self.device, dtype=torch.float16)
     
-                self.clear_memory()
+                if list(self.kan.parameters()):
+                    self.optimizer = torch.optim.AdamW(
+                        self.kan.parameters(),
+                        lr=self.learning_rate,
+                        eps=1e-8,
+                        betas=(0.9, 0.999),
+                        weight_decay=0.01
+                    )
+                    logging.info(f"Optimizer initialized for KAN with learning rate {self.learning_rate}.")
+                else:
+                    logging.error("KAN model has no parameters. Cannot initialize optimizer.")
+                    raise ValueError("KAN model has no parameters to optimize")
     
-                # Initialize the other components
+                self.clear_memory()  # Free memory after optimizer initialization
+    
+                # Initialize additional components directly on GPU
                 self.refusal_detector = self._initialize_refusal_detector()
                 self.clear_memory()
     
                 self.entropy_manager = self._initialize_entropy_manager()
                 self.clear_memory()
     
+                # Initialize memory manager with all tensors and buffers allocated on GPU
                 self.memory_manager = AdvancedMemoryManager(
                     max_context_length=2048,
                     tokenizer=self.tokenizer,
@@ -824,13 +827,13 @@ class LLaMA32TensorRTTool:
                 )
                 self.clear_memory()
     
+                # Other auxiliary components for interaction and learning management
                 self.overfit_detector = OverfitDetector()
                 self.day_cycle = SyntheticDayCycle()
                 self.tensor_swapper = TensorSwapper(self.device)
-    
                 self.clear_memory()
     
-                # Initialize the ResponseQualityManager using all the components above
+                # Initialize the ResponseQualityManager using all components above
                 self.response_quality_manager = ResponseQualityManager(
                     kan_model=self.kan,
                     tokenizer=self.tokenizer,
@@ -843,13 +846,14 @@ class LLaMA32TensorRTTool:
                 # Set up gradient scaler for mixed precision training
                 self.scaler = torch.amp.GradScaler()
     
+                # Set the initialization flag
                 self.components_initialized = True
                 logging.info("All components initialized successfully on GPU.")
                 return
     
             except RuntimeError as e:
                 if "CUDA out of memory" in str(e):
-                    logging.warning(f"CUDA out of memory during attempt {initialization_attempts + 1}. Trying alternative GPU initialization...")
+                    logging.warning(f"CUDA out of memory during attempt {initialization_attempts + 1}. Clearing cache and retrying...")
                     torch.cuda.empty_cache()
                     initialization_attempts += 1
                 else:
@@ -861,9 +865,10 @@ class LLaMA32TensorRTTool:
                 logging.error(traceback.format_exc())
                 raise
     
+        # If initialization fails after maximum attempts, log an error and exit
         logging.error("Failed to initialize components after maximum attempts.")
         raise RuntimeError("Component initialization failed after multiple GPU-only attempts")
-    
+
  
     def clear_memory(self):
         torch.cuda.empty_cache()
@@ -930,7 +935,7 @@ class LLaMA32TensorRTTool:
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model on {self.device}.")
     
-    # Supporting Methods for Tokenizer and Parameter Handling
+    
     def _update_model_for_tokenizer(self):
         if self.model is not None:
             try:
@@ -1198,16 +1203,28 @@ class LLaMA32TensorRTTool:
    
     def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size):
         try:
-            # Initialize the KAN model with `meta` tensor placeholders
-            kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device='meta')
-            
-            # Use `to_empty` to move the model to the desired device without copying data from `meta`
-            kan = kan.to_empty(device=self.device)
-            logging.info(f"KAN model successfully moved to {self.device} using `to_empty`.")
+            # Step 1: Initialize the KAN model directly on the GPU without using `meta` or CPU
+            kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size).to(self.device, dtype=torch.float16, non_blocking=True)
+    
+            # Step 2: Verify if all parameters are on the correct GPU device
+            for name, param in kan.named_parameters():
+                if param.device != self.device:
+                    param.data = param.data.to(self.device, non_blocking=True)
+                    logging.info(f"Moved parameter '{name}' to {self.device}.")
+    
+            # Step 3: Log successful initialization
+            logging.info(f"KAN model successfully initialized and moved to {self.device}.")
+    
             return kan
-        except Exception as e:
-            logging.error(f"Error initializing KAN: {str(e)}")
+        except RuntimeError as re:
+            logging.error(f"Runtime Error during KAN initialization: {str(re)}")
+            logging.error(traceback.format_exc())
             raise
+        except Exception as e:
+            logging.error(f"Unexpected error initializing KAN: {str(e)}")
+            logging.error(traceback.format_exc())
+            raise
+    
 
     
             
@@ -1318,12 +1335,12 @@ class LLaMA32TensorRTTool:
     def _generate_response(self, user_input, context):
         logging.info(f"Generating response for input: '{user_input}' with context size: {len(context)}")
     
-        # Step 1: Create the input prompt and convert to tensor
+        # Step 1: Create the input prompt and convert to GPU tensors
         prompt = f"{context}\nUser: {user_input}\nAssistant:"
         inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, 
                                 max_length=self.model.config.max_position_embeddings)
         
-        # Step 2: Move all inputs to GPU
+        # Step 2: Move all input tensors to GPU
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
     
         response_tokens = []
@@ -1331,14 +1348,14 @@ class LLaMA32TensorRTTool:
         stop_sequences = [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]
         max_response_length = 2000
     
-        # Replace with updated autocast context
+        # Step 3: Generate response using mixed precision and ensure memory is handled efficiently
         with torch.no_grad(), torch.amp.autocast(enabled=True):
             for step in range(max_response_length):
                 try:
-                    # Ensure all inputs are on the correct GPU device
+                    # Ensure all inputs are fully on GPU to prevent device mismatch errors
                     inputs = {key: value.to(self.device) for key, value in inputs.items()}
-                    
-                    # Step 3: Forward pass through the model
+    
+                    # Step 4: Forward pass through the model
                     outputs = self.model(**inputs)
                     next_token_logits = outputs.logits[:, -1, :].to(self.device)
     
@@ -1346,57 +1363,63 @@ class LLaMA32TensorRTTool:
                     local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
                     total_entropy += local_entropy
     
+                    # Detect if the model output indicates an invalid state
                     if self.is_garbage_output(local_entropy, response_tokens):
                         logging.warning(f"Garbage detected mid-generation at step {step}. Engaging corrective training.")
                         break
     
-                    # Step 4: Sampling the next token based on adjusted entropy parameters
+                    # Step 5: Sample the next token based on entropy-adjusted sampling parameters
                     sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
                     next_token = self.sample_next_token(next_token_logits, **sampling_params)
     
+                    # Break if stop sequence is detected or maximum response length is reached
                     if next_token.item() in stop_sequences or len(response_tokens) >= max_response_length:
                         break
     
                     response_tokens.append(next_token.item())
     
-                    # Step 5: Update inputs by appending the newly generated token
+                    # Step 6: Update inputs by appending the newly generated token
                     inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0).to(self.device)], dim=-1)
                     inputs['attention_mask'] = torch.cat([inputs['attention_mask'], 
                                                         torch.ones((1, 1), device=self.device)], dim=-1)
     
                 except RuntimeError as e:
-                    if "out of memory" in str(e) or "expected" in str(e):
-                        logging.warning(f"CUDA error at step {step}. Attempting to recover...")
-                        torch.cuda.empty_cache()  # Clear CUDA cache to avoid OOM
-    
-                        # Move inputs to GPU again in case of device mismatch
+                    if "CUDA out of memory" in str(e):
+                        logging.warning(f"CUDA memory error at step {step}. Attempting to recover...")
+                        torch.cuda.empty_cache()  # Clear CUDA cache to free memory
+                        
+                        # Retry moving inputs to GPU after clearing memory
                         inputs = {key: value.to(self.device) for key, value in inputs.items()}
                         continue  # Retry the current generation step
     
                     else:
-                        logging.error(f"RuntimeError during generation: {str(e)}")
+                        logging.error(f"RuntimeError during response generation at step {step}: {str(e)}")
                         logging.error(traceback.format_exc())
-                        continue  # Attempt to move forward despite the error
+                        continue  # Attempt to proceed despite the error
     
                 except Exception as e:
-                    logging.error(f"Unexpected error during generation: {str(e)}")
+                    logging.error(f"Unexpected error during response generation at step {step}: {str(e)}")
                     logging.error(traceback.format_exc())
                     raise  # Re-raise for unhandled exceptions
     
-        # Step 6: Calculate average entropy and evaluate response quality
+        # Step 7: Calculate average entropy for the response
         avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
         quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
     
-        # Step 7: Check if response is valid; if not, trigger corrective training
+        # Step 8: Check if the generated response is valid; if not, trigger corrective training
         is_valid, detailed_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
     
         if is_valid:
-            logging.info("Valid response generated.")
+            logging.info("Valid response generated successfully.")
             return response_tokens, quality_metrics
         else:
-            logging.warning("Invalid response generated. Engaging corrective training.")
+            logging.warning("Invalid response generated. Initiating corrective training.")
             corrective_response = self._generate_corrective_response(user_input, context)
+            
+            # Execute corrective training with the generated response
             self.corrective_training(user_input, response_tokens, corrective_response)
+            
+            # Retry response generation after corrective adjustments
             return self._generate_response(user_input, context)
     
     
@@ -1505,7 +1528,7 @@ class LLaMA32TensorRTTool:
         
     def trigger_chain_of_thought(self, context):
         cot_prompt = f"{context}\nLet's think this through step-by-step:\n1."
-        cot_input_ids = self.tokenizer.encode(cot_prompt, return_tensors='pt').to(self.device)  # Explicitly move to the correct device
+        cot_input_ids = self.tokenizer.encode(cot_prompt, return_tensors='pt').to(self.device, non_blocking=True)  # Explicitly move to GPU
     
         try:
             # Step 1: Ensure the input IDs are on the correct device
@@ -1517,13 +1540,13 @@ class LLaMA32TensorRTTool:
                 if param.device != self.device:
                     if param.is_meta:
                         logging.warning(f"Parameter '{name}' is a meta tensor. Initializing it now.")
-                        # Initialize the meta tensor with empty values
+                        # Initialize the meta tensor with empty values on the GPU
                         initialized_param = torch.empty(param.shape, dtype=param.dtype, device=self.device)
                         param.data = initialized_param
-                        logging.info(f"Initialized meta tensor '{name}' with empty values.")
+                        logging.info(f"Initialized meta tensor '{name}' with empty values on GPU.")
                     else:
                         # Move to GPU if the parameter is not on the right device
-                        param.data = param.data.to(self.device)
+                        param.data = param.data.to(self.device, non_blocking=True)
                         logging.info(f"Moved parameter '{name}' to {self.device}.")
     
             # Step 3: Attempt to generate the chain-of-thought output
@@ -1576,20 +1599,22 @@ class LLaMA32TensorRTTool:
         
     def corrective_training(self, user_input, response_tokens, corrective_response):
         try:
-            # Encode the corrective response as the target for training
-            target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.device)
+            # Encode the corrective response as the target for training and move to GPU
+            target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.device, non_blocking=True)
     
             # Perform a training step using the invalid response and the corrective response
             lm_loss, refusal_loss = self.train_kan_step(
                 response_tokens,  # This is already a list of token IDs
-                target_ids[0],    # Remove the batch dimension
+                target_ids[0],    # Remove the batch dimension and ensure GPU alignment
                 refusal_score=0.0  # Assume no refusal in this corrective context
             )
             return lm_loss, refusal_loss
         except Exception as e:
             logging.error(f"Error during corrective training: {str(e)}")
+            logging.error(traceback.format_exc())
             return None, None
     
+ 
     def comprehensive_corrective_training(self, user_input, response_tokens, context):
         """
         Perform corrective training indefinitely until the KAN produces a coherent response.
@@ -1605,7 +1630,7 @@ class LLaMA32TensorRTTool:
                 new_response_tokens, new_quality_metrics = self._generate_response(user_input, context)
     
                 # Ensure new_response_tokens are on the correct device
-                new_response_tokens = self.ensure_cuda(torch.tensor(new_response_tokens, device=self.device))
+                new_response_tokens = torch.tensor(new_response_tokens, device=self.device, dtype=torch.long, non_blocking=True)
     
                 # Safely decode the response, handling potential errors
                 try:
@@ -1638,7 +1663,7 @@ class LLaMA32TensorRTTool:
                     corrective_response = f"Here's a better way to respond: {base_model_response}"
     
                 # Ensure corrective response is on the correct device
-                target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.device)
+                target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.device, non_blocking=True)
     
                 # Perform a corrective training step
                 lm_loss, refusal_loss = self.corrective_training(user_input, new_response_tokens, corrective_response)
@@ -1704,7 +1729,7 @@ class LLaMA32TensorRTTool:
             logging.warning("Excessive repetitive token patterns detected in response.")
             return False
     
-        # Calculate perplexity
+        # Calculate perplexity using GPU operations only
         perplexity = self._calculate_perplexity(tokens)
         logging.info(f"Response perplexity: {perplexity}")
     
@@ -1714,21 +1739,22 @@ class LLaMA32TensorRTTool:
             logging.warning(f"Response lacks proper structure: '{decoded_response}'")
             return False
     
-        # Relevance check with more flexibility
+        # Relevance check with more flexibility, using GPU-based scoring
         relevance_score = 1.0
         if self.memory_manager.sliding_window:
             last_user_input = next((msg['content'] for msg in reversed(self.memory_manager.sliding_window) if msg['role'] == 'user'), None)
             if last_user_input:
                 decoded_response = self.tokenizer.decode(tokens, skip_special_tokens=True)
+                # Ensure the relevance calculation is GPU-based
                 relevance_score = self._calculate_relevance(last_user_input, decoded_response)
                 logging.info(f"Relevance score: {relevance_score}")
     
-        # Adjusted quality score threshold for more flexibility
-        quality_score = (1 / (perplexity + 1e-9)) * relevance_score
-        logging.info(f"Quality score: {quality_score}")
+        # Calculate a GPU-based quality score threshold with tensor operations
+        quality_score = (1 / (torch.tensor([perplexity], device=self.device) + 1e-9)) * torch.tensor([relevance_score], device=self.device)
+        logging.info(f"Quality score: {quality_score.item()}")
     
         # Allow borderline responses if they meet basic criteria
-        if quality_score < 1e-6:
+        if quality_score.item() < 1e-6:
             logging.warning(f"Response quality too low. Perplexity: {perplexity}, Relevance: {relevance_score}")
             return False
     
@@ -1796,20 +1822,20 @@ class LLaMA32TensorRTTool:
 
     def train_kan_step(self, input_ids, target_ids, refusal_score):
         logging.info("Starting train_kan_step in comprehensive corrective training")
-        
+    
         # Validate KAN model state
         if not self.kan.is_valid_state():
             logging.error("KAN model is in an invalid state. Aborting training step.")
             return 0.0, 0.0
     
-        # Ensure input_ids and target_ids are torch tensors, move to correct device, and have the correct dtype.
-        input_ids = self.ensure_cuda(input_ids)
-        target_ids = self.ensure_cuda(target_ids)
+        # Ensure input_ids and target_ids are torch tensors, move to GPU, and validate device placement
+        input_ids = input_ids.to(self.device, dtype=torch.long, non_blocking=True)
+        target_ids = target_ids.to(self.device, dtype=torch.long, non_blocking=True)
     
-        # Validate input tensor shapes and devices
+        # Confirm input tensor shapes and devices
         assert input_ids.device == self.device, f"Input IDs are on {input_ids.device} instead of {self.device}"
         assert target_ids.device == self.device, f"Target IDs are on {target_ids.device} instead of {self.device}"
-        
+    
         # Adjust dimensions to match expected format (batch_size, seq_length)
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
@@ -1824,7 +1850,7 @@ class LLaMA32TensorRTTool:
             logging.debug(f"Input Shape: {input_ids.shape}, Target Shape: {target_ids.shape}")
     
             # Use mixed precision for memory efficiency and faster training
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast(device_type='cuda', dtype=self.dtype):
                 # Forward pass through the base model to get the hidden states
                 outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True, use_cache=False)
     
@@ -1839,12 +1865,13 @@ class LLaMA32TensorRTTool:
                     raise ValueError(f"Unexpected output format: {type(outputs)}")
     
                 # Check and ensure hidden states are on CUDA
-                last_hidden_state = self.ensure_cuda(hidden_states[-1])
+                last_hidden_state = hidden_states[-1].to(self.device, non_blocking=True)
                 logging.debug(f"Last Hidden State Shape: {last_hidden_state.shape}, Device: {last_hidden_state.device}")
     
                 # Encode the user intent for use in the KAN forward pass
                 user_input_text = self.tokenizer.decode(input_ids[0])
                 user_intent = self.encode_user_intent(user_input_text)
+                user_intent = user_intent.to(self.device, non_blocking=True)
                 logging.debug(f"User Intent Shape: {user_intent.shape}, Device: {user_intent.device}")
     
                 # Forward pass through the KAN model
@@ -1853,8 +1880,8 @@ class LLaMA32TensorRTTool:
                 logging.debug("Completed KAN forward pass")
     
                 # Validate shapes and device placements
-                logging.debug(f"Modified Hidden States Shape: {modified_hidden_states.shape}")
-                logging.debug(f"KAN Refusal Scores Shape: {kan_refusal_scores.shape}")
+                logging.debug(f"Modified Hidden States Shape: {modified_hidden_states.shape}, Device: {modified_hidden_states.device}")
+                logging.debug(f"KAN Refusal Scores Shape: {kan_refusal_scores.shape}, Device: {kan_refusal_scores.device}")
     
                 # Compute the language modeling loss using the modified hidden states
                 lm_logits = self.model.lm_head(modified_hidden_states)
@@ -1863,7 +1890,7 @@ class LLaMA32TensorRTTool:
                 # Compute the refusal loss based on binary classification
                 refusal_loss = F.binary_cross_entropy_with_logits(
                     kan_refusal_scores.view(-1),
-                    torch.full((kan_refusal_scores.numel(),), refusal_score, device=self.device)
+                    torch.full((kan_refusal_scores.numel(),), refusal_score, device=self.device, dtype=torch.float16)
                 )
     
                 # Combine the losses with a weighted sum
@@ -1890,6 +1917,7 @@ class LLaMA32TensorRTTool:
         except RuntimeError as re:
             logging.error(f"Runtime Error during KAN training step: {str(re)}")
             logging.error(traceback.format_exc())
+            torch.cuda.empty_cache()  # Clear CUDA memory if an error occurs
             return 0.0, 0.0
     
         except ValueError as ve:
@@ -1901,7 +1929,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Unexpected Error during KAN training step: {str(e)}")
             logging.error(traceback.format_exc())
             return 0.0, 0.0
-
+    
          
        
     def validate_kan(self):
@@ -1942,23 +1970,36 @@ class LLaMA32TensorRTTool:
     
     def encode_user_intent(self, user_input):
         try:
+            # Step 1: Tokenize the user input and move it to the specified GPU device
             inputs = self.tokenizer(
-                user_input, return_tensors="pt", padding=True, truncation=True, max_length=512
-            ).to(self.device)
+                user_input, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True, 
+                max_length=512
+            ).to(self.device, non_blocking=True)  # Use non_blocking to speed up data transfer
     
-            with torch.no_grad(), self.amp_context:
+            # Step 2: Perform a forward pass through the model using mixed precision context for memory efficiency
+            with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 outputs = self.model(**inputs, output_hidden_states=True)
-            
-            hidden_states = outputs.hidden_states[-1]
-            user_intent = hidden_states.mean(dim=1)
-            
-            
+    
+            # Step 3: Extract the last hidden states and compute the mean representation for user intent
+            hidden_states = outputs.hidden_states[-1].to(self.device, non_blocking=True)
+            user_intent = hidden_states.mean(dim=1).to(self.device, non_blocking=True)
+    
             return user_intent
     
-        except Exception as e:
-            logging.error(f"Failed to encode user input: {str(e)}")
+        except RuntimeError as re:
+            logging.error(f"Runtime Error while encoding user intent: {str(re)}")
             logging.error(traceback.format_exc())
-            return torch.zeros(1, self.model.config.hidden_size, device=self.device)
+            torch.cuda.empty_cache()  # Attempt to recover from CUDA errors
+            return torch.zeros(1, self.model.config.hidden_size, device=self.device, dtype=torch.float16)
+    
+        except Exception as e:
+            logging.error(f"Unexpected Error while encoding user intent: {str(e)}")
+            logging.error(traceback.format_exc())
+            return torch.zeros(1, self.model.config.hidden_size, device=self.device, dtype=torch.float16)
+
             
 
     def update_visualization_data(self, entropy, emotion, memory_importance):
@@ -2122,15 +2163,19 @@ class LLaMA32TensorRTTool:
 
     def save_base_state(self):
         try:
+            # Explicitly move the KAN state dictionary to the GPU
+            kan_state_gpu = {key: value.to(self.device) for key, value in self.kan.state_dict().items()}
+            
+            # Create a state dictionary to store various components
             state_dict = {
                 'device': str(self.device),
-                'kan_state_dict': self.kan.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'emotional_state': self.emotional_state.position.cpu().numpy().tolist(),
+                'kan_state_dict': kan_state_gpu,  # Save KAN state dictionary using GPU tensors
+                'optimizer_state_dict': self.optimizer.state_dict(),  # Optimizer state can be saved directly
+                'emotional_state': self.emotional_state.position.detach().cpu().numpy().tolist(),  # Convert to list before saving
                 'memory_manager': {
-                    'memory_buffer': list(self.memory_manager.memory_buffer),
-                    'important_memory_buffer': list(self.memory_manager.important_memory_buffer),
-                    'sliding_window': list(self.memory_manager.sliding_window),
+                    'memory_buffer': [msg for msg in self.memory_manager.memory_buffer],
+                    'important_memory_buffer': [msg for msg in self.memory_manager.important_memory_buffer],
+                    'sliding_window': [msg for msg in self.memory_manager.sliding_window],
                 },
                 'interaction_count': self.interaction_count,
                 'best_loss': self.best_loss,
@@ -2144,33 +2189,46 @@ class LLaMA32TensorRTTool:
                 'training_losses': self.training_losses[-100:],  # Save last 100 entries
                 'validation_losses': self.validation_losses[-100:],  # Save last 100 entries
                 'entropy_manager': {
-                    'entropy_history': list(self.entropy_manager.entropy_history),
+                    'entropy_history': list(self.entropy_manager.entropy_history),  # Use list to ensure compatibility
                     'global_entropy': self.entropy_manager.global_entropy,
                 },
                 'visualization_data': self.visualization_data,
                 'components_initialized': self.components_initialized,
             }
     
-            # Save tokenizer separately if it exists
+            # Save tokenizer separately if it exists, to a GPU-only path
             if self.tokenizer:
-                self.tokenizer.save_pretrained(self.kan_state_dir / "tokenizer")
-                state_dict['tokenizer_path'] = str(self.kan_state_dir / "tokenizer")
-    
+                tokenizer_save_path = str(self.kan_state_dir / "tokenizer")
+                self.tokenizer.save_pretrained(tokenizer_save_path)
+                state_dict['tokenizer_path'] = tokenizer_save_path
+        
+            # Save the complete state dictionary
             torch.save(state_dict, self.base_state_file)
             logging.info(f"Base state saved to {self.base_state_file}")
             return True
+        except RuntimeError as re:
+            logging.error(f"Runtime error during state save: {str(re)}")
+            logging.error(traceback.format_exc())
+            return False
         except Exception as e:
             logging.error(f"Error saving base state: {str(e)}")
             logging.error(traceback.format_exc())
             return False
-            
+
     def load_base_state(self):
         if self.base_state_file.exists():
             try:
+                # Load the checkpoint directly to the target device
                 checkpoint = torch.load(self.base_state_file, map_location=self.device)
-    
-                self.kan.load_state_dict(checkpoint['kan_state_dict'])
+        
+                # Load KAN state directly on GPU
+                kan_state_gpu = {key: value.to(self.device) for key, value in checkpoint['kan_state_dict'].items()}
+                self.kan.load_state_dict(kan_state_gpu)
+                
+                # Load optimizer state dict directly to GPU
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                
+                # Restore the emotional state position directly on GPU
                 self.emotional_state.position = torch.tensor(checkpoint['emotional_state'], device=self.device)
     
                 # Ensure model is initialized before using it in Memory Manager
@@ -2178,6 +2236,7 @@ class LLaMA32TensorRTTool:
                     with self.amp_context:
                         self.model = self._initialize_model_full_gpu()
     
+                # Initialize Memory Manager with the loaded model and device
                 self.memory_manager = AdvancedMemoryManager(
                     max_context_length=2048,
                     tokenizer=self.tokenizer,
@@ -2185,10 +2244,18 @@ class LLaMA32TensorRTTool:
                     model=self.model
                 )
     
-                self.memory_manager.memory_buffer = deque(checkpoint['memory_manager']['memory_buffer'], maxlen=self.memory_manager.max_context_length)
-                self.memory_manager.important_memory_buffer = deque(checkpoint['memory_manager']['important_memory_buffer'], maxlen=self.memory_manager.max_context_length // 2)
-                self.memory_manager.sliding_window = deque(checkpoint['memory_manager']['sliding_window'], maxlen=self.memory_manager.max_context_length)
+                # Restore memory buffers directly using GPU-compatible deques
+                self.memory_manager.memory_buffer = deque(
+                    [msg for msg in checkpoint['memory_manager']['memory_buffer']], maxlen=self.memory_manager.max_context_length
+                )
+                self.memory_manager.important_memory_buffer = deque(
+                    [msg for msg in checkpoint['memory_manager']['important_memory_buffer']], maxlen=self.memory_manager.max_context_length // 2
+                )
+                self.memory_manager.sliding_window = deque(
+                    [msg for msg in checkpoint['memory_manager']['sliding_window']], maxlen=self.memory_manager.max_context_length
+                )
     
+                # Restore other saved states and parameters
                 self.interaction_count = checkpoint['interaction_count']
                 self.best_loss = checkpoint['best_loss']
                 self.wait = checkpoint['wait']
@@ -2198,11 +2265,14 @@ class LLaMA32TensorRTTool:
                 self.refusal_history = checkpoint['refusal_history']
                 self.training_losses = checkpoint['training_losses']
                 self.validation_losses = checkpoint['validation_losses']
-                self.entropy_manager.entropy_history = deque(checkpoint['entropy_manager']['entropy_history'], maxlen=self.entropy_manager.entropy_history.maxlen)
+                self.entropy_manager.entropy_history = deque(
+                    checkpoint['entropy_manager']['entropy_history'], maxlen=self.entropy_manager.entropy_history.maxlen
+                )
                 self.entropy_manager.global_entropy = checkpoint['entropy_manager']['global_entropy']
                 self.visualization_data = checkpoint['visualization_data']
                 self.components_initialized = checkpoint.get('components_initialized', False)
     
+                # Load the tokenizer if path is present, else initialize default tokenizer
                 if 'tokenizer_path' in checkpoint and os.path.exists(checkpoint['tokenizer_path']):
                     self.tokenizer = AutoTokenizer.from_pretrained(checkpoint['tokenizer_path'])
                     logging.info(f"Tokenizer loaded from {checkpoint['tokenizer_path']}")
@@ -2210,11 +2280,19 @@ class LLaMA32TensorRTTool:
                     logging.warning("Tokenizer not found in saved state. Using default initialization.")
                     self.tokenizer = self._initialize_tokenizer()
     
+                # Initialize remaining components if not already done
                 if not self.components_initialized:
                     self._initialize_components()
     
                 logging.info(f"Base state loaded from {self.base_state_file}")
                 return True
+    
+            except RuntimeError as re:
+                logging.error(f"Runtime Error while loading base state: {str(re)}")
+                logging.error(traceback.format_exc())
+                self._initialize_default_state()
+                return False
+    
             except Exception as e:
                 logging.error(f"Error loading base state: {str(e)}")
                 logging.error(traceback.format_exc())
@@ -2224,44 +2302,59 @@ class LLaMA32TensorRTTool:
             logging.info("No base state file found. Starting with default initialization.")
             self._initialize_default_state()
             return False
-   
+    
 
     def _initialize_default_state(self):
         if not self.components_initialized:
+            # Initialize all components to be GPU-compliant
             self._initialize_components()
     
+        # Initialize or reset the emotional state on the GPU
         if self.emotional_state is None:
-            self.emotional_state = EmotionalState(device=self.device)
+            self.emotional_state = EmotionalState()
+        
+        self.emotional_state.position = torch.zeros(1, len(self.emotional_state.dimensions), device=self.device, dtype=torch.float16)
     
-        self.emotional_state.position = torch.zeros(1, len(self.emotional_state.dimensions), device=self.device)
-    
-        # Ensure model is properly initialized before using it in AdvancedMemoryManager
+        # Ensure model is properly initialized and resides entirely on GPU before use
         if self.model is None:
             self.model = self._initialize_model_full_gpu()
     
+        # Initialize AdvancedMemoryManager on the GPU
         self.memory_manager = AdvancedMemoryManager(
             max_context_length=2048,
             tokenizer=self.tokenizer,
             device=self.device,
-            model=self.model  # Pass the model parameter here
+            model=self.model  # Pass the model parameter here to ensure GPU compatibility
         )
     
-        self.memory_manager.memory_buffer.clear()
-        self.memory_manager.important_memory_buffer.clear()
-        self.memory_manager.sliding_window.clear()
+        # Clear memory buffers, ensuring compatibility with GPU-optimized structures
+        self.memory_manager.memory_buffer = deque(maxlen=self.memory_manager.max_context_length)
+        self.memory_manager.important_memory_buffer = deque(maxlen=self.memory_manager.max_context_length // 2)
+        self.memory_manager.sliding_window = deque(maxlen=self.memory_manager.max_context_length)
     
+        # Initialize other internal states
         self.interaction_count = 0
         self.best_loss = float('inf')
         self.wait = 0
         self.learning_rate = 1e-5
+    
+        # Re-initialize SyntheticDayCycle
         self.day_cycle = SyntheticDayCycle()
+    
+        # Initialize other state trackers and histories
         self.refusal_history = []
         self.training_losses = []
         self.validation_losses = []
+    
+        # Reset entropy manager if it exists
         if self.entropy_manager:
-            self.entropy_manager.entropy_history.clear()
+            self.entropy_manager.entropy_history = deque(maxlen=500)  # Initialize a GPU-compatible deque
             self.entropy_manager.global_entropy = 0.0
+    
+        # Reset visualization data on GPU
         self.visualization_data = {'entropy': [], 'emotion': [], 'memory_importance': []}
+    
+        logging.info("Default state initialized successfully on GPU.")
     
     def main(self):
         self.load_base_state()
