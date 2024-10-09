@@ -731,8 +731,8 @@ class LLaMA32TensorRTTool:
     def _initialize_components(self):
         logging.info("Starting component initialization (GPU-only, prevent offloading)...")
         self.components_initialized = False
-        initialization_attempts = 10
-        max_attempts = 10
+        initialization_attempts = 0
+        max_attempts = 0
     
         while initialization_attempts < max_attempts:
             try:
