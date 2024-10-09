@@ -352,7 +352,7 @@ class EnhancedKAN(nn.Module):
     def forward(self, hidden_states, user_intent, emotional_state):
         try:
             # Use torch.cuda.amp.autocast for mixed precision
-            with torch.cuda.amp.autocast(dtype=self.dtype):
+            with torch.amp.autocast('cuda', dtype=self.dtype):
                 # Ensure all inputs are on the correct device and dtype
                 hidden_states = hidden_states.to(self.device, dtype=self.dtype)
                 user_intent = user_intent.to(self.device, dtype=self.dtype)
@@ -853,30 +853,26 @@ class LLaMA32TensorRTTool:
             'eos_token': "<|eot_id|>"
         }
     
-        # Add the custom pad token and eos token if they are missing
-        additional_special_tokens = {}
-        
+        # Add pad token if not set
         if tokenizer.pad_token is None or tokenizer.pad_token != special_tokens['pad_token']:
-            additional_special_tokens['pad_token'] = special_tokens['pad_token']
+            tokenizer.add_special_tokens({'pad_token': special_tokens['pad_token']})
             logging.info(f"Added custom pad token: {special_tokens['pad_token']}")
     
+        # Add eos token if not set
         if tokenizer.eos_token is None or tokenizer.eos_token != special_tokens['eos_token']:
-            additional_special_tokens['eos_token'] = special_tokens['eos_token']
+            tokenizer.add_special_tokens({'eos_token': special_tokens['eos_token']})
             logging.info(f"Added custom eos token: {special_tokens['eos_token']}")
-        
-        # Add additional special tokens if needed
-        if additional_special_tokens:
-            tokenizer.add_special_tokens(additional_special_tokens)
-        
-        # Force set the tokenizer IDs for pad_token and eos_token
+    
+        # Force set token IDs to ensure correct behavior
         tokenizer.pad_token = special_tokens['pad_token']
         tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(special_tokens['pad_token'])
+    
         tokenizer.eos_token = special_tokens['eos_token']
         tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids(special_tokens['eos_token'])
-        
+    
         logging.info(f"Forced pad_token_id to {tokenizer.pad_token_id}, eos_token_id to {tokenizer.eos_token_id}")
     
-        # Save tokenizer configuration if updated
+        # Save tokenizer configuration to disk
         tokenizer.save_pretrained(self.model_path)
         logging.info("Tokenizer saved with updated special tokens.")
     
