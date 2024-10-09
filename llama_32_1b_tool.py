@@ -888,13 +888,12 @@ class LLaMA32TensorRTTool:
     
             config = AutoConfig.from_pretrained(self.model_path)
             
-            # Use device_map='auto' and load in 8-bit to reduce memory usage
+            # Load the model directly to GPU, avoiding meta tensors
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 config=config,
-                device_map='auto',
-                load_in_8bit=True,
                 torch_dtype=torch.float16,
+                device_map={"": self.device},  # Map all layers to the specified GPU
                 low_cpu_mem_usage=True,
             )
     
@@ -902,9 +901,6 @@ class LLaMA32TensorRTTool:
             
             # Ensure all model parameters are on the correct device
             model = model.to(self.device)
-            
-            # Tie weights after moving to device
-            model.tie_weights()
             
             logging.info("Model loaded successfully on GPU and set to evaluation mode.")
             
