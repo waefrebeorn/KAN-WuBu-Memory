@@ -879,50 +879,60 @@ class LLaMA32TensorRTTool:
         else:
             return tensor_or_dict
         
-
+    
     def _initialize_model_full_gpu(self):
-        logging.info("Attempting full GPU initialization using `transformers` with `device_map`...")
+        logging.info("Attempting full GPU initialization using `transformers` library...")
+    
+        checkpoint_dir = str(self.model_path)
+        logging.info(f"Checkpoint directory: {checkpoint_dir}")
     
         try:
-            # Step 1: Load the configuration from the model path
-            logging.info(f"Loading model configuration from: {self.model_path}")
-            config = AutoConfig.from_pretrained(self.model_path)
-            config.use_cache = False  # Disable cache for compatibility with training
-    
-            # Step 2: Load the model using `from_pretrained` with device_map for automatic GPU placement
-            logging.info("Loading model using transformers with `device_map` to move to GPU...")
+            # Step 1: Load configuration and tokenizer
+            config = AutoConfig.from_pretrained(checkpoint_dir)
+            logging.info("Model configuration loaded successfully.")
+            
+            # Step 2: Load tokenizer and add padding tokens if necessary
+            self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, use_fast=True)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                logging.info("Padding token added to tokenizer.")
+            
+            # Step 3: Use `from_pretrained` with device_map and low-level parameters to prevent meta tensor errors
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
+                checkpoint_dir,
                 config=config,
-                torch_dtype=self.dtype,  # Use float16 precision to reduce memory usage
-                device_map={"": self.device.index},  # Map the entire model to a single GPU
-                low_cpu_mem_usage=True,  # Optimize CPU memory usage
-                ignore_mismatched_sizes=True  # Ignore size mismatches if necessary
+                torch_dtype=torch.float16,  # Use float16 for lower memory usage
+                device_map={"": self.device},  # Ensure the entire model loads to GPU
+                low_cpu_mem_usage=True       # Use low-memory loading mechanism
             )
-            logging.info(f"Model successfully loaded and moved to GPU: {self.device}")
+            logging.info(f"Model loaded successfully on {self.device} using `transformers`.")
     
-            # Step 3: Load the tokenizer associated with the model
-            logging.info("Loading tokenizer...")
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_path,
-                use_fast=True
-            )
-            logging.info("Tokenizer successfully loaded.")
+            # Step 4: Ensure that all tensors are on the GPU and no meta tensors are left
+            for name, param in self.model.named_parameters():
+                if param.device != self.device:
+                    logging.warning(f"Parameter '{name}' is on {param.device}. Moving to {self.device}.")
+                    param.data = param.to(self.device)
     
-            # Step 4: Ensure that the special tokens are set correctly
-            self._ensure_special_tokens(self.tokenizer)
-            logging.info("Special tokens are correctly set for the tokenizer.")
+                if param.is_meta:
+                    raise RuntimeError(f"Parameter '{name}' is still a meta tensor. Initialization failed.")
     
-            # Step 5: Set the model to evaluation mode and ensure all parameters are on the GPU
+            # Step 5: Validate model, set to eval mode, and tie weights if necessary
             self.model.eval()
             logging.info("Model set to evaluation mode.")
+            
+            # Check and tie weights if not tied
+            if not self._verify_tied_weights(self.model):
+                logging.warning("Weights are not tied after initialization. Re-tying weights.")
+                self.model.tie_weights()
     
+            logging.info(f"All model parameters successfully verified on {self.device}.")
             return self.model
     
         except Exception as e:
-            logging.error(f"Failed to initialize model using `transformers`: {str(e)}")
+            logging.error(f"Error during model initialization: {str(e)}")
+            logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model using `transformers` on {self.device}.")
-    
+ 
    
     def _get_submodule_and_param_name(self, model, param_name):
         """Locate the submodule and parameter name for a given full parameter path."""
