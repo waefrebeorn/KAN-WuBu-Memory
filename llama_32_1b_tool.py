@@ -583,9 +583,45 @@ class LLaMA32TensorRTTool:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available. This tool requires a GPU.")
         
-        self.device = torch.device("cuda:0")  # Use the first CUDA device
-        torch.cuda.set_device(self.device)  # Set the default CUDA device
-    
+        # Get the number of available GPUs
+        num_gpus = torch.cuda.device_count()
+        
+        if num_gpus == 0:
+            raise RuntimeError("No CUDA GPUs found.")
+        
+        # Initialize variables to store the best GPU
+        best_gpu_id = -1
+        max_free_memory = 0
+        
+        # Iterate through all available GPUs
+        for gpu_id in range(num_gpus):
+            # Set the current GPU
+            torch.cuda.set_device(gpu_id)
+            
+            # Get the name of the current GPU
+            gpu_name = torch.cuda.get_device_name(gpu_id)
+            
+            # Check if it's an NVIDIA GPU
+            if "NVIDIA" in gpu_name.upper():
+                # Get the amount of free memory on this GPU
+                free_memory = torch.cuda.get_device_properties(gpu_id).total_memory - torch.cuda.memory_allocated(gpu_id)
+                
+                # If this GPU has more free memory than the previous best, update the best GPU
+                if free_memory > max_free_memory:
+                    best_gpu_id = gpu_id
+                    max_free_memory = free_memory
+        
+        if best_gpu_id == -1:
+            raise RuntimeError("No NVIDIA GPUs found.")
+        
+        # Set the device to the best NVIDIA GPU found
+        self.device = torch.device(f"cuda:{best_gpu_id}")
+        torch.cuda.set_device(self.device)
+        
+        logging.info(f"Selected GPU: {torch.cuda.get_device_name(self.device)}")
+        logging.info(f"GPU ID: {best_gpu_id}")
+        logging.info(f"Free memory on selected GPU: {max_free_memory / 1024**3:.2f} GB")
+        
         self.model_path = self._get_model_path()
         self.tokenizer = None
         self.components_initialized = False
