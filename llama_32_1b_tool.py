@@ -879,21 +879,12 @@ class LLaMA32TensorRTTool:
                     file_path = os.path.join(checkpoint_dir, filename)
                     logging.info(f"Loading weights from {file_path}")
                     try:
-                        state_dict = load_file(file_path, device="cpu")  # Load to CPU first
-                        # Use a custom loading function to handle potential shape mismatches
+                        state_dict = load_file(file_path, device=self.device)  # Load directly to GPU
                         self._load_state_dict_with_mismatch_size(model, state_dict)
                         logging.info(f"Weights loaded successfully from {filename}")
                     except Exception as e:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
-                        raise  # Re-raise the exception to stop the process if loading fails
-    
-            # Move the model with loaded weights to GPU
-            model = model.to(self.device)
-            logging.info("Model with loaded weights moved to GPU")
-    
-            # Enable gradient checkpointing for memory efficiency
-            model.gradient_checkpointing_enable()
-            logging.info("Gradient checkpointing enabled")
+                        raise
     
             # Ensure use_cache is set to False
             model.config.use_cache = False
@@ -913,6 +904,7 @@ class LLaMA32TensorRTTool:
                 model.tie_weights()
     
             # Ensure model is on CUDA
+            model = model.to(self.device)
             assert next(model.parameters()).device == self.device, "Model not on CUDA"
     
             logging.info("Model initialized successfully with tied weights on GPU.")
@@ -922,7 +914,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError("Failed to initialize model on GPU.")
-    
+
     def _load_state_dict_with_mismatch_size(self, model, state_dict):
         model_state_dict = model.state_dict()
         for name, param in state_dict.items():
@@ -1287,7 +1279,7 @@ class LLaMA32TensorRTTool:
                 for step in range(max_response_length):
                     try:
                         outputs = self.model(**inputs)
-                        next_token_logits = outputs.logits[:, -1, :].to(self.device)
+                        next_token_logits = outputs.logits[:, -1, :]
     
                         local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
                         total_entropy += local_entropy
@@ -1303,7 +1295,7 @@ class LLaMA32TensorRTTool:
                             break
     
                         response_tokens.append(next_token.item())
-                        inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1).to(self.device)
+                        inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1)
                         inputs['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones((1, 1), device=self.device)], dim=-1)
     
                         del outputs, next_token_logits
@@ -1347,7 +1339,7 @@ class LLaMA32TensorRTTool:
             torch.cuda.empty_cache()
     
         return response_tokens, quality_metrics
-    
+
     
     def ensure_cuda(self, tensor_or_dict):
         if isinstance(tensor_or_dict, torch.Tensor):
@@ -1848,7 +1840,7 @@ class LLaMA32TensorRTTool:
             with self.amp_context:
                 # Move user input to device
                 user_input_tensor = self.tokenizer.encode(user_input, return_tensors='pt')
-                user_input_tensor = self.move_to_device(user_input_tensor, self.device)
+                user_input_tensor = user_input_tensor.to(self.device)
     
                 response_tokens, quality_metrics = self._generate_response(user_input, context)
             
@@ -1874,8 +1866,8 @@ class LLaMA32TensorRTTool:
         interaction_result = self.create_interaction_result(response, refusal_score, lm_loss, refusal_loss, validation_loss)
         self._save_interaction_state(interaction_result)
     
-        return interaction_result    
-    
+        return interaction_result
+        
     def _handle_invalid_response(self):
         logging.warning("Invalid response generated.")
         return {
