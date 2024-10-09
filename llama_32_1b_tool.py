@@ -454,7 +454,7 @@ class EnhancedKAN(nn.Module):
         self.emotional_size = num_emotional_dimensions
         self.vocab_size = vocab_size
         self.influence_scale = 0.01
-        self.model = base_model  
+        self.model = base_model
 
         # Initialize layers directly on the specified device to avoid meta issues
         self.refusal_override = nn.Linear(hidden_size + hidden_size + num_emotional_dimensions, hidden_size, dtype=torch.float16).to(self.device)
@@ -794,7 +794,7 @@ class LLaMA32TensorRTTool:
                 vocab_size = len(self.tokenizer)
     
                 # Initialize KAN (Knowledge-Augmented Network) with half precision
-                self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
+                self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size, self.model)
                 self.kan.to(self.device, dtype=torch.float16)
     
                 if list(self.kan.parameters()):
@@ -1232,19 +1232,17 @@ class LLaMA32TensorRTTool:
             self.kan.to(torch.float16)  # Convert to half precision
             self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
    
-    def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size):
+    def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size, base_model):
         try:
-            # Step 1: Initialize the KAN model directly on the GPU without using `meta` or CPU
-            kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device=self.device).to(self.device, dtype=torch.float16, non_blocking=True)
-
+            # Initialize the KAN model directly on the GPU
+            kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device=self.device, base_model=base_model).to(self.device, dtype=torch.float16, non_blocking=True)
     
-            # Step 2: Verify if all parameters are on the correct GPU device
+            # Verify if all parameters are on the correct GPU device
             for name, param in kan.named_parameters():
                 if param.device != self.device:
                     param.data = param.data.to(self.device, non_blocking=True)
                     logging.info(f"Moved parameter '{name}' to {self.device}.")
     
-            # Step 3: Log successful initialization
             logging.info(f"KAN model successfully initialized and moved to {self.device}.")
     
             return kan
@@ -1256,7 +1254,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Unexpected error initializing KAN: {str(e)}")
             logging.error(traceback.format_exc())
             raise
-    
+            
 
     
             
