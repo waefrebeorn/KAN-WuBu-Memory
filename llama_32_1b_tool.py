@@ -896,25 +896,29 @@ class LLaMA32TensorRTTool:
             # Create an empty model with meta tensors
             with init_empty_weights():
                 self.model = AutoModelForCausalLM.from_config(config)
-                logging.info("Created model with empty weights.")
+                logging.info("Created model with empty weights (meta tensors).")
     
-            # Check if the device is correctly assigned
+            # Ensure device is correctly specified
             if self.device not in ["cpu", "cuda:0", "cuda"]:
                 raise RuntimeError(f"Invalid device specified: {self.device}")
     
-            # Ensure that `cuda:0` is explicitly used for the model's device if self.device is `cuda`
-            target_device = self.device 
+            target_device = self.device
             logging.info(f"Target device for model dispatch: {target_device}")
     
             # Manually map devices for all parts of the model
             device_map = {name: target_device for name, _ in self.model.named_parameters()}
+    
+            # Load checkpoint and dispatch using `accelerate`
+            logging.info(f"Loading model checkpoint and dispatching to device: {target_device}")
             
-            # Load checkpoint and dispatch
+            # Explicitly use `torch.nn.Module.to_empty` to move from meta to the right device
+            self.model.to_empty(device=target_device)
+            
             self.model = load_checkpoint_and_dispatch(
                 self.model,
                 checkpoint=self.model_path,
                 device_map=device_map,
-                no_split_module_classes=["LlamaDecoderLayer"]
+                no_split_module_classes=["LlamaDecoderLayer"],
             )
     
             logging.info(f"Model successfully initialized on device: {target_device}")
@@ -927,7 +931,7 @@ class LLaMA32TensorRTTool:
             # Set the model to evaluation mode
             self.model.eval()
             logging.info("Model set to evaluation mode.")
-            
+    
             return self.model
     
         except Exception as e:
