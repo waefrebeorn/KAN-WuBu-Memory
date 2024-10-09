@@ -889,41 +889,42 @@ class LLaMA32TensorRTTool:
         try:
             logging.info(f"Initializing the model on device: {self.device}")
     
-            # Ensure CUDA availability
+            # Ensure CUDA is available
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA is not available. This tool requires a GPU.")
     
-            # Load the configuration directly
+            # Load configuration
             config = AutoConfig.from_pretrained(self.model_path)
             logging.info(f"Loaded configuration from: {self.model_path}")
     
-            # Initialize the model directly on the specified GPU without using `meta` tensors
-            with torch.device(self.device):
+            # Ensure all tensors are created on the correct device context
+            torch.cuda.set_device(self.device)
+            with torch.cuda.device(self.device):
+                # Set default tensor type to float16 on GPU for initialization
+                torch.set_default_tensor_type(torch.cuda.HalfTensor)
+    
+                # Initialize model directly on GPU
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_path,
                     config=config,
                     torch_dtype=torch.float16,  # Use float16 for memory efficiency
-                    device_map=None,            # Avoid any CPU device mapping
-                    low_cpu_mem_usage=False     # Directly initialize on GPU
+                    device_map=None,            # Avoid CPU mapping
+                    low_cpu_mem_usage=False     # Initialize directly on GPU
                 )
     
-            logging.info(f"Model initialized on {self.device}")
-    
-            # Ensure `lm_head` is correctly assigned to the GPU
-            if hasattr(self.model, "lm_head"):
-                self.model.lm_head.to(self.device)
-                logging.info(f"lm_head moved to GPU: {self.device}")
+            # Ensure critical components like lm_head are on the correct device
+            self._move_to_device(self.model)
     
             # Tie weights if necessary
             if hasattr(self.model, "tie_weights"):
                 self.model.tie_weights()
                 logging.info("Model weights tied successfully.")
     
-            # Set the model to evaluation mode
+            # Set model to evaluation mode
             self.model.eval()
             logging.info("Model set to evaluation mode.")
     
-            # Confirm that all parameters are on GPU
+            # Confirm all parameters are on GPU
             self._validate_model_device_placement()
     
             return self.model
@@ -932,6 +933,24 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model on {self.device}.")
+    
+    def _move_to_device(self, module, device=None):
+        """Move all parameters and buffers of the module to the specified device."""
+        if device is None:
+            device = self.device
+    
+        # Iterate through all submodules and ensure they are on the correct device
+        for name, param in module.named_parameters(recurse=True):
+            if param.device != device:
+                logging.warning(f"Moving parameter '{name}' to device {device}")
+                param.data = param.data.to(device)
+                if param.grad is not None:
+                    param.grad.data = param.grad.data.to(device)
+    
+        for name, buffer in module.named_buffers(recurse=True):
+            if buffer.device != device:
+                logging.warning(f"Moving buffer '{name}' to device {device}")
+                buffer.data = buffer.data.to(device)
     
     def _move_parameters_to_gpu(self):
         """Ensure all model parameters, including `lm_head.weight`, are explicitly moved to the GPU."""
