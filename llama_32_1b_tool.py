@@ -616,6 +616,13 @@ class LLaMA32TensorRTTool:
                 # Initialize KAN with half precision
                 self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
                 self.kan.to(torch.float16)
+                
+                # Add this check
+                if list(self.kan.parameters()):
+                    self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate, eps=1e-8, betas=(0.9, 0.999), weight_decay=0.01)
+                else:
+                    logging.error("KAN model has no parameters. Cannot initialize optimizer.")
+                    raise ValueError("KAN model has no parameters")
                 self.clear_memory()
     
                 # Use a memory-efficient optimizer
@@ -856,7 +863,7 @@ class LLaMA32TensorRTTool:
             self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate)
    
     def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size):
-        logging.info("Initializing KAN...")
+        logging.info(f"Initializing KAN with hidden_size={hidden_size}, num_emotional_dimensions={num_emotional_dimensions}, vocab_size={vocab_size}")
         try:
             kan = EnhancedKAN(
                 hidden_size=hidden_size,
@@ -865,12 +872,14 @@ class LLaMA32TensorRTTool:
                 device=self.device
             )
             kan.to(self.device)
-            logging.info("KAN initialized successfully.")
+            logging.info(f"KAN model structure: {kan}")
+            logging.info(f"KAN parameter count: {sum(p.numel() for p in kan.parameters())}")
             return kan
         except Exception as e:
             logging.error(f"Error initializing KAN: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError("Failed to initialize KAN") from e
+            
             
     def _lazy_initialize_refusal_detector(self):
         if self.refusal_detector is None:
