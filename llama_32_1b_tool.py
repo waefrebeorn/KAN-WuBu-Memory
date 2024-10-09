@@ -884,16 +884,10 @@ class LLaMA32TensorRTTool:
         else:
             return tensor_or_dict
         
-
+    
     def _initialize_model_full_gpu(self):
         try:
             logging.info(f"Initializing the model on device: {self.device}")
-    
-            # Ensure CUDA is available
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA is not available. This tool requires a GPU.")
-    
-            # Load configuration
             config = AutoConfig.from_pretrained(self.model_path)
             logging.info(f"Loaded configuration from: {self.model_path}")
     
@@ -907,13 +901,13 @@ class LLaMA32TensorRTTool:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_path,
                     config=config,
-                    torch_dtype=torch.float16,  # Use float16 for memory efficiency
-                    device_map=None,            # Avoid CPU mapping
-                    low_cpu_mem_usage=False     # Initialize directly on GPU
+                    torch_dtype=torch.float16,
+                    device_map="auto",
+                    low_cpu_mem_usage=True
                 )
     
-            # Ensure critical components like lm_head are on the correct device
-            self._move_to_device(self.model)
+            # Explicitly move the entire model to the desired device
+            self.model = self.model.to(self.device)
     
             # Tie weights if necessary
             if hasattr(self.model, "tie_weights"):
@@ -933,7 +927,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model on {self.device}.")
-    
+        
     def _move_to_device(self, module, device=None):
         """Move all parameters and buffers of the module to the specified device."""
         if device is None:
@@ -966,9 +960,9 @@ class LLaMA32TensorRTTool:
             raise
     
     def _validate_model_device_placement(self):
-        """Check if all parameters are on the specified GPU device."""
         for name, param in self.model.named_parameters():
             if param.device != self.device:
+                logging.error(f"Parameter '{name}' is on {param.device}, expected {self.device}")
                 raise RuntimeError(f"Parameter '{name}' is not on the expected device: {self.device}. Found on {param.device}.")
         logging.info("All model parameters are correctly placed on the specified GPU device.")
         
