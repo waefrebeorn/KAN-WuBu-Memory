@@ -894,22 +894,29 @@ class LLaMA32TensorRTTool:
             model.eval()
             logging.info("Model set to evaluation mode")
     
-            # Set model dtype to float16
-            model = model.to(dtype=torch.float16)
-            logging.info("Model converted to float16")
+            # Set model dtype to float16 and ensure it's on the correct device
+            model = model.to(device=self.device, dtype=torch.float16)
+            logging.info(f"Model converted to float16 and moved to {self.device}")
     
             # Verify that weights are tied
             if not self._verify_tied_weights(model):
                 logging.warning("Weights are not tied after initialization. Re-tying weights.")
                 model.tie_weights()
     
-            logging.info(f"Model initialized successfully with tied weights on {self.device}.")
+            # Verify all model parameters are on the correct device
+            for name, param in model.named_parameters():
+                if param.device != self.device:
+                    raise RuntimeError(f"Parameter '{name}' is on {param.device}, expected {self.device}")
+    
+            logging.info(f"All model parameters verified to be on {self.device}")
+    
             return model
     
         except Exception as e:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model on {self.device}.")
+            
             
     def _load_state_dict_with_mismatch_size(self, model, state_dict):
         model_state_dict = model.state_dict()
@@ -1271,7 +1278,7 @@ class LLaMA32TensorRTTool:
             stop_sequences = [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]
             max_response_length = 2000
     
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
                 for step in range(max_response_length):
                     try:
                         outputs = self.model(**inputs)
@@ -1294,7 +1301,8 @@ class LLaMA32TensorRTTool:
                         inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1)
                         inputs['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones((1, 1), device=self.device)], dim=-1)
     
-                        del outputs, next_token_logits
+                        # Explicitly delete tensors and clear CUDA cache
+                        del outputs, next_token_logits, next_token
                         torch.cuda.empty_cache()
     
                     except RuntimeError as e:
@@ -1302,12 +1310,11 @@ class LLaMA32TensorRTTool:
                             logging.warning(f"CUDA out of memory at step {step}. Attempting to recover...")
                             torch.cuda.empty_cache()
                             if step > 0:
-                                # Try to continue with what we have so far
                                 break
                             else:
-                                # If we're at the first step, we need to raise the error
                                 raise
                         else:
+                            logging.error(f"RuntimeError during generation: {str(e)}")
                             raise
     
             avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
@@ -1328,14 +1335,12 @@ class LLaMA32TensorRTTool:
         except Exception as e:
             logging.error(f"Unexpected error during generation: {str(e)}")
             logging.error(traceback.format_exc())
-            raise
+            return [], {"error": str(e)}  # Return empty tokens and error metric instead of raising
     
         finally:
             # Ensure we always clean up, even if an exception occurs
             torch.cuda.empty_cache()
-    
-        return response_tokens, quality_metrics
-
+            
     
     def ensure_cuda(self, tensor_or_dict):
         if isinstance(tensor_or_dict, torch.Tensor):
