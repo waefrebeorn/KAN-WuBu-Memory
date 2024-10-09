@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.cuda.amp as amp
 from safetensors.torch import load_file
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from accelerate import init_empty_weights, load_checkpoint_and_dispatch, load_file
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 import logging
 from pathlib import Path
 import json
