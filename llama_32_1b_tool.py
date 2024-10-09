@@ -871,7 +871,7 @@ class LLaMA32TensorRTTool:
     
             # Move the empty model to GPU using to_empty()
             model = model.to_empty(device=self.device)
-            logging.info("Empty model moved to GPU")
+            logging.info(f"Empty model moved to device: {self.device}")
     
             # Load the model weights using SafeTensors
             for filename in os.listdir(checkpoint_dir):
@@ -879,7 +879,9 @@ class LLaMA32TensorRTTool:
                     file_path = os.path.join(checkpoint_dir, filename)
                     logging.info(f"Loading weights from {file_path}")
                     try:
-                        state_dict = load_file(file_path, device=self.device)  # Load directly to GPU
+                        # Load the state dict to CPU first, then move to GPU
+                        state_dict = load_file(file_path, device="cpu")
+                        state_dict = {k: v.to(self.device) for k, v in state_dict.items()}
                         self._load_state_dict_with_mismatch_size(model, state_dict)
                         logging.info(f"Weights loaded successfully from {filename}")
                     except Exception as e:
@@ -905,16 +907,16 @@ class LLaMA32TensorRTTool:
     
             # Ensure model is on CUDA
             model = model.to(self.device)
-            assert next(model.parameters()).device == self.device, "Model not on CUDA"
+            assert next(model.parameters()).device == self.device, f"Model not on {self.device}"
     
-            logging.info("Model initialized successfully with tied weights on GPU.")
+            logging.info(f"Model initialized successfully with tied weights on {self.device}.")
             return model
     
         except Exception as e:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
-            raise RuntimeError("Failed to initialize model on GPU.")
-
+            raise RuntimeError(f"Failed to initialize model on {self.device}.")
+            
     def _load_state_dict_with_mismatch_size(self, model, state_dict):
         model_state_dict = model.state_dict()
         for name, param in state_dict.items():
