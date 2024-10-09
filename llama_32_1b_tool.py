@@ -881,64 +881,54 @@ class LLaMA32TensorRTTool:
         
 
     def _initialize_model_full_gpu(self):
-        logging.info("Attempting full GPU initialization using `transformers` library...")
-    
-        checkpoint_dir = str(self.model_path)
-        logging.info(f"Checkpoint directory: {checkpoint_dir}")
-    
         try:
-            # Step 1: Load configuration
-            config = AutoConfig.from_pretrained(checkpoint_dir)
-            logging.info("Model configuration loaded successfully.")
+            logging.info(f"Initializing the model on device: {self.device}")
+    
+            # Load configuration first
+            config = AutoConfig.from_pretrained(self.model_path)
+            logging.info(f"Loaded configuration from: {self.model_path}")
+    
+            # Create an empty model with meta tensors
+            with init_empty_weights():
+                self.model = AutoModelForCausalLM.from_config(config)
+                logging.info("Created model with empty weights.")
+    
+            # Check if the device is correctly assigned
+            if self.device not in ["cpu", "cuda:0", "cuda"]:
+                raise RuntimeError(f"Invalid device specified: {self.device}")
+    
+            # Ensure that `cuda:0` is explicitly used for the model's device if self.device is `cuda`
+            target_device = self.device if "cuda" in self.device else "cuda:0"
+            logging.info(f"Target device for model dispatch: {target_device}")
+    
+            # Manually map devices for all parts of the model
+            device_map = {name: target_device for name, _ in self.model.named_parameters()}
             
-            # Step 2: Use to_empty() to pre-allocate space on GPU for the model with meta tensors
-            with torch.no_grad():
-                with init_empty_weights():
-                    # Use init_empty_weights to set up an empty meta tensor model
-                    self.model = AutoModelForCausalLM.from_config(config)
-    
-            logging.info("Model meta-configuration created with empty weights.")
-    
-            # Step 3: Load the weights safely using `accelerate`
+            # Load checkpoint and dispatch
             self.model = load_checkpoint_and_dispatch(
                 self.model,
-                checkpoint=checkpoint_dir,
-                device_map={"": self.device},
+                checkpoint=self.model_path,
+                device_map=device_map,
                 no_split_module_classes=["LlamaDecoderLayer"]
             )
     
-            logging.info(f"Model weights successfully loaded and dispatched on {self.device}.")
+            logging.info(f"Model successfully initialized on device: {target_device}")
     
-            # Step 4: Manually tie weights if needed
-            self._update_model_for_tokenizer()
+            # Tie weights if necessary
+            if not self.model.is_tied():
+                self.model.tie_weights()
+                logging.info("Model weights tied successfully.")
     
-            # Step 5: Ensure lm_head is properly initialized and on the right device
-            if 'lm_head.weight' in [name for name, _ in self.model.named_parameters()]:
-                logging.info("`lm_head.weight` found in model parameters.")
-            else:
-                logging.warning("`lm_head.weight` missing in loaded model. Manually initializing `lm_head`.")
-                self.model.lm_head.weight = torch.nn.Parameter(
-                    torch.empty((self.model.config.vocab_size, self.model.config.hidden_size), device=self.device)
-                )
-                torch.nn.init.xavier_uniform_(self.model.lm_head.weight)
-                logging.info("`lm_head.weight` manually initialized.")
-    
-            # Step 6: Set the model to evaluation mode and verify all tensors are on GPU
+            # Set the model to evaluation mode
             self.model.eval()
             logging.info("Model set to evaluation mode.")
             
-            # Verify all parameters are on the expected device
-            for name, param in self.model.named_parameters():
-                if param.device != self.device:
-                    param.data = param.to(self.device)
-    
-            logging.info(f"All model parameters successfully verified on {self.device}.")
             return self.model
     
         except Exception as e:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
-            raise RuntimeError(f"Failed to initialize model using `transformers` on {self.device}.")
+            raise RuntimeError(f"Failed to initialize model on {self.device}.")
     
     # Supporting Methods for Tokenizer and Parameter Handling
     def _update_model_for_tokenizer(self):
