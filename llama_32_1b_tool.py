@@ -646,7 +646,7 @@ class LLaMA32TensorRTTool:
                 self.clear_memory()
     
                 # Set up gradient scaler for mixed precision training
-                self.scaler = torch.cuda.amp.GradScaler()
+                self.scaler = torch.amp.GradScaler('cuda')
     
                 self.components_initialized = True
                 logging.info("All components initialized successfully on GPU.")
@@ -839,11 +839,35 @@ class LLaMA32TensorRTTool:
                 model_max_length=131072,
             )
             logging.info("Tokenizer initialized successfully.")
+    
+            # Ensure the special tokens are set correctly
+            self._ensure_special_tokens(tokenizer)
+            
             return tokenizer
         except Exception as e:
             logging.error(f"Failed to initialize tokenizer: {str(e)}")
             logging.error(traceback.format_exc())
             return None
+    
+    def _ensure_special_tokens(self, tokenizer):
+        special_tokens = {
+            'pad_token': "<|finetune_right_pad_id|>",
+            'eos_token': "<|eot_id|>"
+        }
+    
+        # Check if pad_token or other special tokens are missing and add them
+        if tokenizer.pad_token is None or tokenizer.pad_token != special_tokens['pad_token']:
+            tokenizer.add_special_tokens({'pad_token': special_tokens['pad_token']})
+            logging.info(f"Added custom pad token: {special_tokens['pad_token']}")
+    
+        if tokenizer.eos_token is None or tokenizer.eos_token != special_tokens['eos_token']:
+            tokenizer.add_special_tokens({'eos_token': special_tokens['eos_token']})
+            logging.info(f"Added custom eos token: {special_tokens['eos_token']}")
+    
+        # Save tokenizer configuration if updated
+        tokenizer.save_pretrained(self.model_path)
+        logging.info("Tokenizer saved with updated special tokens.")
+    
     
             
 
@@ -1198,7 +1222,7 @@ class LLaMA32TensorRTTool:
         try:
             print(f"Corrected input shape: {input_ids.shape}, Target shape: {target_ids.shape}")
     
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True, use_cache=False)
     
                 if isinstance(outputs, tuple):
