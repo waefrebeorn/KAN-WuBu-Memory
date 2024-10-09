@@ -906,7 +906,7 @@ class LLaMA32TensorRTTool:
                         for param_name, param in state_dict.items():
                             if param_name in model.state_dict():
                                 if model.state_dict()[param_name].is_meta:
-                                    # Initialize and move to GPU if the parameter is still a meta tensor
+                                    # Initialize the meta tensor and move to GPU
                                     model.get_parameter(param_name).data = param.to(self.device)
                                     logging.info(f"Initialized and moved parameter '{param_name}' to {self.device}")
                                 else:
@@ -920,9 +920,12 @@ class LLaMA32TensorRTTool:
             for name, param in model.named_parameters():
                 if param.device != self.device:
                     if param.is_meta:
-                        # If it's still a meta tensor, initialize with empty values and move
+                        # If it's still a meta tensor, initialize with an empty tensor with correct properties
                         logging.warning(f"Parameter '{name}' is still a meta tensor. Initializing it now.")
-                        param.data = torch.empty(param.shape, dtype=param.dtype, device=self.device)
+                        param_dtype = torch.float16 if "float" in str(param.dtype) else param.dtype
+                        param_shape = param.shape
+                        param_device = self.device
+                        param.data = torch.empty(param_shape, dtype=param_dtype, device=param_device)
                         logging.info(f"Initialized meta tensor '{name}' with empty values and moved to {self.device}")
                     else:
                         param.data = param.data.to(self.device)
@@ -967,7 +970,8 @@ class LLaMA32TensorRTTool:
                     if param.is_meta:
                         # Initialize and move any remaining meta tensors
                         logging.warning(f"Parameter '{name}' is still a meta tensor. Initializing it now.")
-                        param.data = torch.empty(param.shape, dtype=param.dtype, device=self.device)
+                        param_dtype = torch.float16 if "float" in str(param.dtype) else param.dtype
+                        param.data = torch.empty(param.shape, dtype=param_dtype, device=self.device)
                         logging.info(f"Initialized meta tensor '{name}' with empty values and moved to {self.device}")
                     else:
                         param.data = param.data.to(self.device)
