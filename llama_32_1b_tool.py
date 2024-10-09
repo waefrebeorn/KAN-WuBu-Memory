@@ -879,7 +879,7 @@ class LLaMA32TensorRTTool:
         else:
             return tensor_or_dict
         
-        
+
     def _initialize_model_full_gpu(self):
         logging.info("Attempting full GPU initialization using `transformers` library...")
     
@@ -887,27 +887,32 @@ class LLaMA32TensorRTTool:
         logging.info(f"Checkpoint directory: {checkpoint_dir}")
     
         try:
-            # Step 1: Load configuration and tokenizer
+            # Step 1: Load configuration
             config = AutoConfig.from_pretrained(checkpoint_dir)
             logging.info("Model configuration loaded successfully.")
             
-            # Step 2: Load tokenizer and add padding tokens if necessary
-            self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, use_fast=True)
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-                logging.info("Padding token added to tokenizer.")
-            
-            # Step 3: Use `from_pretrained` with device_map and low-level parameters to prevent meta tensor errors
-            self.model = AutoModelForCausalLM.from_pretrained(
-                checkpoint_dir,
-                config=config,
-                torch_dtype=torch.float16,  # Use float16 for lower memory usage
-                device_map={"": self.device},  # Ensure the entire model loads to GPU
-                low_cpu_mem_usage=True       # Use low-memory loading mechanism
-            )
-            logging.info(f"Model loaded successfully on {self.device} using `transformers`.")
+            # Step 2: Use to_empty() to pre-allocate space on GPU for the model with meta tensors
+            with torch.no_grad():
+                with init_empty_weights():
+                    # Use init_empty_weights to set up an empty meta tensor model
+                    self.model = AutoModelForCausalLM.from_config(config)
     
-            # Step 4: Handle `lm_head.weight` if not loaded
+            logging.info("Model meta-configuration created with empty weights.")
+    
+            # Step 3: Load the weights safely using `accelerate`
+            self.model = load_checkpoint_and_dispatch(
+                self.model,
+                checkpoint=checkpoint_dir,
+                device_map={"": self.device},
+                no_split_module_classes=["LlamaDecoderLayer"]
+            )
+    
+            logging.info(f"Model weights successfully loaded and dispatched on {self.device}.")
+    
+            # Step 4: Manually tie weights if needed
+            self._update_model_for_tokenizer()
+    
+            # Step 5: Ensure lm_head is properly initialized and on the right device
             if 'lm_head.weight' in [name for name, _ in self.model.named_parameters()]:
                 logging.info("`lm_head.weight` found in model parameters.")
             else:
@@ -918,23 +923,14 @@ class LLaMA32TensorRTTool:
                 torch.nn.init.xavier_uniform_(self.model.lm_head.weight)
                 logging.info("`lm_head.weight` manually initialized.")
     
-            # Step 5: Ensure that all tensors are on the GPU and no meta tensors are left
-            for name, param in self.model.named_parameters():
-                if param.device != self.device:
-                    logging.warning(f"Parameter '{name}' is on {param.device}. Moving to {self.device}.")
-                    param.data = param.to(self.device)
-    
-                if param.is_meta:
-                    raise RuntimeError(f"Parameter '{name}' is still a meta tensor. Initialization failed.")
-    
-            # Step 6: Validate model, set to eval mode, and tie weights if necessary
+            # Step 6: Set the model to evaluation mode and verify all tensors are on GPU
             self.model.eval()
             logging.info("Model set to evaluation mode.")
-    
-            # Check and tie weights if not tied
-            if not self._verify_tied_weights(self.model):
-                logging.warning("Weights are not tied after initialization. Re-tying weights.")
-                self.model.tie_weights()
+            
+            # Verify all parameters are on the expected device
+            for name, param in self.model.named_parameters():
+                if param.device != self.device:
+                    param.data = param.to(self.device)
     
             logging.info(f"All model parameters successfully verified on {self.device}.")
             return self.model
@@ -943,7 +939,37 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model using `transformers` on {self.device}.")
-
+    
+    # Supporting Methods for Tokenizer and Parameter Handling
+    def _update_model_for_tokenizer(self):
+        if self.model is not None:
+            try:
+                # Get the current embedding layer
+                old_embeddings = self.model.get_input_embeddings()
+    
+                # Create new embeddings with the correct size
+                new_num_tokens = len(self.tokenizer)
+                new_embeddings = torch.nn.Embedding(new_num_tokens, old_embeddings.embedding_dim)
+    
+                # Copy the weights for the existing tokens
+                num_tokens_to_copy = min(old_embeddings.num_embeddings, new_num_tokens)
+                new_embeddings.weight.data[:num_tokens_to_copy, :] = old_embeddings.weight.data[:num_tokens_to_copy, :]
+    
+                # Set the new embedding layer and tie weights if necessary
+                self.model.set_input_embeddings(new_embeddings)
+                self.model.tie_weights()
+                logging.info(f"Model embeddings resized to {new_num_tokens}")
+    
+                # Set pad_token_id in model config
+                self.model.config.pad_token_id = self.tokenizer.pad_token_id
+                logging.info(f"Set pad_token_id in model config: {self.model.config.pad_token_id}")
+    
+            except Exception as e:
+                logging.error(f"Failed to update model for tokenizer: {str(e)}")
+                logging.error(traceback.format_exc())
+        else:
+            logging.warning("Model not initialized YET. Delaying loading model-specific tokenizer updates.")
+    
    
     def _get_submodule_and_param_name(self, model, param_name):
         """Locate the submodule and parameter name for a given full parameter path."""
