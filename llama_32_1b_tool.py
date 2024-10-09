@@ -884,6 +884,16 @@ class LLaMA32TensorRTTool:
         if self.entropy_manager is None:
             logging.info("Lazy initializing Entropy Manager...")
             self.entropy_manager = self._initialize_entropy_manager()
+            
+    def _initialize_refusal_detector(self):
+        if self.refusal_detector is None:
+            logging.info(" initializing Refusal Detector...")
+            self.refusal_detector = self._initialize_refusal_detector()
+    
+    def _initialize_entropy_manager(self):
+        if self.entropy_manager is None:
+            logging.info(" initializing Entropy Manager...")
+            self.entropy_manager = self._initialize_entropy_manager()            
 
     def _initialize_memory_manager(self):
         return AdvancedMemoryManager(2048, self.tokenizer, self.device)
