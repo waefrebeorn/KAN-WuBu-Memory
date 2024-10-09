@@ -910,14 +910,17 @@ class LLaMA32TensorRTTool:
    
     def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size):
         try:
+            # Initialize the KAN model with `meta` tensor placeholders
             kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device='meta')
-            # Move it to the desired device explicitly after creation
-            kan = kan.to(self.device)  # Replace `to_empty` with direct `to`
-            logging.info(f"KAN model successfully moved to {self.device}")
+            
+            # Use `to_empty` to move the model to the desired device without copying data from `meta`
+            kan = kan.to_empty(device=self.device)
+            logging.info(f"KAN model successfully moved to {self.device} using `to_empty`.")
             return kan
         except Exception as e:
             logging.error(f"Error initializing KAN: {str(e)}")
             raise
+
     
             
             
