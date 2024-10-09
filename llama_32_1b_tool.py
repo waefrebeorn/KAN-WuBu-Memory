@@ -339,10 +339,10 @@ class EnhancedKAN(nn.Module):
         self.input_size = hidden_size + hidden_size + num_emotional_dimensions
         self.vocab_size = vocab_size
         self.influence_scale = 0.01
-        
-        # Initialize layers directly instead of using lazy initialization
-        self.refusal_override = nn.Linear(self.input_size, self.hidden_size, dtype=self.dtype).to(self.device)
-        self.output_modifier = nn.Linear(self.hidden_size, self.vocab_size, dtype=self.dtype).to(self.device)
+
+        # Correctly initialize layers with device
+        self.refusal_override = nn.Linear(self.input_size, self.hidden_size, dtype=self.dtype, device=self.device)
+        self.output_modifier = nn.Linear(self.hidden_size, self.vocab_size, dtype=self.dtype, device=self.device)
 
     @torch.jit.script_method
     def optimize_memory(self):
@@ -859,13 +859,11 @@ class LLaMA32TensorRTTool:
     def _initialize_kan(self, hidden_size, num_emotional_dimensions, vocab_size):
         logging.info(f"Initializing KAN with hidden_size={hidden_size}, num_emotional_dimensions={num_emotional_dimensions}, vocab_size={vocab_size}")
         try:
-            kan = EnhancedKAN(
-                hidden_size=hidden_size,
-                num_emotional_dimensions=num_emotional_dimensions,
-                vocab_size=vocab_size,
-                device=self.device
-            )
-            kan.to(self.device)
+            # Create KAN on meta device first
+            kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device='meta')
+            # Use to_empty to move it to the correct device
+            kan = kan.to_empty(device=self.device)
+    
             logging.info(f"KAN model structure: {kan}")
             logging.info(f"KAN parameter count: {sum(p.numel() for p in kan.parameters())}")
             return kan
@@ -873,6 +871,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error initializing KAN: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError("Failed to initialize KAN") from e
+    
             
             
     def _lazy_initialize_refusal_detector(self):
