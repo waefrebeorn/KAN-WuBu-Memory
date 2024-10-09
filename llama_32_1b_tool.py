@@ -869,9 +869,9 @@ class LLaMA32TensorRTTool:
                 model = AutoModelForCausalLM.from_config(config)
             logging.info("Model initialized with empty weights")
     
-            # Move the empty model to GPU using to_empty()
-            model = model.to_empty(device=self.device)
-            logging.info(f"Empty model moved to device: {self.device}")
+            # Instead of using to_empty(), we'll initialize the model on CPU first
+            model = model.to('cpu')
+            logging.info("Model moved to CPU for initialization")
     
             # Load the model weights using SafeTensors
             for filename in os.listdir(checkpoint_dir):
@@ -886,6 +886,10 @@ class LLaMA32TensorRTTool:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
                         raise
     
+            # Now move the entire model to GPU and convert to float16
+            model = model.to(device=self.device, dtype=torch.float16)
+            logging.info(f"Model converted to float16 and moved to {self.device}")
+    
             # Ensure use_cache is set to False
             model.config.use_cache = False
             logging.info("use_cache set to False")
@@ -893,10 +897,6 @@ class LLaMA32TensorRTTool:
             # Set model to evaluation mode
             model.eval()
             logging.info("Model set to evaluation mode")
-    
-            # Set model dtype to float16 and ensure it's on the correct device
-            model = model.to(device=self.device, dtype=torch.float16)
-            logging.info(f"Model converted to float16 and moved to {self.device}")
     
             # Verify that weights are tied
             if not self._verify_tied_weights(model):
