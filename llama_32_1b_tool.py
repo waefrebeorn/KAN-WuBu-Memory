@@ -456,16 +456,17 @@ class EnhancedKAN(nn.Module):
         self.influence_scale = 0.01
         self.model = base_model
 
-        # Initialize layers without moving to device yet
+        # Initialize layers on CPU
         self.refusal_override = nn.Linear(hidden_size + hidden_size + num_emotional_dimensions, hidden_size)
         self.output_modifier = nn.Linear(hidden_size, vocab_size)
 
-    def to_empty(self, device):
+    def to(self, device):
+        super().to(device)
         self.device = device
-        self = super().to(device)
-        self.refusal_override = self.refusal_override.to_empty(device=device)
-        self.output_modifier = self.output_modifier.to_empty(device=device)
+        self.refusal_override = self.refusal_override.to(device)
+        self.output_modifier = self.output_modifier.to(device)
         return self
+
 
     def forward(self, hidden_states, user_intent, emotional_state):
         try:
@@ -782,13 +783,15 @@ class LLaMA32TensorRTTool:
                 # Ensure the model is compatible with the tokenizer
                 self._update_model_for_tokenizer()
     
+                # Tie weights after moving to device
+                self.model.tie_weights()
+    
                 # Get the vocabulary size for KAN initialization
                 vocab_size = len(self.tokenizer)
     
                 # Initialize KAN (Knowledge-Augmented Network) with half precision
                 self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size, self.model)
-                self.kan.to(self.device, dtype=torch.float16)
-    
+                
                 if list(self.kan.parameters()):
                     self.optimizer = torch.optim.AdamW(
                         self.kan.parameters(),
@@ -861,7 +864,6 @@ class LLaMA32TensorRTTool:
         # If initialization fails after maximum attempts, log an error and exit
         logging.error("Failed to initialize components after maximum attempts.")
         raise RuntimeError("Component initialization failed after multiple GPU-only attempts")
-
  
     def clear_memory(self):
         torch.cuda.empty_cache()
@@ -886,12 +888,13 @@ class LLaMA32TensorRTTool:
     
             config = AutoConfig.from_pretrained(self.model_path)
             
-            # Use device_map='auto' for better handling of large models
+            # Use device_map='auto' and load in 8-bit to reduce memory usage
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 config=config,
-                torch_dtype=torch.float16,
                 device_map='auto',
+                load_in_8bit=True,
+                torch_dtype=torch.float16,
                 low_cpu_mem_usage=True,
             )
     
@@ -899,6 +902,9 @@ class LLaMA32TensorRTTool:
             
             # Ensure all model parameters are on the correct device
             model = model.to(self.device)
+            
+            # Tie weights after moving to device
+            model.tie_weights()
             
             logging.info("Model loaded successfully on GPU and set to evaluation mode.")
             
@@ -1218,8 +1224,8 @@ class LLaMA32TensorRTTool:
             # Initialize the KAN model
             kan = EnhancedKAN(hidden_size, num_emotional_dimensions, vocab_size, device='cpu', base_model=base_model)
             
-            # Move the model to GPU using to_empty() to avoid copying uninitialized data
-            kan = kan.to_empty(device=self.device)
+            # Move the model to GPU using to() instead of to_empty()
+            kan = kan.to(self.device)
             
             # Initialize parameters on the GPU
             for name, param in kan.named_parameters():
@@ -1232,12 +1238,8 @@ class LLaMA32TensorRTTool:
     
             logging.info(f"KAN model successfully initialized and moved to {self.device}.")
             return kan
-        except RuntimeError as re:
-            logging.error(f"Runtime Error during KAN initialization: {str(re)}")
-            logging.error(traceback.format_exc())
-            raise
         except Exception as e:
-            logging.error(f"Unexpected error initializing KAN: {str(e)}")
+            logging.error(f"Error during KAN initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise
             
