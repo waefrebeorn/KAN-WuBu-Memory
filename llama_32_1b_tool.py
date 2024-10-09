@@ -880,53 +880,58 @@ class LLaMA32TensorRTTool:
             return tensor_or_dict
         
     def _initialize_model_full_gpu(self):
-        logging.info("Attempting full GPU initialization with enforced max_memory...")
+        logging.info("Attempting full GPU initialization with enforced max_memory for LLama 3.2 1B Instruct model...")
     
         checkpoint_dir = str(self.model_path)
         logging.info(f"Checkpoint directory: {checkpoint_dir}")
     
         try:
-            # Initialize model with empty weights
+            # Step 1: Initialize model with empty weights using the config
             config = AutoConfig.from_pretrained(checkpoint_dir)
             with init_empty_weights():
                 model = AutoModelForCausalLM.from_config(config)
             logging.info("Model initialized with empty weights")
     
-            # Use to_empty() to move the model to GPU without initializing weights
+            # Step 2: Use to_empty() to move the model to GPU without initializing weights
             model = model.to_empty(device=self.device)
             logging.info(f"Empty model structure moved to device: {self.device}")
     
-            # Load the model weights using SafeTensors directly to GPU
+            # Step 3: Load the model weights using SafeTensors directly to GPU
             for filename in os.listdir(checkpoint_dir):
                 if filename.endswith('.safetensors'):
                     file_path = os.path.join(checkpoint_dir, filename)
                     logging.info(f"Loading weights from {file_path}")
                     try:
-                        state_dict = load_file(file_path, device="cpu")
+                        state_dict = load_file(file_path, device="cpu")  # Temporarily load to CPU for safety checks
                         for param_name, param in state_dict.items():
                             if param_name in model.state_dict():
                                 if model.state_dict()[param_name].is_meta:
-                                    # Initialize the meta tensor
-                                    model.get_parameter(param_name).data = param.to(self.device)
-                                    logging.info(f"Initialized and moved parameter '{param_name}' to {self.device}")
-                                else:
-                                    model.state_dict()[param_name].copy_(param.to(self.device))
+                                    # Correctly initialize meta tensors with the proper shape and dtype
+                                    logging.warning(f"Parameter '{param_name}' is a meta tensor. Initializing it now.")
+                                    initialized_param = torch.empty(param.shape, dtype=param.dtype, device=self.device)
+                                    model.get_parameter(param_name).data = initialized_param  # Set initialized tensor
+                                    logging.info(f"Initialized and moved meta parameter '{param_name}' to {self.device}")
+                                # Load weights into the GPU directly
+                                model.state_dict()[param_name].copy_(param.to(self.device))
                         logging.info(f"Weights loaded successfully from {filename}")
                     except Exception as e:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
                         raise
     
-            # Move all existing parameters to the correct device
+            # Step 4: Move all existing parameters to the correct device and handle meta tensors
             for name, param in model.named_parameters():
                 if param.device != self.device:
                     if param.is_meta:
-                        # If it's still a meta tensor, log a warning
-                        logging.warning(f"Parameter '{name}' is still a meta tensor and cannot be moved.")
+                        # Attempt to initialize and move the meta tensor
+                        logging.warning(f"Parameter '{name}' is still a meta tensor. Initializing it now.")
+                        initialized_param = torch.empty(param.shape, dtype=param.dtype, device=self.device)
+                        param.data = initialized_param  # Set initialized tensor
+                        logging.info(f"Initialized and moved meta parameter '{name}' to {self.device}")
                     else:
                         param.data = param.data.to(self.device)
                         logging.info(f"Moved parameter '{name}' to {self.device}")
     
-            # Ensure use_cache is set to False
+            # Step 5: Set model configurations and finalize setup
             model.config.use_cache = False
             logging.info("use_cache set to False")
     
@@ -938,7 +943,7 @@ class LLaMA32TensorRTTool:
             model = model.to(dtype=torch.float16)
             logging.info("Model converted to float16")
     
-            # Verify that weights are tied
+            # Verify that weights are tied properly
             if not self._verify_tied_weights(model):
                 logging.warning("Weights are not tied after initialization. Re-tying weights.")
                 model.tie_weights()
@@ -957,33 +962,7 @@ class LLaMA32TensorRTTool:
         except Exception as e:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
-    
-            # Attempt to move any remaining parameters to GPU
-            logging.info("Attempting to move any remaining parameters to GPU...")
-            for name, param in model.named_parameters():
-                if param.device != self.device:
-                    if not param.is_meta:  # Move only if it's not a meta tensor
-                        param.data = param.data.to(self.device)
-                        logging.info(f"Moved parameter '{name}' to {self.device}")
-                    else:
-                        logging.warning(f"Parameter '{name}' is still a meta tensor and cannot be moved.")
-    
-            # Retry the initialization to verify if the model can now be initialized
-            try:
-                logging.info("Retrying model initialization after moving parameters...")
-                for name, param in model.named_parameters():
-                    if param.device != self.device:
-                        raise RuntimeError(f"Parameter '{name}' is on {param.device}, expected {self.device}")
-                    if param.is_meta:
-                        raise RuntimeError(f"Parameter '{name}' is still a meta tensor")
-    
-                logging.info(f"Model initialized successfully on {self.device} after retrying.")
-                return model
-    
-            except Exception as retry_error:
-                logging.error(f"Retry initialization failed: {str(retry_error)}")
-                logging.error(traceback.format_exc())
-                raise RuntimeError(f"Failed to initialize model on {self.device}.")
+            raise RuntimeError(f"Failed to initialize model on {self.device}.")
     
             
     def _load_state_dict_with_mismatch_size(self, model, state_dict):
