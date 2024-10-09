@@ -681,7 +681,7 @@ class LLaMA32TensorRTTool:
         self.tensor_swapper = None
     
         self.scaler = torch.cuda.amp.GradScaler()
-        self.amp_context = torch.cuda.amp.autocast(dtype=torch.float16)
+        self.amp_context = torch.cuda.amp.autocast(dtype=torch.float32)
     
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
