@@ -618,7 +618,7 @@ class LLaMA32TensorRTTool:
         self.tensor_swapper = None
     
         self.scaler = torch.cuda.amp.GradScaler()
-        self.amp_context = torch.cuda.amp.autocast(dtype=torch.float16, device_type='cuda')
+        self.amp_context = torch.cuda.amp.autocast(dtype=torch.float16)
     
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
@@ -823,6 +823,9 @@ class LLaMA32TensorRTTool:
             if not self._verify_tied_weights(model):
                 logging.warning("Weights are not tied after initialization. Re-tying weights.")
                 model.tie_weights()
+    
+            # Ensure model is on CUDA
+            assert next(model.parameters()).is_cuda, "Model not on CUDA"
     
             logging.info("Model initialized successfully with tied weights on GPU.")
             return model
@@ -1627,7 +1630,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Unexpected Error during KAN training step: {str(e)}")
             logging.error(traceback.format_exc())
             return 0.0, 0.0
-            
+        
        
     def validate_kan(self):
         if len(self.memory_manager.sliding_window) < 2:
