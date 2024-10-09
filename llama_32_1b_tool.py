@@ -1364,7 +1364,7 @@ class LLaMA32TensorRTTool:
                     response_tokens.append(next_token.item())
                     inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1)
                     inputs['attention_mask'] = torch.cat([inputs['attention_mask'], 
-                                                        torch.ones((1, 1), device=self.device)], dim=-1)
+                                                            torch.ones((1, 1), device=self.device)], dim=-1)
     
                 except RuntimeError as e:
                     # Check if it's a CUDA OOM error or a device mismatch
@@ -1381,11 +1381,15 @@ class LLaMA32TensorRTTool:
                         continue  # Retry the current generation step
     
                     else:
-                        logging.error(f"Unexpected RuntimeError during generation: {str(e)}")
-                        raise  # Re-raise if it's a different error
+                        logging.error(f"RuntimeError during generation: {str(e)}")
+                        logging.error(traceback.format_exc())
+                        # Attempt to move all inputs to GPU if a device mismatch occurs
+                        self.ensure_cuda(inputs)
+                        continue  # Retry the current generation step
     
                 except Exception as e:
                     logging.error(f"Unexpected error during generation: {str(e)}")
+                    logging.error(traceback.format_exc())
                     raise  # Re-raise for unhandled exceptions
     
         avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
