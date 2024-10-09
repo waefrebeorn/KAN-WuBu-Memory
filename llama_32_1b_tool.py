@@ -134,8 +134,16 @@ class EmotionalState:
                 return "Sad" if dominance > 0 else "Depressed"
 
     def get_embedding(self, batch_size=1):
-        # Ensure the embedding is of shape (batch_size, num_em
-        
+        # Ensure the embedding is of shape (batch_size, num_emotional_dimensions)
+        if batch_size != self.position.size(0):
+            return self.position.expand(batch_size, -1)
+        return self.position
+
+    def __str__(self):
+        emotion = self.get_emotion()
+        values = self.position.squeeze().tolist()
+        return f"Emotion: {emotion}, Values: {dict(zip(self.dimensions, values))}"
+   
 class OverfitDetector:
     def __init__(self, window_size=50, threshold=0.05):
         self.window_size = window_size
