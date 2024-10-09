@@ -885,26 +885,28 @@ class LLaMA32TensorRTTool:
         else:
             return tensor_or_dict
         
-    
     def _initialize_model_full_gpu(self):
         try:
             logging.info(f"Initializing the model on device: {self.device}")
             
-            # Set the default tensor type to CUDA
-            torch.set_default_tensor_type(torch.cuda.FloatTensor)
+            # Ensure we're using CUDA
+            assert torch.cuda.is_available(), "CUDA is not available. This tool requires a GPU."
+            torch.cuda.set_device(self.device)
+    
+            # Load the model configuration
+            config = AutoConfig.from_pretrained(self.model_path)
             
-            # Load the model directly to GPU
+            # Load the model directly to GPU, avoiding meta tensors
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
-                device_map="auto",
+                config=config,
                 torch_dtype=torch.float16,
-                low_cpu_mem_usage=True
+                device_map={"": self.device},  # Map all layers to the specified GPU
+                low_cpu_mem_usage=True,
+                use_cache=False,
             )
-            
-            # Ensure the model is on the correct device
-            model = model.to(self.device)
-            
-            # Set model to evaluation mode
+    
+            # Ensure the model is in evaluation mode
             model.eval()
             
             logging.info("Model loaded successfully on GPU and set to evaluation mode.")
