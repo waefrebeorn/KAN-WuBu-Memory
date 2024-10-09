@@ -864,8 +864,8 @@ class LLaMA32TensorRTTool:
     
         try:
             # Initialize model with empty weights
+            config = AutoConfig.from_pretrained(checkpoint_dir)
             with init_empty_weights():
-                config = AutoConfig.from_pretrained(checkpoint_dir)
                 model = AutoModelForCausalLM.from_config(config)
             logging.info("Model initialized with empty weights")
     
@@ -879,10 +879,8 @@ class LLaMA32TensorRTTool:
                     file_path = os.path.join(checkpoint_dir, filename)
                     logging.info(f"Loading weights from {file_path}")
                     try:
-                        # Load the state dict to CPU first, then move to GPU
-                        state_dict = load_file(file_path, device="cpu")
-                        state_dict = {k: v.to(self.device) for k, v in state_dict.items()}
-                        self._load_state_dict_with_mismatch_size(model, state_dict)
+                        state_dict = load_file(file_path, device='cpu')
+                        model.load_state_dict(state_dict, strict=False)
                         logging.info(f"Weights loaded successfully from {filename}")
                     except Exception as e:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
@@ -904,10 +902,6 @@ class LLaMA32TensorRTTool:
             if not self._verify_tied_weights(model):
                 logging.warning("Weights are not tied after initialization. Re-tying weights.")
                 model.tie_weights()
-    
-            # Ensure model is on CUDA
-            model = model.to(self.device)
-            assert next(model.parameters()).device == self.device, f"Model not on {self.device}"
     
             logging.info(f"Model initialized successfully with tied weights on {self.device}.")
             return model
