@@ -903,7 +903,6 @@ class LLaMA32TensorRTTool:
                 torch_dtype=torch.float16,
                 device_map={"": self.device},  # Map all layers to the specified GPU
                 low_cpu_mem_usage=True,
-                use_cache=False,
             )
     
             # Ensure the model is in evaluation mode
