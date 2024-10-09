@@ -882,18 +882,18 @@ class LLaMA32TensorRTTool:
     def _initialize_model_full_gpu(self):
         try:
             logging.info(f"Initializing the model on device: {self.device}")
-            
+    
             # Ensure CUDA is available
             assert torch.cuda.is_available(), "CUDA is not available. This tool requires a GPU."
             torch.cuda.set_device(self.device)
-            
+    
             # Load the model configuration
             config = AutoConfig.from_pretrained(self.model_path)
     
-            # Initialize the model on 'meta' device to prevent memory allocation during initialization
-            model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16, low_cpu_mem_usage=True).to_empty()
-            
-            # Manually move each parameter from meta to GPU
+            # Create an empty model on the 'meta' device
+            model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16).to_empty()
+    
+            # Allocate all parameters on the specified GPU manually
             for name, param in model.named_parameters():
                 if param.device == torch.device("meta"):
                     param.data = torch.empty(param.shape, dtype=param.dtype, device=self.device)
