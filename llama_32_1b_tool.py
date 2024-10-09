@@ -706,6 +706,27 @@ class LLaMA32TensorRTTool:
             raise FileNotFoundError(f"Model directory not found: {model_dir}")
         return model_dir
 
+    @staticmethod
+    def move_to_device(tensor_or_dict, device):
+        if isinstance(tensor_or_dict, torch.Tensor):
+            return tensor_or_dict.to(device)
+        elif isinstance(tensor_or_dict, dict):
+            return {k: LLaMA32TensorRTTool.move_to_device(v, device) for k, v in tensor_or_dict.items()}
+        elif isinstance(tensor_or_dict, list):
+            return [LLaMA32TensorRTTool.move_to_device(t, device) for t in tensor_or_dict]
+        else:
+            return tensor_or_dict
+
+    def check_tensor_device(self, tensor_or_dict, name):
+        if isinstance(tensor_or_dict, torch.Tensor):
+            logging.info(f"{name} is on device: {tensor_or_dict.device}")
+        elif isinstance(tensor_or_dict, dict):
+            for k, v in tensor_or_dict.items():
+                self.check_tensor_device(v, f"{name}[{k}]")
+        elif isinstance(tensor_or_dict, list):
+            for i, t in enumerate(tensor_or_dict):
+                self.check_tensor_device(t, f"{name}[{i}]")
+                
     
     def _initialize_components(self):
         logging.info("Starting component initialization (GPU-only, prevent offloading)...")
@@ -838,9 +859,7 @@ class LLaMA32TensorRTTool:
     def _initialize_model_full_gpu(self):
         logging.info("Attempting full GPU initialization with enforced max_memory...")
     
-        max_memory = {i: "98GB" for i in range(torch.cuda.device_count())}
         checkpoint_dir = str(self.model_path)
-    
         logging.info(f"Checkpoint directory: {checkpoint_dir}")
     
         try:
@@ -851,7 +870,7 @@ class LLaMA32TensorRTTool:
             logging.info("Model initialized with empty weights")
     
             # Move the empty model to GPU
-            model = model.to_empty(device=self.device)
+            model = model.to(self.device)
             logging.info("Empty model moved to GPU")
     
             # Load the model weights using SafeTensors
@@ -860,11 +879,14 @@ class LLaMA32TensorRTTool:
                     file_path = os.path.join(checkpoint_dir, filename)
                     logging.info(f"Loading weights from {file_path}")
                     try:
-                        state_dict = load_file(file_path, device=self.device) 
+                        state_dict = load_file(file_path, device=self.device)
                         model.load_state_dict(state_dict, strict=False)
                         logging.info(f"Weights loaded successfully from {filename}")
                     except Exception as e:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
+    
+            # Ensure all model parameters are on the correct device
+            model = model.to(self.device)
     
             # Enable gradient checkpointing for memory efficiency
             model.gradient_checkpointing_enable()
@@ -896,7 +918,6 @@ class LLaMA32TensorRTTool:
         except Exception as e:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
-            
             raise RuntimeError("Failed to initialize model on GPU.")
             
            
@@ -988,19 +1009,6 @@ class LLaMA32TensorRTTool:
             logging.error(traceback.format_exc())
             raise RuntimeError("Failed to initialize model with quantization.")
     
-    
-    def move_to_device(tensor, device):
-        """
-        Recursively move a tensor, list of tensors, or dictionary of tensors to the specified device.
-        """
-        if isinstance(tensor, torch.Tensor):
-            return tensor.to(device)
-        elif isinstance(tensor, dict):
-            return {k: move_to_device(v, device) for k, v in tensor.items()}
-        elif isinstance(tensor, list):
-            return [move_to_device(t, device) for t in tensor]
-        else:
-            return tensor
             
   
     def _initialize_tokenizer(self):
@@ -1267,7 +1275,7 @@ class LLaMA32TensorRTTool:
                             break
     
                         response_tokens.append(next_token.item())
-                        inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0).to(self.device)], dim=-1)  # Ensure new token is on the same device
+                        inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1)
                         inputs['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones((1, 1), device=self.device)], dim=-1)
     
                         del outputs, next_token_logits
@@ -1305,7 +1313,7 @@ class LLaMA32TensorRTTool:
                 corrective_response = self._generate_corrective_response(user_input, context)
                 self.corrective_training(user_input, [], corrective_response)  # Empty response_tokens due to error
                 continue  # Retry generation after corrective training
-    
+                
             
   
     def _generate_corrective_response(self, user_input, context):
@@ -1794,6 +1802,10 @@ class LLaMA32TensorRTTool:
     
         try:
             with self.amp_context:
+                # Move user input to device
+                user_input_tensor = self.tokenizer.encode(user_input, return_tensors='pt')
+                user_input_tensor = self.move_to_device(user_input_tensor, self.device)
+    
                 response_tokens, quality_metrics = self._generate_response(user_input, context)
             
             # If the response is invalid, invoke comprehensive corrective training
@@ -1818,8 +1830,8 @@ class LLaMA32TensorRTTool:
         interaction_result = self.create_interaction_result(response, refusal_score, lm_loss, refusal_loss, validation_loss)
         self._save_interaction_state(interaction_result)
     
-        return interaction_result
-        
+        return interaction_result    
+    
     def _handle_invalid_response(self):
         logging.warning("Invalid response generated.")
         return {
