@@ -703,8 +703,8 @@ class LLaMA32TensorRTTool:
         self.day_cycle = None
         self.tensor_swapper = None
     
-        self.scaler = torch.cuda.amp.GradScaler()
-        self.amp_context = torch.cuda.amp.autocast(dtype=torch.float32)
+        self.scaler = torch.amp.GradScaler()
+        self.amp_context = torch.amp.autocast(device_type='cuda', dtype=torch.float32)
     
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
@@ -908,6 +908,7 @@ class LLaMA32TensorRTTool:
                             if param_name in model.state_dict():
                                 # Handle meta tensor initialization
                                 if model.state_dict()[param_name].is_meta:
+                                    # Allocate the parameter on the correct device and copy the value
                                     model.get_parameter(param_name).data = param.to(self.device)
                                     logging.info(f"Initialized and moved parameter '{param_name}' to {self.device}")
                                 else:
@@ -961,6 +962,7 @@ class LLaMA32TensorRTTool:
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model on {self.device}.")
     
+   
     def _get_submodule_and_param_name(self, model, param_name):
         """Locate the submodule and parameter name for a given full parameter path."""
         parts = param_name.split(".")
