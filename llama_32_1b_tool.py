@@ -171,7 +171,11 @@ class ResponseQualityManager:
         self.memory_manager = memory_manager
         self.invalid_response_count = 0
 
+        # Initialize TF-IDF Vectorizer for relevance calculation
+        self.tfidf_vectorizer = TfidfVectorizer()
+
     def evaluate_response(self, user_input, response_tokens, context):
+        """Evaluate the quality of the response based on multiple criteria."""
         response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
 
         # Check refusal score using the existing refusal detector
@@ -196,7 +200,27 @@ class ResponseQualityManager:
 
         return is_valid, quality_metrics
 
+    def calculate_relevance(self, user_input, response):
+        """Calculate the relevance score between the user input and the generated response."""
+        # Token Overlap Measure
+        user_tokens = set(self.tokenizer.tokenize(user_input))
+        response_tokens = set(self.tokenizer.tokenize(response))
+        overlap = len(user_tokens.intersection(response_tokens))
+        overlap_score = overlap / max(len(user_tokens), 1)  # Avoid division by zero
+
+        # Calculate Cosine Similarity Using TF-IDF (Advanced)
+        combined_texts = [user_input, response]
+        tfidf_matrix = self.tfidf_vectorizer.fit_transform(combined_texts)
+        cosine_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+
+        # Combine both metrics to calculate the final relevance score
+        relevance_score = 0.5 * overlap_score + 0.5 * cosine_sim
+
+        logging.info(f"Relevance Score: Overlap = {overlap_score:.4f}, Cosine Similarity = {cosine_sim:.4f}, Final Score = {relevance_score:.4f}")
+        return relevance_score
+
     def detect_garbled_output(self, response):
+        """Detect if the response contains garbled or nonsensical text."""
         if re.search(r'[^\x00-\x7F]+', response):  # Check for non-ASCII characters
             return True
         if len(response.split()) < 3:  # Too few words in a long sequence
@@ -205,7 +229,46 @@ class ResponseQualityManager:
             return True
         return False
 
+    def has_proper_structure(self, response):
+        """Check if the response has a proper structure (e.g., complete sentences)."""
+        sentences = re.split(r'(?<=[.!?])\s+', response.strip())
+        if not sentences:
+            return False
+        if not sentences[0][0].isupper():  # First sentence should start with a capital letter
+            return False
+        if sentences[-1][-1] not in '.!?':  # Last sentence should end with punctuation
+            return False
+        return True
+
+    def calculate_perplexity(self, response_tokens):
+        """Calculate the perplexity of the response based on the logits."""
+        try:
+            inputs = torch.tensor([response_tokens]).to(self.kan_model.device)
+            with torch.no_grad():
+                outputs = self.kan_model.model(inputs, labels=inputs)
+                loss = outputs.loss
+                perplexity = torch.exp(loss)
+            return perplexity.item()
+        except Exception as e:
+            logging.error(f"Error calculating perplexity: {str(e)}")
+            return float('inf')
+
+    def is_valid_response(self, quality_metrics):
+        """Determine if a response is valid based on quality metrics."""
+        if quality_metrics['is_refusal']:
+            return False
+        if quality_metrics['perplexity'] > 100:  # Set a threshold for acceptable perplexity
+            return False
+        if quality_metrics['relevance_score'] < 0.3:  # Set a threshold for relevance
+            return False
+        if not quality_metrics['structure']:  # Check if response has proper structure
+            return False
+        if quality_metrics['garbled_output']:  # Check if the output is marked as garbled
+            return False
+        return True
+
     def corrective_training(self, user_input, response_tokens, corrective_response):
+        """Perform corrective training on an invalid response."""
         try:
             # Encode the corrective response as the target for training
             target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.kan_model.device)
@@ -221,24 +284,27 @@ class ResponseQualityManager:
             logging.error(f"Error during corrective training: {str(e)}")
             return None, None
 
-    def adaptive_regeneration(self, user_input, context):
-        """Regenerate a response continuously until a valid one is found."""
-        attempt = 0
-        while True:
-            # Generate a new response
+    def adaptive_regeneration(self, user_input, context, max_attempts=3):
+        """Regenerate a response until a valid one is found or maximum attempts are reached."""
+        for attempt in range(max_attempts):
+            # Generate a new response using the KAN model
             response_tokens, response_entropy = self.kan_model.generate_response(user_input)
-            is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
-    
-            # If valid response is found, return it
+            
+            # Evaluate the generated response using the ResponseQualityManager
+            is_valid, quality_metrics = self.evaluate_response(user_input, response_tokens, context)
+
+            # If a valid response is found, return it
             if is_valid:
                 return response_tokens, quality_metrics
-    
+
             # Log invalid response and corrective training information
-            logging.warning(f"Invalid response detected. Attempt {attempt + 1}. Triggering corrective training.")
+            logging.warning(f"Invalid response detected. Attempt {attempt + 1}/{max_attempts}. Triggering corrective training.")
             corrective_response = "I misunderstood. Can you rephrase that?"
             self.corrective_training(user_input, response_tokens, corrective_response)
-            attempt += 1
-    
+
+        # After max attempts, return the last generated response with its metrics
+        return response_tokens, quality_metrics
+   
 
 
 class SyntheticDayCycle:
@@ -1130,6 +1196,25 @@ class LLaMA32TensorRTTool:
         sentences = thought_process.split('.')
         return sentences[-1].strip() + '.'
         
+    def corrective_training(self, user_input, response_tokens, corrective_response):
+        """
+        Perform corrective training on an invalid response using the corrective response.
+        This method handles training the KAN model to learn from mistakes.
+        """
+        try:
+            # Encode the corrective response as the target for training
+            target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.kan.device)
+
+            # Perform a training step using the invalid response and the corrective response
+            lm_loss, refusal_loss = self.kan.train_kan_step(
+                torch.tensor([response_tokens], dtype=torch.long).to(self.kan.device),
+                target_ids,
+                refusal_score=0.0  # Assume no refusal in this corrective context
+            )
+            return lm_loss, refusal_loss
+        except Exception as e:
+            logging.error(f"Error during corrective training: {str(e)}")
+            return None, None
 
     def comprehensive_corrective_training(self, user_input, response_tokens, context=None):
         """
@@ -1137,15 +1222,15 @@ class LLaMA32TensorRTTool:
         This method leverages all training tools (CoT, Entropy, Refusal Detection) to refine KAN's behavior.
         """
         logging.info(f"Starting Indefinite Corrective Training for input: '{user_input}'")
-        
+    
         # Initialize tracking for quality metrics
         attempt_count = 0
     
-        # Initial evaluation of the response
+        # Initial evaluation of the response using ResponseQualityManager
         is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
         refusal_score = self.refusal_detector.detect_refusal(response_tokens)
     
-        # Loop indefinitely until a coherent response is generated
+        # Main training loop that runs indefinitely until a coherent response is generated
         while not is_valid or refusal_score > 0.5:
             attempt_count += 1
             logging.warning(f"Corrective Training Attempt {attempt_count}: Response is invalid. Refining KAN...")
@@ -1153,7 +1238,7 @@ class LLaMA32TensorRTTool:
             # Log quality metrics for tracking progression
             logging.info(f"Quality Metrics: {quality_metrics}")
     
-            # Check if Chain-of-Thought should be triggered based on entropy trends
+            # Check if Chain-of-Thought (CoT) should be triggered based on entropy trends
             if self.entropy_manager.should_trigger_cot(quality_metrics['perplexity']):
                 logging.info("Triggering Chain-of-Thought during corrective training due to high entropy.")
                 context = self.memory_manager.get_context(self.emotional_state.get_emotion())
@@ -1167,10 +1252,20 @@ class LLaMA32TensorRTTool:
             # Perform a corrective training step using the generated corrective response
             lm_loss, refusal_loss = self.corrective_training(user_input, response_tokens, corrective_response)
     
-            # Re-generate a new response based on updated KAN parameters, with early garbage detection
+            # Log losses for tracking training effectiveness
+            logging.info(f"Corrective Training Step - LM Loss: {lm_loss:.4f}, Refusal Loss: {refusal_loss:.4f}")
+    
+            # Re-generate a new response based on updated KAN parameters
             new_response_tokens, new_quality_metrics = self._generate_response(user_input, context)
     
-            # Re-evaluate the newly generated response
+            # Early detection of garbage or incoherent output mid-generation
+            if self.response_quality_manager.detect_garbled_output(self.tokenizer.decode(new_response_tokens, skip_special_tokens=True)):
+                logging.warning("Detected garbled output mid-generation. Re-generating response.")
+                corrective_response = "I misunderstood. Let me correct that."
+                self.corrective_training(user_input, new_response_tokens, corrective_response)
+                continue
+    
+            # Re-evaluate the newly generated response using updated KAN parameters
             is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, new_response_tokens, context)
             refusal_score = self.refusal_detector.detect_refusal(new_response_tokens)
     
@@ -1179,13 +1274,13 @@ class LLaMA32TensorRTTool:
                 logging.info(f"Indefinite Corrective Training Successful at attempt {attempt_count}.")
                 return new_response_tokens, new_quality_metrics
     
-            # Adjust learning rate dynamically based on observed trends
+            # Adjust learning rate dynamically based on entropy trends to refine learning
             self.adjust_learning_based_on_entropy(new_quality_metrics['perplexity'])
     
-            # Update the response tokens for the next iteration
+            # Update response tokens for the next iteration
             response_tokens = new_response_tokens
     
-        # Return the final coherent response and quality metrics
+        # Return the final coherent response and quality metrics after successful training
         logging.info(f"KAN generated a valid response after {attempt_count} attempts.")
         return response_tokens, quality_metrics
         
