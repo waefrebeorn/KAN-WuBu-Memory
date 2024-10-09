@@ -656,7 +656,7 @@ class LLaMA32TensorRTTool:
                 hidden_size = self.config.hidden_size
                 num_emotional_dimensions = len(self.emotional_state.dimensions)
     
-                # Initialize the tokenizer
+                # Initialize the tokenizer first
                 self.tokenizer = self._initialize_tokenizer()
                 if self.tokenizer is None:
                     raise RuntimeError("Failed to initialize tokenizer")
@@ -671,6 +671,9 @@ class LLaMA32TensorRTTool:
     
                 if self.model is None:
                     raise RuntimeError("Model initialization failed")
+    
+                # Update the model for the tokenizer
+                self._update_model_for_tokenizer()
     
                 vocab_size = len(self.tokenizer)
     
@@ -930,13 +933,6 @@ class LLaMA32TensorRTTool:
                 tokenizer.add_special_tokens({'pad_token': '[PAD]'})
                 logging.info(f"Added distinct [PAD] token to tokenizer.")
     
-            # Resize token embeddings if a new token was added
-            self.model.resize_token_embeddings(len(tokenizer))
-    
-            # Set pad_token_id in model config
-            self.model.config.pad_token_id = tokenizer.pad_token_id
-            logging.info(f"Set pad_token_id in model config: {self.model.config.pad_token_id}")
-    
             # Ensure eos_token is set
             if tokenizer.eos_token is None:
                 tokenizer.eos_token = '</s>'
@@ -950,11 +946,31 @@ class LLaMA32TensorRTTool:
             tokenizer.save_pretrained(self.model_path)
             logging.info("Updated tokenizer saved to model path.")
     
+            # Defer model-specific operations
+            self.tokenizer = tokenizer
+            self._update_model_for_tokenizer()
+    
             return tokenizer
         except Exception as e:
             logging.error(f"Failed to initialize tokenizer: {str(e)}")
             logging.error(traceback.format_exc())
             return None
+    
+    def _update_model_for_tokenizer(self):
+        if self.model is not None:
+            try:
+                # Resize token embeddings
+                self.model.resize_token_embeddings(len(self.tokenizer))
+                logging.info("Model token embeddings resized.")
+    
+                # Set pad_token_id in model config
+                self.model.config.pad_token_id = self.tokenizer.pad_token_id
+                logging.info(f"Set pad_token_id in model config: {self.model.config.pad_token_id}")
+            except Exception as e:
+                logging.error(f"Failed to update model for tokenizer: {str(e)}")
+                logging.error(traceback.format_exc())
+        else:
+            logging.warning("Model not initialized. Skipping model-specific tokenizer updates.")
             
     
     
