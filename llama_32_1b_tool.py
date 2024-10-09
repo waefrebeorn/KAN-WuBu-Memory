@@ -956,7 +956,30 @@ class LLaMA32TensorRTTool:
         except Exception as e:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
-            raise RuntimeError(f"Failed to initialize model on {self.device}.")
+    
+            # Attempt to move any remaining parameters to GPU
+            logging.info("Attempting to move any remaining parameters to GPU...")
+            for name, param in model.named_parameters():
+                if param.device != self.device or param.is_meta:
+                    param.data = param.data.to(self.device)  # Move to GPU
+                    logging.info(f"Moved parameter '{name}' to {self.device}")
+    
+            # Retry the initialization to verify if the model can now be initialized
+            try:
+                logging.info("Retrying model initialization after moving parameters...")
+                for name, param in model.named_parameters():
+                    if param.device != self.device:
+                        raise RuntimeError(f"Parameter '{name}' is on {param.device}, expected {self.device}")
+                    if param.is_meta:
+                        raise RuntimeError(f"Parameter '{name}' is still a meta tensor")
+    
+                logging.info(f"Model initialized successfully on {self.device} after retrying.")
+                return model
+    
+            except Exception as retry_error:
+                logging.error(f"Retry initialization failed: {str(retry_error)}")
+                logging.error(traceback.format_exc())
+                raise RuntimeError(f"Failed to initialize model on {self.device}.")
     
             
     def _load_state_dict_with_mismatch_size(self, model, state_dict):
