@@ -550,8 +550,9 @@ class LLaMA32TensorRTTool:
         self.day_cycle = None
         self.tensor_swapper = None
 
-        self.scaler = amp.GradScaler()
-        self.amp_context = amp.autocast(dtype=torch.float16)
+        self.scaler = torch.amp.GradScaler()
+        self.amp_context = torch.amp.autocast(dtype=torch.float16, device_type='cuda')
+
 
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
@@ -885,14 +886,32 @@ class LLaMA32TensorRTTool:
             self.entropy_manager = self._initialize_entropy_manager()
             
     def _initialize_refusal_detector(self):
+        """Initialize the RefusalDetector instance properly without recursive calls."""
         if self.refusal_detector is None:
-            logging.info(" initializing Refusal Detector...")
-            self.refusal_detector = self._initialize_refusal_detector()
+            logging.info("Initializing Refusal Detector...")
+            try:
+                # Assuming you need to set up a RefusalDetector class, which you have in the main script
+                self.refusal_detector = RefusalDetector(self.tokenizer, self.model)
+                logging.info("Refusal Detector initialized successfully.")
+            except Exception as e:
+                logging.error(f"Failed to initialize Refusal Detector: {str(e)}")
+                logging.error(traceback.format_exc())
+        return self.refusal_detector
+
     
     def _initialize_entropy_manager(self):
+        """Initialize the EntropyManager instance properly without recursive calls."""
         if self.entropy_manager is None:
-            logging.info(" initializing Entropy Manager...")
-            self.entropy_manager = self._initialize_entropy_manager()            
+            logging.info("Initializing Entropy Manager...")
+            try:
+                # Assuming you have an EntropyManager class that you want to initialize
+                self.entropy_manager = EntropyManager(self.model, self.tokenizer, self.device)
+                logging.info("Entropy Manager initialized successfully.")
+            except Exception as e:
+                logging.error(f"Failed to initialize Entropy Manager: {str(e)}")
+                logging.error(traceback.format_exc())
+        return self.entropy_manager
+   
 
     def _initialize_memory_manager(self):
         return AdvancedMemoryManager(2048, self.tokenizer, self.device)
