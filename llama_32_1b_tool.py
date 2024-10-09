@@ -889,43 +889,32 @@ class LLaMA32TensorRTTool:
         try:
             logging.info(f"Initializing the model on device: {self.device}")
     
-            # Load configuration first
+            # Ensure CUDA availability
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is not available. This tool requires a GPU.")
+    
+            # Load the configuration directly
             config = AutoConfig.from_pretrained(self.model_path)
             logging.info(f"Loaded configuration from: {self.model_path}")
     
-            # Create an empty model with meta tensors
-            with init_empty_weights():
-                self.model = AutoModelForCausalLM.from_config(config)
-                logging.info("Created model with empty weights (meta tensors).")
+            # Initialize the model directly on the specified GPU without using `meta` tensors
+            with torch.device(self.device):
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_path,
+                    config=config,
+                    torch_dtype=torch.float16,  # Use float16 for memory efficiency
+                    device_map=None,            # Avoid any CPU device mapping
+                    low_cpu_mem_usage=False     # Directly initialize on GPU
+                )
     
-            # Ensure the device is correctly specified
-            if self.device not in ["cpu", "cuda:0", "cuda"]:
-                raise RuntimeError(f"Invalid device specified: {self.device}")
+            logging.info(f"Model initialized on {self.device}")
     
-            target_device = self.device
-            logging.info(f"Target device for model dispatch: {target_device}")
+            # Ensure `lm_head` is correctly assigned to the GPU
+            if hasattr(self.model, "lm_head"):
+                self.model.lm_head.to(self.device)
+                logging.info(f"lm_head moved to GPU: {self.device}")
     
-            # Manually map devices for all parts of the model
-            device_map = {name: target_device for name, _ in self.model.named_parameters()}
-            device_map["lm_head"] = target_device  # Explicitly assign lm_head to the target device
-    
-            # Load checkpoint and dispatch using `accelerate`
-            logging.info(f"Loading model checkpoint and dispatching to device: {target_device}")
-    
-            # Explicitly use `torch.nn.Module.to_empty()` to move the meta tensors to the right device
-            self.model.to_empty(device=target_device)
-    
-            # Dispatch the model using the `accelerate` library
-            self.model = load_checkpoint_and_dispatch(
-                self.model,
-                checkpoint=self.model_path,
-                device_map=device_map,
-                no_split_module_classes=["LlamaDecoderLayer"],
-            )
-    
-            logging.info(f"Model successfully initialized on device: {target_device}")
-    
-            # Directly call `tie_weights` if the model supports it
+            # Tie weights if necessary
             if hasattr(self.model, "tie_weights"):
                 self.model.tie_weights()
                 logging.info("Model weights tied successfully.")
@@ -934,9 +923,8 @@ class LLaMA32TensorRTTool:
             self.model.eval()
             logging.info("Model set to evaluation mode.")
     
-            # Verify that the `lm_head.weight` is on the correct device
-            if not any(param.device == self.device for name, param in self.model.named_parameters() if "lm_head" in name):
-                raise RuntimeError("lm_head.weight not correctly assigned to the specified device.")
+            # Confirm that all parameters are on GPU
+            self._validate_model_device_placement()
     
             return self.model
     
