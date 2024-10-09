@@ -889,49 +889,33 @@ class LLaMA32TensorRTTool:
     def _initialize_model_full_gpu(self):
         try:
             logging.info(f"Initializing the model on device: {self.device}")
-            config = AutoConfig.from_pretrained(self.model_path)
-            logging.info(f"Loaded configuration from: {self.model_path}")
-    
-            # Ensure all tensors are created on the correct device context
-            torch.cuda.set_device(self.device)
-            with torch.cuda.device(self.device):
-                # Initialize model with empty weights
-                with init_empty_weights():
-                    model = AutoModelForCausalLM.from_config(config)
-    
-                # Load the model weights
-                model = load_checkpoint_and_dispatch(
-                    model,
-                    self.model_path,
-                    device_map="auto",
-                    dtype=torch.float16,
-                    no_split_module_classes=["LlamaDecoderLayer"],
-                    offload_folder=None,  # Ensure no CPU offloading
-                    offload_state_dict=False  # Prevent offloading to CPU
-                )
-    
+            
+            # Set the default tensor type to CUDA
+            torch.set_default_tensor_type(torch.cuda.FloatTensor)
+            
+            # Load the model directly to GPU
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                device_map="auto",
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True
+            )
+            
             # Ensure the model is on the correct device
             model = model.to(self.device)
-    
-            # Tie weights if necessary
-            if hasattr(model, "tie_weights"):
-                model.tie_weights()
-                logging.info("Model weights tied successfully.")
-    
+            
             # Set model to evaluation mode
             model.eval()
-            logging.info("Model set to evaluation mode.")
-    
-            # Confirm all parameters are on GPU
-            self._validate_model_device_placement(model)
-    
+            
+            logging.info("Model loaded successfully on GPU and set to evaluation mode.")
+            
             return model
     
         except Exception as e:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model on {self.device}.")
-    
+            
     def _validate_model_device_placement(self, model):
         for name, param in model.named_parameters():
             if param.device != self.device:
