@@ -74,11 +74,36 @@ def setup_logging():
 setup_logging()
 
 class EmotionalState:
-    def __init__(self, dimensions=('valence', 'arousal', 'dominance'), device="cuda"):
+    def __init__(self, dimensions=('valence', 'arousal', 'dominance')):
+        # Use the provided GPU selection logic
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available. This tool requires a GPU.")
+        
+        num_gpus = torch.cuda.device_count()
+        if num_gpus == 0:
+            raise RuntimeError("No CUDA GPUs found.")
+
+        best_gpu_id = -1
+        max_free_memory = 0
+        for gpu_id in range(num_gpus):
+            torch.cuda.set_device(gpu_id)
+            if "NVIDIA" in torch.cuda.get_device_name(gpu_id).upper():
+                free_memory = torch.cuda.get_device_properties(gpu_id).total_memory - torch.cuda.memory_allocated(gpu_id)
+                if free_memory > max_free_memory:
+                    best_gpu_id = gpu_id
+                    max_free_memory = free_memory
+
+        if best_gpu_id == -1:
+            raise RuntimeError("No NVIDIA GPUs found.")
+
+        # Set the selected GPU as the device
+        self.device = torch.device(f"cuda:{best_gpu_id}")
+        torch.cuda.set_device(self.device)
+
+        # Emotional state initialization
         self.dimensions = dimensions
-        self.device = device
-        self.position = torch.zeros(1, len(dimensions), device=device, dtype=torch.float16)
-        self.velocity = torch.zeros(1, len(dimensions), device=device, dtype=torch.float16)
+        self.position = torch.zeros(1, len(dimensions), device=self.device, dtype=torch.float16)
+        self.velocity = torch.zeros(1, len(dimensions), device=self.device, dtype=torch.float16)
 
     def update(self, feedback, max_speed=0.1):
         feedback_vector = torch.as_tensor(feedback, device=self.device, dtype=torch.float16)
@@ -109,15 +134,7 @@ class EmotionalState:
                 return "Sad" if dominance > 0 else "Depressed"
 
     def get_embedding(self, batch_size=1):
-        # Ensure the embedding is of shape (batch_size, num_emotional_dimensions)
-        if batch_size != self.position.size(0):
-            return self.position.expand(batch_size, -1)
-        return self.position
-
-    def __str__(self):
-        emotion = self.get_emotion()
-        values = self.position.squeeze().tolist()
-        return f"Emotion: {emotion}, Values: {dict(zip(self.dimensions, values))}"
+        # Ensure the embedding is of shape (batch_size, num_em
         
 class OverfitDetector:
     def __init__(self, window_size=50, threshold=0.05):
@@ -1601,13 +1618,11 @@ class LLaMA32TensorRTTool:
     
                 # Check and ensure hidden states are on CUDA
                 last_hidden_state = hidden_states[-1].to(self.device, dtype=torch.float16)
-                assert last_hidden_state.device.type == "cuda", "Last hidden state not on CUDA"
                 logging.debug(f"Last Hidden State Shape: {last_hidden_state.shape}, Device: {last_hidden_state.device}")
     
                 # Encode the user intent for use in the KAN forward pass
                 user_input_text = self.tokenizer.decode(input_ids[0])
                 user_intent = self.encode_user_intent(user_input_text)
-                assert user_intent.device.type == "cuda", "User intent not on CUDA"
                 logging.debug(f"User Intent Shape: {user_intent.shape}, Device: {user_intent.device}")
     
                 # Forward pass through the KAN model
@@ -1616,9 +1631,6 @@ class LLaMA32TensorRTTool:
                 logging.debug("Completed KAN forward pass")
     
                 # Validate shapes and device placements
-                assert modified_hidden_states.device.type == "cuda", f"Modified Hidden States not on CUDA"
-                assert kan_refusal_scores.device.type == "cuda", f"KAN Refusal Scores not on CUDA"
-    
                 logging.debug(f"Modified Hidden States Shape: {modified_hidden_states.shape}")
                 logging.debug(f"KAN Refusal Scores Shape: {kan_refusal_scores.shape}")
     
@@ -1717,7 +1729,6 @@ class LLaMA32TensorRTTool:
             hidden_states = outputs.hidden_states[-1]
             user_intent = hidden_states.mean(dim=1)
             
-            assert user_intent.device.type == "cuda", "User intent not on CUDA"
             
             return user_intent
     
