@@ -1009,15 +1009,6 @@ class LLaMA32TensorRTTool:
                 tokenizer.add_special_tokens({'pad_token': '[PAD]'})
                 logging.info(f"Added distinct [PAD] token to tokenizer.")
     
-            # Ensure eos_token is set
-            if tokenizer.eos_token is None:
-                tokenizer.eos_token = '</s>'
-                logging.info(f"Set eos_token to '</s>'")
-    
-            # Double-check that pad and eos tokens are distinct
-            if tokenizer.pad_token == tokenizer.eos_token:
-                raise ValueError("Pad token and EOS token are the same. This may cause issues.")
-    
             # Save the updated tokenizer
             tokenizer.save_pretrained(self.model_path)
             logging.info("Updated tokenizer saved to model path.")
@@ -1230,14 +1221,14 @@ class LLaMA32TensorRTTool:
 
     def _generate_response(self, user_input, context):
         logging.info(f"Generating response for input: '{user_input}' with context size: {len(context)}")
-        
+    
         while True:
             try:
                 prompt = f"{context}\nUser: {user_input}\nAssistant:"
                 inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings)
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 
-
+                # Ensure all tensors in inputs are moved to the correct device
+                inputs = self._ensure_cuda(inputs)
     
                 response_tokens = []
                 total_entropy = 0
@@ -1248,7 +1239,7 @@ class LLaMA32TensorRTTool:
                     for step in range(max_response_length):
                         outputs = self.model(**inputs)
                         next_token_logits = outputs.logits[:, -1, :]
-                        
+    
                         local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
                         total_entropy += local_entropy
     
@@ -1263,8 +1254,8 @@ class LLaMA32TensorRTTool:
                             break
     
                         response_tokens.append(next_token.item())
-                        inputs.input_ids = torch.cat([inputs.input_ids, next_token.unsqueeze(0)], dim=-1)
-                        inputs.attention_mask = torch.cat([inputs.attention_mask, torch.ones((1, 1), device=self.device)], dim=-1)
+                        inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1)
+                        inputs['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones((1, 1), device=self.device)], dim=-1)
     
                         del outputs, next_token_logits
                         torch.cuda.empty_cache()
@@ -1360,13 +1351,18 @@ class LLaMA32TensorRTTool:
         
     def trigger_chain_of_thought(self, context):
         cot_prompt = f"{context}\nLet's think this through step-by-step:\n1."
-        cot_input_ids = self.tokenizer.encode(cot_prompt, return_tensors='pt').to(self.device)
+        cot_input_ids = self.tokenizer.encode(cot_prompt, return_tensors='pt')
+        
+        # Ensure cot_input_ids is moved to the correct device
+        cot_input_ids = self._ensure_cuda(cot_input_ids)
+    
         cot_output = self.model.generate(cot_input_ids, max_length=500, num_return_sequences=1, no_repeat_ngram_size=2)
         thought_process = self.tokenizer.decode(cot_output[0], skip_special_tokens=True)
-        
+    
         # Extract final response from thought process
         final_response = self._extract_final_response(thought_process)
         return final_response
+
     
     def _extract_final_response(self, thought_process):
         # Implement logic to extract the final response from the thought process
