@@ -1795,11 +1795,17 @@ class LLaMA32TensorRTTool:
         if not tokens:
             return 1.0  # Return lowest perplexity for empty responses
         try:
-            # Ensure tokens is a tensor on the correct device
+            # Ensure tokens is a non-empty tensor on the correct device
             if isinstance(tokens, list):
+                if not tokens:
+                    return 1.0  # Return lowest perplexity for empty list
                 tokens = torch.tensor(tokens, dtype=torch.long, device=self.device)
             elif isinstance(tokens, torch.Tensor):
+                if tokens.numel() == 0:
+                    return 1.0  # Return lowest perplexity for empty tensor
                 tokens = tokens.to(self.device)
+            else:
+                raise ValueError(f"Unexpected type for tokens: {type(tokens)}")
     
             inputs = tokens.unsqueeze(0)  # Add batch dimension
             
@@ -1811,18 +1817,15 @@ class LLaMA32TensorRTTool:
         except Exception as e:
             logging.error(f"Error calculating perplexity: {str(e)}")
             return float('inf')  # Return highest perplexity for error cases
+            
         
     def has_proper_structure(self, tokens):
         try:
             if isinstance(tokens, str):
-                # If tokens is already a string, use it directly
                 decoded_text = tokens
-            elif isinstance(tokens, list):
-                # If tokens is a list of token IDs, decode it
-                decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
             else:
-                # If tokens is neither a string nor a list, raise an error
-                raise ValueError(f"Unexpected type for tokens: {type(tokens)}")
+                # Assume tokens is a list or tensor of token IDs
+                decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
     
             sentences = re.split(r'(?<=[.!?])\s+', decoded_text.strip())
             
@@ -1830,15 +1833,15 @@ class LLaMA32TensorRTTool:
                 logging.warning("No complete sentences found in the response.")
                 return False
         
-            if not sentences[0] or not sentences[0][0].isupper():
+            if not sentences[0][0].isupper():
                 logging.warning(f"First sentence doesn't start with a capital letter: '{sentences[0]}'")
                 return False
         
-            if not sentences[-1] or sentences[-1][-1] not in '.!?':
+            if sentences[-1][-1] not in '.!?':
                 logging.warning(f"Last sentence doesn't end with proper punctuation: '{sentences[-1]}'")
                 return False
         
-            proper_sentences = sum(1 for s in sentences if s and s[0].isupper() and s[-1] in '.!?')
+            proper_sentences = sum(1 for s in sentences if s[0].isupper() and s[-1] in '.!?')
             proper_ratio = proper_sentences / len(sentences)
         
             if proper_ratio < 0.5:
