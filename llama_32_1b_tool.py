@@ -890,10 +890,10 @@ class LLaMA32TensorRTTool:
             # Load the model configuration
             config = AutoConfig.from_pretrained(self.model_path)
     
-            # Create an empty model on the 'meta' device
-            model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16).to_empty()
+            # Create an empty model on the specified device using `to_empty` correctly
+            model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16).to_empty(device=self.device)
     
-            # Allocate all parameters on the specified GPU manually
+            # Allocate all parameters on the specified GPU manually if needed
             for name, param in model.named_parameters():
                 if param.device == torch.device("meta"):
                     param.data = torch.empty(param.shape, dtype=param.dtype, device=self.device)
@@ -909,6 +909,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model on {self.device}.")
+    
     
     def _validate_model_device_placement(self, model):
         for name, param in model.named_parameters():
