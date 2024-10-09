@@ -515,6 +515,7 @@ class LLaMA32TensorRTTool:
         self.kan_state_dir.mkdir(exist_ok=True)
         self.base_state_file = self.kan_state_dir / "base_state.pt"
         
+        self.response_quality_manager = None
         self.refusal_history = []
         self.interaction_results = []
         self.training_losses = []
@@ -564,17 +565,19 @@ class LLaMA32TensorRTTool:
             try:
                 logging.info(f"Initialization attempt {initialization_attempts + 1}/{max_attempts}")
     
+                # Initialize base configuration
                 self.config = AutoConfig.from_pretrained(self.model_path)
                 self.config.use_cache = False
                 hidden_size = self.config.hidden_size
                 num_emotional_dimensions = len(self.emotional_state.dimensions)
     
+                # Initialize the tokenizer
                 self.tokenizer = self._initialize_tokenizer()
                 if self.tokenizer is None:
                     raise RuntimeError("Failed to initialize tokenizer")
     
                 self.clear_memory()
-                
+    
                 # Initialize model with gradient checkpointing for memory efficiency
                 with self.amp_context:
                     self.model = self._initialize_model_full_gpu()
@@ -585,24 +588,29 @@ class LLaMA32TensorRTTool:
                     raise RuntimeError("Model initialization failed")
     
                 vocab_size = len(self.tokenizer)
-                
+    
                 # Initialize KAN with half precision
                 try:
                     self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size)
                     self.kan.to(torch.float16)
                     if list(self.kan.parameters()):
-                        self.optimizer = torch.optim.AdamW(self.kan.parameters(), lr=self.learning_rate, eps=1e-8, betas=(0.9, 0.999), weight_decay=0.01)
+                        self.optimizer = torch.optim.AdamW(
+                            self.kan.parameters(),
+                            lr=self.learning_rate,
+                            eps=1e-8,
+                            betas=(0.9, 0.999),
+                            weight_decay=0.01
+                        )
                     else:
                         logging.error("KAN model has no parameters. Cannot initialize optimizer.")
                         raise ValueError("KAN model has no parameters")
                 except Exception as e:
                     logging.error(f"Error initializing KAN or optimizer: {str(e)}")
                     raise
-                               
-                self.clear_memory()
-   
     
-                # Initialize other components
+                self.clear_memory()
+    
+                # Initialize the other components
                 self.refusal_detector = self._initialize_refusal_detector()
                 self.clear_memory()
     
@@ -622,6 +630,16 @@ class LLaMA32TensorRTTool:
                 self.tensor_swapper = TensorSwapper(self.device)
     
                 self.clear_memory()
+    
+                # Initialize the ResponseQualityManager using all the components above
+                self.response_quality_manager = ResponseQualityManager(
+                    kan_model=self.kan,
+                    tokenizer=self.tokenizer,
+                    refusal_detector=self.refusal_detector,
+                    emotional_state=self.emotional_state,
+                    memory_manager=self.memory_manager
+                )
+                logging.info("ResponseQualityManager initialized successfully.")
     
                 # Set up gradient scaler for mixed precision training
                 self.scaler = torch.amp.GradScaler('cuda')
@@ -647,6 +665,7 @@ class LLaMA32TensorRTTool:
         logging.error("Failed to initialize components after maximum attempts.")
         raise RuntimeError("Component initialization failed after multiple GPU-only attempts")
     
+ 
     def clear_memory(self):
         torch.cuda.empty_cache()
         gc.collect()
