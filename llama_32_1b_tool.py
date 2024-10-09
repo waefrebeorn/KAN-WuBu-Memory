@@ -1086,74 +1086,115 @@ class LLaMA32TensorRTTool:
 
     def _generate_response(self, user_input, context):
         """
-        Generate a response with real-time garbage detection and dynamic Chain-of-Thought triggering.
-        Uses the base model to guide KAN learning when high entropy or garbled outputs are detected.
+        Generate a response with indefinite attempts, engaging corrective training when issues are encountered.
         """
         logging.info(f"Generating response for input: '{user_input}' with context size: {len(context)}")
         
+        while True:
+            try:
+                prompt = f"{context}\nUser: {user_input}\nAssistant:"
+                input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
+    
+                if input_ids.shape[1] > self.model.config.max_position_embeddings:
+                    input_ids = input_ids[:, -self.model.config.max_position_embeddings:]
+    
+                response_tokens = []
+                total_entropy = 0
+                stop_sequences = [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]
+                max_response_length = 2000
+    
+                with torch.no_grad(), self.amp_context:
+                    for step in range(max_response_length):
+                        outputs = self.model(input_ids)
+                        next_token_logits = outputs.logits[:, -1, :]
+                        
+                        local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
+                        total_entropy += local_entropy
+    
+                        if self.is_garbage_output(local_entropy, response_tokens):
+                            logging.warning(f"Garbage detected mid-generation at step {step}. Engaging corrective training.")
+                            break
+    
+                        sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
+                        next_token = self.sample_next_token(next_token_logits, **sampling_params)
+    
+                        if next_token.item() in stop_sequences or len(response_tokens) >= max_response_length:
+                            break
+    
+                        response_tokens.append(next_token.item())
+                        next_token = next_token.view(1, 1)
+                        input_ids = torch.cat([input_ids, next_token], dim=-1)
+    
+                        del outputs, next_token_logits
+                        torch.cuda.empty_cache()
+    
+                avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
+                quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
+    
+                # Check if the generated response is valid
+                is_valid, detailed_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
+                
+                if is_valid:
+                    logging.info("Valid response generated.")
+                    return response_tokens, quality_metrics
+                else:
+                    logging.warning("Invalid response generated. Engaging corrective training.")
+                    corrective_response = self._generate_corrective_response(user_input, context)
+                    self.corrective_training(user_input, response_tokens, corrective_response)
+                    continue  # Retry generation after corrective training
+    
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e):
+                    logging.warning("CUDA out of memory during generation. Clearing cache and retrying...")
+                    torch.cuda.empty_cache()
+                    time.sleep(1)  # Give some time for memory to be freed
+                else:
+                    logging.error(f"Runtime error during generation: {str(e)}")
+                    logging.error(traceback.format_exc())
+                    # Engage corrective training
+                    corrective_response = self._generate_corrective_response(user_input, context)
+                    self.corrective_training(user_input, [], corrective_response)  # Empty response_tokens due to error
+                    continue  # Retry generation after corrective training
+    
+            except Exception as e:
+                logging.error(f"Unexpected error during generation: {str(e)}")
+                logging.error(traceback.format_exc())
+                # Engage corrective training
+                corrective_response = self._generate_corrective_response(user_input, context)
+                self.corrective_training(user_input, [], corrective_response)  # Empty response_tokens due to error
+                continue  # Retry generation after corrective training
+    
+    def _generate_corrective_response(self, user_input, context):
+        """
+        Generate a corrective response using the base model or chain-of-thought reasoning.
+        """
+        if self.entropy_manager.should_trigger_cot(self.entropy_manager.global_entropy):
+            logging.info("Triggering Chain-of-Thought for corrective response.")
+            thought_process = self.trigger_chain_of_thought(context)
+            return f"Let's analyze this step-by-step: {thought_process}"
+        else:
+            logging.info("Generating base model response for correction.")
+            return self._generate_base_model_response(user_input, context)
+    
+    def _generate_base_model_response(self, user_input, context):
+        """
+        Generate a response using the base model without KAN modifications.
+        """
         prompt = f"{context}\nUser: {user_input}\nAssistant:"
         input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
-    
-        # Ensure input length does not exceed the model's maximum position embeddings
-        if input_ids.shape[1] > self.model.config.max_position_embeddings:
-            input_ids = input_ids[:, -self.model.config.max_position_embeddings:]
-    
-        response_tokens = []
-        total_entropy = 0
-        stop_sequences = [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]
-        max_response_length = 2000  # Set a maximum response length
-    
-        with torch.no_grad(), self.amp_context:
-            for step in range(max_response_length):
-                # Forward pass through the model to get the logits for the next token
-                outputs = self.model(input_ids)
-                next_token_logits = outputs.logits[:, -1, :]
-    
-                # Calculate entropy to detect garbage patterns and incoherent responses
-                local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
-                total_entropy += local_entropy
-    
-                # Detect garbage patterns in real-time using entropy spikes and repetition patterns
-                if self.is_garbage_output(local_entropy, response_tokens):
-                    logging.warning(f"Garbage detected mid-generation at step {step}. Interrupting response generation.")
-                    break
-    
-                # Dynamically trigger Chain-of-Thought if entropy exceeds threshold
-                if self.entropy_manager.should_trigger_cot(local_entropy):
-                    logging.info("Triggering Chain-of-Thought due to high entropy spike.")
-                    context = self.memory_manager.get_context(self.emotional_state.get_emotion())
-                    thought_process = self.trigger_chain_of_thought(context)
-                    response_tokens.extend(self.tokenizer.encode(thought_process))
-                    break
-    
-                # Sample the next token using argmax or entropy-adjusted sampling
-                sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
-                next_token = self.sample_next_token(next_token_logits, **sampling_params)
-    
-                # Stop if we reach an end-of-text token or if the response is too long
-                if next_token.item() in stop_sequences or len(response_tokens) >= max_response_length:
-                    break
-    
-                # Append the next token and continue
-                response_tokens.append(next_token.item())
-                next_token = next_token.view(1, 1)
-                input_ids = torch.cat([input_ids, next_token], dim=-1)
-    
-                # Early termination if the response is structurally complete
-                if len(response_tokens) > 10:
-                    partial_response = self.tokenizer.decode(response_tokens)
-                    if self._is_response_complete(partial_response):
-                        break
-    
-                # Clear unused memory to avoid out-of-memory issues
-                del outputs, next_token_logits
-                torch.cuda.empty_cache()
-    
-        # Calculate average entropy over the generated sequence
-        avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
-        quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
-    
-        return response_tokens, quality_metrics
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids,
+                max_length=2000,
+                num_return_sequences=1,
+                no_repeat_ngram_size=2,
+                temperature=0.7,
+                top_p=0.95
+            )
+        
+        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
     
     def is_garbage_output(self, entropy, partial_tokens):
         """Detect garbage outputs based on entropy spikes and partial token patterns."""
@@ -1216,74 +1257,64 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during corrective training: {str(e)}")
             return None, None
 
-    def comprehensive_corrective_training(self, user_input, response_tokens, context=None):
+    def comprehensive_corrective_training(self, user_input, response_tokens, context):
         """
-        Perform corrective training indefinitely until the KAN produces a coherent response that matches the base model's quality.
+        Perform corrective training indefinitely until the KAN produces a coherent response.
         This method leverages all training tools (CoT, Entropy, Refusal Detection) to refine KAN's behavior.
         """
         logging.info(f"Starting Indefinite Corrective Training for input: '{user_input}'")
     
-        # Initialize tracking for quality metrics
-        attempt_count = 0
+        while True:
+            try:
+                # Generate a new response
+                new_response_tokens, new_quality_metrics = self._generate_response(user_input, context)
     
-        # Initial evaluation of the response using ResponseQualityManager
-        is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
-        refusal_score = self.refusal_detector.detect_refusal(response_tokens)
+                # Safely decode the response, handling potential errors
+                try:
+                    response = self.tokenizer.decode(new_response_tokens, skip_special_tokens=True)
+                except Exception as e:
+                    logging.error(f"Error decoding response: {str(e)}")
+                    response = ""
     
-        # Main training loop that runs indefinitely until a coherent response is generated
-        while not is_valid or refusal_score > 0.5:
-            attempt_count += 1
-            logging.warning(f"Corrective Training Attempt {attempt_count}: Response is invalid. Refining KAN...")
+                # Evaluate the response
+                is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, response, context)
+                refusal_score = self.refusal_detector.detect_refusal(new_response_tokens)
     
-            # Log quality metrics for tracking progression
-            logging.info(f"Quality Metrics: {quality_metrics}")
+                # If the response is valid and not a refusal, return it
+                if is_valid and refusal_score <= 0.5:
+                    logging.info("Valid response generated.")
+                    return new_response_tokens, new_quality_metrics
     
-            # Check if Chain-of-Thought (CoT) should be triggered based on entropy trends
-            if self.entropy_manager.should_trigger_cot(quality_metrics['perplexity']):
-                logging.info("Triggering Chain-of-Thought during corrective training due to high entropy.")
-                context = self.memory_manager.get_context(self.emotional_state.get_emotion())
-                cot_response = self.trigger_chain_of_thought(context)
-                corrective_response = f"Let's analyze this step-by-step: {cot_response}"
-            else:
-                # Use the base model's output as a corrective response if KAN is producing garbled outputs
-                base_model_response = self._generate_base_model_response(user_input, context)
-                corrective_response = f"Here’s the correct way to respond: {base_model_response}"
+                # If the response is invalid or a refusal, continue training
+                logging.warning("Invalid response or refusal detected. Continuing training...")
     
-            # Perform a corrective training step using the generated corrective response
-            lm_loss, refusal_loss = self.corrective_training(user_input, response_tokens, corrective_response)
+                # Trigger Chain-of-Thought if needed
+                if self.entropy_manager.should_trigger_cot(new_quality_metrics['perplexity']):
+                    logging.info("Triggering Chain-of-Thought due to high entropy.")
+                    thought_process = self.trigger_chain_of_thought(context)
+                    corrective_response = f"Let's analyze this step-by-step: {thought_process}"
+                else:
+                    # Use the base model's output as a corrective response
+                    base_model_response = self._generate_base_model_response(user_input, context)
+                    corrective_response = f"Here's a better way to respond: {base_model_response}"
     
-            # Log losses for tracking training effectiveness
-            logging.info(f"Corrective Training Step - LM Loss: {lm_loss:.4f}, Refusal Loss: {refusal_loss:.4f}")
+                # Perform a corrective training step
+                lm_loss, refusal_loss = self.corrective_training(user_input, new_response_tokens, corrective_response)
     
-            # Re-generate a new response based on updated KAN parameters
-            new_response_tokens, new_quality_metrics = self._generate_response(user_input, context)
+                # Log training progress
+                logging.info(f"Corrective Training Step - LM Loss: {lm_loss:.4f}, Refusal Loss: {refusal_loss:.4f}")
     
-            # Early detection of garbage or incoherent output mid-generation
-            if self.response_quality_manager.detect_garbled_output(self.tokenizer.decode(new_response_tokens, skip_special_tokens=True)):
-                logging.warning("Detected garbled output mid-generation. Re-generating response.")
-                corrective_response = "I misunderstood. Let me correct that."
-                self.corrective_training(user_input, new_response_tokens, corrective_response)
-                continue
+                # Adjust learning rate based on entropy
+                self.adjust_learning_based_on_entropy(new_quality_metrics['perplexity'])
     
-            # Re-evaluate the newly generated response using updated KAN parameters
-            is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, new_response_tokens, context)
-            refusal_score = self.refusal_detector.detect_refusal(new_response_tokens)
+            except Exception as e:
+                logging.error(f"Error during corrective training: {str(e)}")
+                logging.error(traceback.format_exc())
+                # Continue the loop even if an error occurs
     
-            # If response is coherent and valid, exit the loop
-            if is_valid and refusal_score <= 0.5:
-                logging.info(f"Indefinite Corrective Training Successful at attempt {attempt_count}.")
-                return new_response_tokens, new_quality_metrics
-    
-            # Adjust learning rate dynamically based on entropy trends to refine learning
-            self.adjust_learning_based_on_entropy(new_quality_metrics['perplexity'])
-    
-            # Update response tokens for the next iteration
-            response_tokens = new_response_tokens
-    
-        # Return the final coherent response and quality metrics after successful training
-        logging.info(f"KAN generated a valid response after {attempt_count} attempts.")
-        return response_tokens, quality_metrics
-        
+            # Clear CUDA cache to prevent memory issues
+            torch.cuda.empty_cache()
+            
     
 
     def sample_next_token(self, logits, temperature=1.0, top_p=None):
