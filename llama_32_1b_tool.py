@@ -767,13 +767,6 @@ class LLaMA32TensorRTTool:
         checkpoint_dir = str(self.model_path)
     
         logging.info(f"Checkpoint directory: {checkpoint_dir}")
-        logging.info(f"Current working directory: {os.getcwd()}")
-        logging.info(f"User running the script: {os.getlogin()}")
-    
-        try:
-            logging.info(f"Directory contents: {os.listdir(checkpoint_dir)}")
-        except Exception as e:
-            logging.error(f"Error listing directory contents: {str(e)}")
     
         try:
             # Initialize model with empty weights
@@ -828,6 +821,7 @@ class LLaMA32TensorRTTool:
             
             raise RuntimeError("Failed to initialize model on GPU.")
             
+           
     def _verify_tied_weights(self, model):
         # Add a method to verify if weights are tied
         if hasattr(model, 'tie_weights'):
@@ -1162,14 +1156,16 @@ class LLaMA32TensorRTTool:
         while True:
             try:
                 prompt = f"{context}\nUser: {user_input}\nAssistant:"
-                inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings).to(self.device)
+                inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings)
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                inputs['attention_mask'] = inputs['attention_mask'].to(self.device)
     
                 response_tokens = []
                 total_entropy = 0
                 stop_sequences = [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]
                 max_response_length = 2000
     
-                with torch.no_grad(), self.amp_context:
+                with torch.no_grad():
                     for step in range(max_response_length):
                         outputs = self.model(**inputs)
                         next_token_logits = outputs.logits[:, -1, :]
@@ -1229,7 +1225,7 @@ class LLaMA32TensorRTTool:
                 corrective_response = self._generate_corrective_response(user_input, context)
                 self.corrective_training(user_input, [], corrective_response)  # Empty response_tokens due to error
                 continue  # Retry generation after corrective training
-
+    
   
     def _generate_corrective_response(self, user_input, context):
         """
@@ -1509,10 +1505,6 @@ class LLaMA32TensorRTTool:
         return overlap / max(len(input_tokens), len(response_tokens))
 
     def train_kan_step(self, input_ids, target_ids, refusal_score):
-        """
-        Perform a single training step for the KAN model using the given inputs and targets.
-        Includes enhanced logging, tensor checks, and mixed precision training.
-        """
         logging.info("Starting train_kan_step in comprehensive corrective training")
         
         # Validate KAN model state
@@ -1527,8 +1519,8 @@ class LLaMA32TensorRTTool:
             target_ids = torch.tensor(target_ids, device=self.device, dtype=torch.long)
     
         # Validate input tensor shapes and devices
-        assert input_ids.device.type == self.device.type, f"Input IDs are on {input_ids.device} instead of {self.device}"
-        assert target_ids.device.type == self.device.type, f"Target IDs are on {target_ids.device} instead of {self.device}"
+        assert input_ids.device == self.device, f"Input IDs are on {input_ids.device} instead of {self.device}"
+        assert target_ids.device == self.device, f"Target IDs are on {target_ids.device} instead of {self.device}"
         
         # Adjust dimensions to match expected format (batch_size, seq_length)
         if input_ids.dim() == 1:
@@ -1544,7 +1536,7 @@ class LLaMA32TensorRTTool:
             logging.debug(f"Input Shape: {input_ids.shape}, Target Shape: {target_ids.shape}")
     
             # Use mixed precision for memory efficiency and faster training
-            with torch.amp.autocast(device_type='cuda', dtype=self.dtype):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 # Forward pass through the base model to get the hidden states
                 outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True, use_cache=False)
     
@@ -1559,12 +1551,12 @@ class LLaMA32TensorRTTool:
                     raise ValueError(f"Unexpected output format: {type(outputs)}")
     
                 # Check and move hidden states to the correct device
-                last_hidden_state = hidden_states[-1].to(self.device, dtype=self.dtype)
+                last_hidden_state = hidden_states[-1].to(self.device, dtype=torch.float16)
                 logging.debug(f"Last Hidden State Shape: {last_hidden_state.shape}, Device: {last_hidden_state.device}")
     
                 # Encode the user intent for use in the KAN forward pass
                 user_input_text = self.tokenizer.decode(input_ids[0])
-                user_intent = self.encode_user_intent(user_input_text).to(self.device, dtype=self.dtype)
+                user_intent = self.encode_user_intent(user_input_text).to(self.device, dtype=torch.float16)
                 logging.debug(f"User Intent Shape: {user_intent.shape}, Device: {user_intent.device}")
     
                 # Forward pass through the KAN model
