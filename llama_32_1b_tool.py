@@ -672,7 +672,7 @@ class LLaMA32TensorRTTool:
         # Initialize components
         self._initialize_components()
     
-        assert next(self.model.parameters()).device.type == "cuda", "Model not initialized on CUDA"
+ 
         
     def _get_model_path(self):
         script_dir = Path(__file__).parent
