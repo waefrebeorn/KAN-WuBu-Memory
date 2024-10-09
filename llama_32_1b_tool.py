@@ -879,6 +879,7 @@ class LLaMA32TensorRTTool:
         else:
             return tensor_or_dict
         
+
     def _initialize_model_full_gpu(self):
         logging.info("Attempting full GPU initialization with enforced max_memory...")
     
@@ -916,18 +917,19 @@ class LLaMA32TensorRTTool:
                         logging.error(f"Error loading weights from {filename}: {str(e)}")
                         raise
     
-            # Step 4: Move all remaining parameters to the correct device
+            # Step 4: Move all remaining parameters to the correct device and handle meta tensors
             for name, param in model.named_parameters():
                 if param.device != self.device:
                     if param.is_meta:
-                        # Initialize the meta tensor using `register_parameter`
+                        # Replace the parameter using `register_parameter` in the correct submodule
                         logging.warning(f"Parameter '{name}' is still a meta tensor. Replacing it with an initialized tensor.")
+                        submodule, param_name = self._get_submodule_and_param_name(model, name)
                         param_dtype = torch.float16 if "float" in str(param.dtype) else param.dtype
                         param_shape = param.shape
     
                         # Create a new initialized tensor with the same properties
-                        new_param = torch.nn.Parameter(torch.empty(param_shape, dtype=param_dtype, device=self.device))
-                        model.register_parameter(name, new_param)
+                        new_param = nn.Parameter(torch.empty(param_shape, dtype=param_dtype, device=self.device))
+                        submodule.register_parameter(param_name, new_param)
                         logging.info(f"Initialized and replaced meta tensor '{name}' with a new parameter on {self.device}")
                     else:
                         param.data = param.data.to(self.device)
@@ -970,11 +972,12 @@ class LLaMA32TensorRTTool:
             for name, param in model.named_parameters():
                 if param.device != self.device:
                     if param.is_meta:
-                        # Initialize and move any remaining meta tensors
+                        # Replace the meta tensor properly
                         logging.warning(f"Parameter '{name}' is still a meta tensor. Initializing it now.")
+                        submodule, param_name = self._get_submodule_and_param_name(model, name)
                         param_dtype = torch.float16 if "float" in str(param.dtype) else param.dtype
-                        new_param = torch.nn.Parameter(torch.empty(param.shape, dtype=param_dtype, device=self.device))
-                        model.register_parameter(name, new_param)
+                        new_param = nn.Parameter(torch.empty(param.shape, dtype=param_dtype, device=self.device))
+                        submodule.register_parameter(param_name, new_param)
                         logging.info(f"Initialized and replaced meta tensor '{name}' with a new parameter on {self.device}")
                     else:
                         param.data = param.data.to(self.device)
@@ -996,6 +999,15 @@ class LLaMA32TensorRTTool:
                 logging.error(f"Retry initialization failed: {str(retry_error)}")
                 logging.error(traceback.format_exc())
                 raise RuntimeError(f"Failed to initialize model on {self.device}.")
+    
+    # Helper method to navigate submodules and replace parameters correctly
+    def _get_submodule_and_param_name(self, model, param_name):
+        """Locate the submodule and parameter name for a given full parameter path."""
+        parts = param_name.split(".")
+        submodule = model
+        for part in parts[:-1]:
+            submodule = getattr(submodule, part)
+        return submodule, parts[-1]
     
             
     def _load_state_dict_with_mismatch_size(self, model, state_dict):
