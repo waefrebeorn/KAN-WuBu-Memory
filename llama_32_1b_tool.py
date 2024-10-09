@@ -925,21 +925,37 @@ class LLaMA32TensorRTTool:
             # Ensure the special tokens are set correctly
             self._ensure_special_tokens(tokenizer)
     
-            # Add padding token manually if not already present
+            # Add a distinct padding token if not already present
             if tokenizer.pad_token is None:
                 tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-                logging.info(f"Added [PAD] token to tokenizer.")
+                logging.info(f"Added distinct [PAD] token to tokenizer.")
     
-            # Override eos_token_id with pad_token_id if necessary
-            if tokenizer.pad_token_id is not None and tokenizer.pad_token_id != tokenizer.eos_token_id:
-                tokenizer.eos_token_id = tokenizer.pad_token_id
-                logging.info(f"Overriding eos_token_id with pad_token_id: {tokenizer.pad_token_id}")
+            # Resize token embeddings if a new token was added
+            self.model.resize_token_embeddings(len(tokenizer))
+    
+            # Set pad_token_id in model config
+            self.model.config.pad_token_id = tokenizer.pad_token_id
+            logging.info(f"Set pad_token_id in model config: {self.model.config.pad_token_id}")
+    
+            # Ensure eos_token is set
+            if tokenizer.eos_token is None:
+                tokenizer.eos_token = '</s>'
+                logging.info(f"Set eos_token to '</s>'")
+    
+            # Double-check that pad and eos tokens are distinct
+            if tokenizer.pad_token == tokenizer.eos_token:
+                raise ValueError("Pad token and EOS token are the same. This may cause issues.")
+    
+            # Save the updated tokenizer
+            tokenizer.save_pretrained(self.model_path)
+            logging.info("Updated tokenizer saved to model path.")
     
             return tokenizer
         except Exception as e:
             logging.error(f"Failed to initialize tokenizer: {str(e)}")
             logging.error(traceback.format_exc())
             return None
+            
     
     
     def _ensure_special_tokens(self, tokenizer):
@@ -1103,16 +1119,14 @@ class LLaMA32TensorRTTool:
         sentiment = sum(1 for word in words if word in positive_words) - sum(1 for word in words if word in negative_words)
         return sentiment / len(words)
 
+
     def _generate_response(self, user_input, context):
         logging.info(f"Generating response for input: '{user_input}' with context size: {len(context)}")
         
         while True:
             try:
                 prompt = f"{context}\nUser: {user_input}\nAssistant:"
-                input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
-    
-                if input_ids.shape[1] > self.model.config.max_position_embeddings:
-                    input_ids = input_ids[:, -self.model.config.max_position_embeddings:]
+                inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings).to(self.device)
     
                 response_tokens = []
                 total_entropy = 0
@@ -1121,7 +1135,7 @@ class LLaMA32TensorRTTool:
     
                 with torch.no_grad(), self.amp_context:
                     for step in range(max_response_length):
-                        outputs = self.model(input_ids)
+                        outputs = self.model(**inputs)
                         next_token_logits = outputs.logits[:, -1, :]
                         
                         local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
@@ -1138,8 +1152,8 @@ class LLaMA32TensorRTTool:
                             break
     
                         response_tokens.append(next_token.item())
-                        next_token = next_token.view(1, 1)
-                        input_ids = torch.cat([input_ids, next_token], dim=-1)
+                        inputs.input_ids = torch.cat([inputs.input_ids, next_token.unsqueeze(0)], dim=-1)
+                        inputs.attention_mask = torch.cat([inputs.attention_mask, torch.ones((1, 1), device=self.device)], dim=-1)
     
                         del outputs, next_token_logits
                         torch.cuda.empty_cache()
@@ -1179,7 +1193,8 @@ class LLaMA32TensorRTTool:
                 corrective_response = self._generate_corrective_response(user_input, context)
                 self.corrective_training(user_input, [], corrective_response)  # Empty response_tokens due to error
                 continue  # Retry generation after corrective training
-                
+
+  
     def _generate_corrective_response(self, user_input, context):
         """
         Generate a corrective response using the base model or chain-of-thought reasoning.
@@ -1213,10 +1228,9 @@ class LLaMA32TensorRTTool:
         
     
     def is_garbage_output(self, entropy, partial_tokens):
-        """Detect garbage outputs based on entropy spikes and partial token patterns."""
-        if entropy > 3.0:  # Threshold for detecting excessive entropy (indicates randomness)
+        if entropy > 4.0:  # Increased threshold from 3.0 to 4.0
             return True
-        if len(partial_tokens) > 10 and partial_tokens[-10:] == partial_tokens[-20:-10]:  # Repetitive pattern detection
+        if len(partial_tokens) > 20 and len(set(partial_tokens[-20:])) < 5:  # Check for low variety in recent tokens
             return True
         return False
         
@@ -1411,9 +1425,11 @@ class LLaMA32TensorRTTool:
         return False
     
     def _calculate_perplexity(self, tokens):
+        if not tokens:
+            return float('inf')  # Return a high perplexity for empty responses
         try:
             with torch.no_grad():
-                inputs = torch.tensor([tokens], dtype=torch.long).to(self.device)  # Ensure long dtype
+                inputs = torch.tensor([tokens], dtype=torch.long).to(self.device)
                 outputs = self.model(inputs)
                 logits = outputs.logits[:, :-1, :].contiguous()
                 target = inputs[:, 1:].contiguous()
@@ -1424,6 +1440,8 @@ class LLaMA32TensorRTTool:
             return float('inf')
     
     def _has_proper_structure(self, tokens):
+        if isinstance(tokens, str):
+            tokens = self.tokenizer.encode(tokens, add_special_tokens=False)
         decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
         sentences = re.split(r'(?<=[.!?])\s+', decoded_text.strip())
         
