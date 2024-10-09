@@ -833,7 +833,7 @@ class LLaMA32TensorRTTool:
     
             # Ensure the special tokens are set correctly
             self._ensure_special_tokens(tokenizer)
-            
+    
             return tokenizer
         except Exception as e:
             logging.error(f"Failed to initialize tokenizer: {str(e)}")
@@ -841,11 +841,12 @@ class LLaMA32TensorRTTool:
             return None
     
     def _ensure_special_tokens(self, tokenizer):
+        # Define special tokens if not present
         special_tokens = {
             'pad_token': "<|finetune_right_pad_id|>",
             'eos_token': "<|eot_id|>"
         }
-    
+        
         # Check if pad_token or other special tokens are missing and add them
         if tokenizer.pad_token is None or tokenizer.pad_token != special_tokens['pad_token']:
             tokenizer.add_special_tokens({'pad_token': special_tokens['pad_token']})
@@ -1197,11 +1198,11 @@ class LLaMA32TensorRTTool:
         logging.debug(f"Input IDs shape: {input_ids.shape if isinstance(input_ids, torch.Tensor) else 'Not a tensor'}")
         logging.debug(f"Target IDs shape: {target_ids.shape if isinstance(target_ids, torch.Tensor) else 'Not a tensor'}")
     
-        if isinstance(input_ids, list):
-            input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
-        if isinstance(target_ids, list):
-            target_ids = torch.tensor(target_ids, dtype=torch.long, device=self.device)
+        # Ensure input tensors are on the correct device
+        input_ids = input_ids.to(self.device) if input_ids.device != self.device else input_ids
+        target_ids = target_ids.to(self.device) if target_ids.device != self.device else target_ids
     
+        # Adjust dimensions to match expected format
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
         if target_ids.dim() == 1:
@@ -1211,9 +1212,11 @@ class LLaMA32TensorRTTool:
         self.optimizer.zero_grad()
     
         try:
-            print(f"Corrected input shape: {input_ids.shape}, Target shape: {target_ids.shape}")
+            logging.debug(f"Corrected input shape: {input_ids.shape}, Target shape: {target_ids.shape}")
     
-            with torch.amp.autocast('cuda'):
+            # Use mixed precision for memory efficiency
+            with torch.amp.autocast(device_type='cuda', dtype=self.dtype):
+                # Forward pass through the base model to get the hidden states
                 outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True, use_cache=False)
     
                 if isinstance(outputs, tuple):
@@ -1225,38 +1228,43 @@ class LLaMA32TensorRTTool:
                 else:
                     raise ValueError(f"Unexpected output format: {type(outputs)}")
     
-                last_hidden_state = hidden_states[-1]
-                user_intent = self.encode_user_intent(self.tokenizer.decode(input_ids[0]))
-                
+                last_hidden_state = hidden_states[-1].to(self.device)  # Ensure hidden states are on the correct device
+                user_intent = self.encode_user_intent(self.tokenizer.decode(input_ids[0])).to(self.device)
+    
+                # Forward pass through the KAN model
                 modified_hidden_states, kan_refusal_scores = self.kan(
                     last_hidden_state, user_intent, self.emotional_state
                 )
     
-                print(f"Modified hidden states shape: {modified_hidden_states.shape}")
-                print(f"KAN refusal scores shape: {kan_refusal_scores.shape}")
+                logging.debug(f"Modified hidden states shape: {modified_hidden_states.shape}")
+                logging.debug(f"KAN refusal scores shape: {kan_refusal_scores.shape}")
     
+                # Compute the language modeling loss
                 lm_logits = self.model.lm_head(modified_hidden_states)
                 lm_loss = F.cross_entropy(lm_logits.view(-1, lm_logits.size(-1)), target_ids.view(-1), ignore_index=-100)
     
+                # Compute the refusal loss based on binary classification
                 refusal_loss = F.binary_cross_entropy_with_logits(
                     kan_refusal_scores.view(-1), torch.full((kan_refusal_scores.numel(),), refusal_score, device=self.device)
                 )
     
+                # Combine losses with a weighted sum
                 loss = lm_loss + self.kan_loss_weight * refusal_loss
     
-            # Scale the loss
+            # Scale the loss for mixed precision training
             scaled_loss = self.scaler.scale(loss)
             scaled_loss.backward()
     
-            # Unscale the gradients
+            # Unscale gradients and apply clipping
             self.scaler.unscale_(self.optimizer)
-    
-            # Clip gradients
             torch.nn.utils.clip_grad_norm_(self.kan.parameters(), max_norm=1.0)
     
-            # Optimizer step and update scaler
+            # Perform optimizer step and update the scaler
             self.scaler.step(self.optimizer)
             self.scaler.update()
+    
+            # Log loss values for debugging
+            logging.info(f"Language Model Loss: {lm_loss.item():.4f}, Refusal Loss: {refusal_loss.item():.4f}, Total Loss: {loss.item():.4f}")
     
             return lm_loss.item(), refusal_loss.item()
     
