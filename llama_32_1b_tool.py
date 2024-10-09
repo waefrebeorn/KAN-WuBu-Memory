@@ -1308,7 +1308,8 @@ class LLaMA32TensorRTTool:
         logging.info(f"Generating response for input: '{user_input}' with context size: {len(context)}")
     
         prompt = f"{context}\nUser: {user_input}\nAssistant:"
-        inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=self.model.config.max_position_embeddings)
+        inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, 
+                                max_length=self.model.config.max_position_embeddings)
     
         # Ensure all inputs are on the correct device
         inputs = self.ensure_cuda(inputs)
@@ -1339,7 +1340,8 @@ class LLaMA32TensorRTTool:
     
                     response_tokens.append(next_token.item())
                     inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0)], dim=-1)
-                    inputs['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones((1, 1), device=self.device)], dim=-1)
+                    inputs['attention_mask'] = torch.cat([inputs['attention_mask'], 
+                                                        torch.ones((1, 1), device=self.device)], dim=-1)
     
                 except RuntimeError as e:
                     # Check if it's a CUDA OOM error or a device mismatch
@@ -1347,16 +1349,21 @@ class LLaMA32TensorRTTool:
                         logging.warning(f"CUDA error at step {step}. Attempting to recover...")
                         torch.cuda.empty_cache()  # Clear CUDA cache to avoid OOM
     
-                        # Attempt to reload parameters to the correct device
-                        self._reload_model_parameters()  # This method will be created to handle reloading
+                        # Attempt to reload model parameters to the correct device
+                        self._reload_model_parameters()  # This method handles moving parameters to the GPU
     
-                        # Retry generating the response
-                        inputs = self.ensure_cuda(inputs)  # Move inputs to the GPU again
+                        # Ensure all inputs are on the GPU again
+                        inputs = self.ensure_cuda(inputs)
+    
                         continue  # Retry the current generation step
     
                     else:
                         logging.error(f"Unexpected RuntimeError during generation: {str(e)}")
                         raise  # Re-raise if it's a different error
+    
+                except Exception as e:
+                    logging.error(f"Unexpected error during generation: {str(e)}")
+                    raise  # Re-raise for unhandled exceptions
     
         avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
         quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
@@ -1372,6 +1379,7 @@ class LLaMA32TensorRTTool:
             self.corrective_training(user_input, response_tokens, corrective_response)
             return self._generate_response(user_input, context)
     
+    
     def _reload_model_parameters(self):
         """Reload model parameters to ensure they are on the correct device."""
         logging.info("Reloading model parameters to ensure they are on the GPU.")
@@ -1379,6 +1387,9 @@ class LLaMA32TensorRTTool:
             if param.is_meta:  # Check if the parameter is still on meta
                 param.data = param.data.to(self.device)  # Move to GPU
                 logging.info(f"Moved parameter '{name}' from meta to {self.device}")
+            elif param.device != self.device:  # Check if parameter is on CPU
+                param.data = param.data.to(self.device)  # Move to GPU
+                logging.info(f"Moved parameter '{name}' from {param.device} to {self.device}")
     
     
     def ensure_cuda(self, tensor_or_dict):
