@@ -653,7 +653,7 @@ class LLaMA32TensorRTTool:
         self.dtype = torch.float16 
         self.model = None
         self.config = None
-        self.emotional_state = EmotionalState(device=self.device) 
+        self.emotional_state = EmotionalState() 
         self.system_prompt = ""
         self.optimizer = None
         self.learning_rate = 1e-5
