@@ -1752,24 +1752,44 @@ class LLaMA32TensorRTTool:
     def has_proper_structure(self, tokens):
         """Check for proper structure in a decoded response."""
         try:
+            # Validate input type and convert to tensor if necessary
             if isinstance(tokens, str):
-                raise ValueError("Input to has_proper_structure must be a list of token IDs or a tensor.")
-
-            if isinstance(tokens, list) or isinstance(tokens, torch.Tensor):
-                if len(tokens) == 0 or (isinstance(tokens, torch.Tensor) and tokens.numel() == 0):
-                    logging.warning("Empty tokens received in has_proper_structure.")
+                logging.warning("Received string input in has_proper_structure. Attempting to convert to token IDs.")
+                tokens = self.tokenizer.encode(tokens, add_special_tokens=False)
+            
+            if not isinstance(tokens, (list, torch.Tensor)):
+                logging.error(f"Unexpected type for tokens in has_proper_structure: {type(tokens)}")
+                return False
+    
+            if isinstance(tokens, torch.Tensor):
+                if tokens.numel() == 0:
+                    logging.warning("Empty tensor received in has_proper_structure. Returning False.")
                     return False
-
-                decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
-            else:
-                raise ValueError(f"Unexpected type for tokens in has_proper_structure: {type(tokens)}")
-
-            sentences = re.split(r'(?<=[.!?])\s+', decoded_text.strip())
-            return len(sentences) > 0 and sentences[0][0].isupper() and sentences[-1][-1] in '.!?'
+            elif len(tokens) == 0:
+                logging.warning("Empty list received in has_proper_structure. Returning False.")
+                return False
+    
+            # Decode tokens to text for structure checking
+            decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True).strip()
+            
+            if not decoded_text:  # Handle empty or whitespace-only decoded text
+                logging.warning("Decoded text is empty or consists of only whitespace. Returning False.")
+                return False
+    
+            # Split the decoded text into sentences based on punctuation
+            sentences = re.split(r'(?<=[.!?])\s+', decoded_text)
+    
+            # Validate that the response has at least one complete sentence
+            if not sentences or len(sentences) == 0 or sentences[0] == "":
+                logging.warning(f"Failed to extract sentences from decoded text: '{decoded_text}'")
+                return False
+    
+            # Check if the first sentence starts with a capital letter and the last sentence ends with a punctuation
+            return sentences[0][0].isupper() and sentences[-1][-1] in '.!?'
         except Exception as e:
             logging.error(f"Error in has_proper_structure: {str(e)}")
             return False
-
+    
     def _calculate_relevance(self, input_text, response_text):
         input_tokens = set(self.tokenizer.encode(input_text))
         response_tokens = set(self.tokenizer.encode(response_text))
@@ -1790,9 +1810,6 @@ class LLaMA32TensorRTTool:
         elif isinstance(target_ids, torch.Tensor):
             target_ids = target_ids.to(self.device, dtype=torch.long, non_blocking=True)
     
-        # Confirm input tensor shapes and devices
-        assert input_ids.device == self.device, f"Input IDs are on {input_ids.device} instead of {self.device}"
-        assert target_ids.device == self.device, f"Target IDs are on {target_ids.device} instead of {self.device}"
     
         # Adjust dimensions to match expected format (batch_size, seq_length)
         if input_ids.dim() == 1:
