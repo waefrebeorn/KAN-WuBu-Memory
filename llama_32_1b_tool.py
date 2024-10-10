@@ -1704,23 +1704,31 @@ class LLaMA32TensorRTTool:
         return False
     
     def _calculate_perplexity(self, tokens):
-        if not tokens:
+        if not tokens or len(tokens) == 0:  # Check for empty tokens at the very beginning
+            logging.warning("Empty tokens received in _calculate_perplexity. Returning default perplexity value.")
             return 1.0  # Return lowest perplexity for empty responses
+
         try:
             # Ensure tokens is a non-empty tensor on the correct device
             if isinstance(tokens, list):
-                if not tokens:
-                    return 1.0  # Return lowest perplexity for empty list
+                if len(tokens) == 0:  # Double-check for empty list
+                    logging.warning("Empty list detected in _calculate_perplexity. Returning default perplexity value.")
+                    return 1.0
                 tokens = torch.tensor(tokens, dtype=torch.long, device=self.device)
             elif isinstance(tokens, torch.Tensor):
-                if tokens.numel() == 0:
-                    return 1.0  # Return lowest perplexity for empty tensor
+                if tokens.numel() == 0:  # Check for empty tensor
+                    logging.warning("Empty tensor detected in _calculate_perplexity. Returning default perplexity value.")
+                    return 1.0
                 tokens = tokens.to(self.device)
             else:
                 raise ValueError(f"Unexpected type for tokens: {type(tokens)}")
-    
+
+            if tokens.size(0) == 0:  # Final check before feeding into the model
+                logging.warning("Empty batch detected in _calculate_perplexity. Returning default perplexity value.")
+                return 1.0
+
             inputs = tokens.unsqueeze(0)  # Add batch dimension
-            
+
             with torch.no_grad():
                 outputs = self.model(inputs, labels=inputs)
                 loss = outputs.loss
@@ -1729,42 +1737,52 @@ class LLaMA32TensorRTTool:
         except Exception as e:
             logging.error(f"Error calculating perplexity: {str(e)}")
             return float('inf')  # Return highest perplexity for error cases
-            
+
+    
         
     def has_proper_structure(self, tokens):
         try:
+            # Log the type of the input for debugging
+            logging.info(f"Received tokens of type: {type(tokens)}")
+
             if isinstance(tokens, str):
+                # If it's a raw string, use it directly
                 decoded_text = tokens
-            else:
-                # Assume tokens is a list or tensor of token IDs
+            elif isinstance(tokens, list) or isinstance(tokens, torch.Tensor):
+                # Convert list or tensor of token IDs to string
                 decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
-    
+            else:
+                raise ValueError(f"Unexpected type for tokens in has_proper_structure: {type(tokens)}")
+
             sentences = re.split(r'(?<=[.!?])\s+', decoded_text.strip())
-            
-            if not sentences:
+
+            if not sentences or len(sentences) == 0:
                 logging.warning("No complete sentences found in the response.")
                 return False
-        
-            if not sentences[0][0].isupper():
+
+            # Ensure the first sentence starts with a capital letter
+            if not sentences[0] or not sentences[0][0].isupper():
                 logging.warning(f"First sentence doesn't start with a capital letter: '{sentences[0]}'")
                 return False
-        
+
+            # Ensure the last sentence ends with proper punctuation
             if sentences[-1][-1] not in '.!?':
                 logging.warning(f"Last sentence doesn't end with proper punctuation: '{sentences[-1]}'")
                 return False
-        
-            proper_sentences = sum(1 for s in sentences if s[0].isupper() and s[-1] in '.!?')
-            proper_ratio = proper_sentences / len(sentences)
-        
+
+            # Calculate the ratio of properly formatted sentences
+            proper_sentences = sum(1 for s in sentences if s and s[0].isupper() and s[-1] in '.!?')
+            proper_ratio = proper_sentences / len(sentences) if len(sentences) > 0 else 0
+
             if proper_ratio < 0.5:
                 logging.warning(f"Only {proper_ratio:.2f} of sentences have proper structure.")
                 return False
-                
+
             return True
         except Exception as e:
             logging.error(f"Error in has_proper_structure: {str(e)}")
             return False
-            
+    
     def _calculate_relevance(self, input_text, response_text):
         input_tokens = set(self.tokenizer.encode(input_text))
         response_tokens = set(self.tokenizer.encode(response_text))
