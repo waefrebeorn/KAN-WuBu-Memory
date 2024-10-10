@@ -708,7 +708,7 @@ class LLaMA32TensorRTTool:
         self.tensor_swapper = None
     
         self.scaler = torch.amp.GradScaler()
-        self.amp_context = torch.amp.autocast(device_type='cuda', dtype=torch.float16)
+        self.amp_context = torch.cuda.amp.autocast(dtype=torch.float16)
     
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
@@ -1290,15 +1290,16 @@ class LLaMA32TensorRTTool:
         max_response_length = 2000
     
         # Step 3: Generate response using mixed precision and ensure memory is handled efficiently
-        with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+        with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
             for step in range(max_response_length):
                 try:
                     # Ensure all inputs are fully on GPU to prevent device mismatch errors
                     inputs = {key: value.to(self.device) for key, value in inputs.items()}
-    
+        
                     # Step 4: Forward pass through the model
                     outputs = self.model(**inputs)
                     next_token_logits = outputs.logits[:, -1, :].to(self.device)
+        
     
                     # Calculate local entropy
                     local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
@@ -1444,12 +1445,59 @@ class LLaMA32TensorRTTool:
     
         
     
-    def is_garbage_output(self, entropy, partial_tokens):
-        if entropy > 4.0:  # Increased threshold from 3.0 to 4.0
+    def is_garbage_output(self, entropy, partial_tokens, step=0):
+        """
+        Detect if the response is potentially garbled or of low quality.
+        
+        Args:
+            entropy (float): The entropy value of the most recently generated token.
+            partial_tokens (list[int]): The list of generated token IDs so far.
+            step (int): Current generation step, to adjust sensitivity based on the stage of response generation.
+    
+        Returns:
+            bool: True if the response is detected as garbage, otherwise False.
+        """
+        # 1. Dynamic Entropy Threshold Adjustment Based on Step
+        # Gradually increase entropy tolerance during initial generation steps to avoid premature garbage detection.
+        max_entropy_threshold = 5.0 if step > 10 else 8.0  # Use a higher threshold initially
+        if entropy > max_entropy_threshold:
+            logging.warning(f"High entropy detected (entropy = {entropy:.2f} at step {step}). Marking as garbage.")
             return True
-        if len(partial_tokens) > 20 and len(set(partial_tokens[-20:])) < 5:  # Check for low variety in recent tokens
-            return True
+    
+        # 2. Check for Excessive Repetition in Recent Tokens
+        if len(partial_tokens) > 20:
+            recent_tokens = partial_tokens[-20:]
+            unique_tokens = set(recent_tokens)
+    
+            # Adjust sensitivity based on repetition and diversity in recent tokens
+            if len(unique_tokens) < 5 and step > 5:  # Only activate this check after the initial generation phase
+                logging.warning("Low diversity detected in recent tokens. Marking as garbage output.")
+                return True
+    
+            # Additional n-gram repetition detection (e.g., repeating patterns of 3-grams)
+            ngram_size = 3
+            ngrams = [tuple(recent_tokens[i:i + ngram_size]) for i in range(len(recent_tokens) - ngram_size + 1)]
+            if len(set(ngrams)) < len(ngrams) // 2:
+                logging.warning("Excessive n-gram repetition detected. Marking as garbage output.")
+                return True
+    
+        # 3. Detect Incoherent Sequences in the Generated Text
+        if len(partial_tokens) > 50:  # Check for incoherence only after some content has been generated
+            decoded_text = self.tokenizer.decode(partial_tokens[-50:], skip_special_tokens=True)
+    
+            # Check for overly repeated phrases or patterns of characters
+            if re.search(r"(.)\1{4,}", decoded_text):  # e.g., "aaaa", "!!!!", etc.
+                logging.warning("Detected repeated character patterns in generated text. Marking as garbage output.")
+                return True
+    
+            # Check for sequences of symbols without alphanumeric content
+            if re.search(r"[^\w\s]{10,}", decoded_text):  # e.g., "!!!!!!?????!!!!"
+                logging.warning("Detected excessive symbol sequences in generated text. Marking as garbage output.")
+                return True
+    
+        # If none of the above conditions are met, the output is not considered garbage
         return False
+    
         
     def _is_response_complete(self, partial_response):
         # Check if the response seems complete based on content
@@ -1825,9 +1873,10 @@ class LLaMA32TensorRTTool:
             logging.debug(f"Input Shape: {input_ids.shape}, Target Shape: {target_ids.shape}")
     
             # Use mixed precision for memory efficiency and faster training
-            with torch.cuda.amp.autocast(device_type='cuda', dtype=self.dtype):
+            with torch.cuda.amp.autocast(dtype=self.dtype):
                 # Forward pass through the base model to get the hidden states
                 outputs = self.model(input_ids=input_ids, labels=target_ids, output_hidden_states=True, use_cache=False)
+            
     
                 # Extract the loss, logits, and hidden states from the model outputs
                 if isinstance(outputs, tuple):
@@ -1955,8 +2004,9 @@ class LLaMA32TensorRTTool:
             ).to(self.device, non_blocking=True)  # Use non_blocking to speed up data transfer
     
             # Step 2: Perform a forward pass through the model using mixed precision context for memory efficiency
-            with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
                 outputs = self.model(**inputs, output_hidden_states=True)
+            
     
             # Step 3: Extract the last hidden states and compute the mean representation for user intent
             hidden_states = outputs.hidden_states[-1].to(self.device, non_blocking=True)
