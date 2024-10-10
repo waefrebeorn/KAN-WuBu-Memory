@@ -49,6 +49,7 @@ def setup_logging():
         "train_kan_step -",
         "Torch was not compiled with flash attention."
         "1Torch was not compiled with flash attention."
+        ".*Torch was not compiled with flash attention.*"
     ]
 
     console_handler.addFilter(LogFilter(ignore_patterns))
