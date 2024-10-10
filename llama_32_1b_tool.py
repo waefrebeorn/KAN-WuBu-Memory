@@ -708,7 +708,7 @@ class LLaMA32TensorRTTool:
         self.tensor_swapper = None
     
         self.scaler = torch.amp.GradScaler()
-        self.amp_context = torch.cuda.amp.autocast(dtype=torch.float16)
+        self.amp_context = torch.amp.autocast(device_type='cuda', dtype=torch.float16)
     
         self.response_end_sequences = ["<|eot_id|>", "\n\nHuman:", "\n\nUser:"]
         self.max_response_length = 1000
@@ -771,14 +771,6 @@ class LLaMA32TensorRTTool:
                 hidden_size = self.config.hidden_size
                 num_emotional_dimensions = len(self.emotional_state.dimensions)
     
-                # Initialize the tokenizer
-                self.tokenizer = self._initialize_tokenizer()
-                if self.tokenizer is None:
-                    raise RuntimeError("Failed to initialize tokenizer")
-    
-                # Ensure GPU memory is freed before initializing models
-                self.clear_memory()
-    
                 # Initialize the model entirely on GPU with gradient checkpointing enabled
                 with self.amp_context:
                     self.model = self._initialize_model_full_gpu()
@@ -790,7 +782,12 @@ class LLaMA32TensorRTTool:
     
                 self.clear_memory()  # Free memory after model initialization
     
-                # Ensure the model is compatible with the tokenizer
+                # Initialize the tokenizer after model to ensure compatibility
+                self.tokenizer = self._initialize_tokenizer()
+                if self.tokenizer is None:
+                    raise RuntimeError("Failed to initialize tokenizer")
+    
+                # Ensure the model is compatible with the tokenizer (post-initialization adjustments)
                 self._update_model_for_tokenizer()
     
                 # Tie weights after moving to device
@@ -801,7 +798,7 @@ class LLaMA32TensorRTTool:
     
                 # Initialize KAN (Knowledge-Augmented Network) with half precision
                 self.kan = self._initialize_kan(hidden_size, num_emotional_dimensions, vocab_size, self.model)
-                
+    
                 if list(self.kan.parameters()):
                     self.optimizer = torch.optim.AdamW(
                         self.kan.parameters(),
@@ -874,7 +871,7 @@ class LLaMA32TensorRTTool:
         # If initialization fails after maximum attempts, log an error and exit
         logging.error("Failed to initialize components after maximum attempts.")
         raise RuntimeError("Component initialization failed after multiple GPU-only attempts")
- 
+    
     def clear_memory(self):
         torch.cuda.empty_cache()
         gc.collect()

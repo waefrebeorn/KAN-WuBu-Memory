@@ -50,6 +50,7 @@ def setup_logging():
         "Torch was not compiled with flash attention."
         "1Torch was not compiled with flash attention."
         ".*Torch was not compiled with flash attention.*"
+        "FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead."
     ]
 
     console_handler.addFilter(LogFilter(ignore_patterns))
