@@ -225,7 +225,7 @@ class ResponseQualityManager:
             'relevance_score': self.calculate_relevance(user_input, response),
             'length': len(response_tokens),
             'structure': self.has_proper_structure(response),
-            'perplexity': self.calculate_perplexity(response_tokens),
+            'perplexity': self._calculate_perplexity(response_tokens),
         }
 
         # Combine all quality metrics into a final decision
