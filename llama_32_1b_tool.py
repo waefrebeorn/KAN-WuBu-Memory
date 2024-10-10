@@ -492,16 +492,6 @@ class EnhancedKAN(nn.Module):
             logging.error(f"Error in EnhancedKAN.forward: {str(e)}")
             raise
 
-    def is_valid_state(self):
-        try:
-            for name, param in self.named_parameters():
-                if param.device != self.device:
-                    logging.warning(f"Parameter {name} is on device {param.device} instead of {self.device}.")
-                    return False
-            return True
-        except Exception as e:
-            logging.error(f"Error validating KAN state: {str(e)}")
-            return False
   
 class EntropyManager:
     def __init__(self, model, tokenizer, device):
@@ -1530,12 +1520,18 @@ class LLaMA32TensorRTTool:
         
     def corrective_training(self, user_input, response_tokens, corrective_response):
         try:
+            # Ensure response_tokens is a tensor before passing to the training step
+            if isinstance(response_tokens, list):
+                response_tokens = torch.tensor(response_tokens, dtype=torch.long, device=self.device)
+            elif isinstance(response_tokens, torch.Tensor):
+                response_tokens = response_tokens.to(self.device)
+    
             # Encode the corrective response as the target for training and move to GPU
             target_ids = self.tokenizer.encode(corrective_response, return_tensors="pt").to(self.device, non_blocking=True)
     
             # Perform a training step using the invalid response and the corrective response
             lm_loss, refusal_loss = self.train_kan_step(
-                response_tokens,  # This is already a list of token IDs
+                response_tokens,  # Ensure this is a tensor
                 target_ids[0],    # Remove the batch dimension and ensure GPU alignment
                 refusal_score=0.0  # Assume no refusal in this corrective context
             )
@@ -1544,7 +1540,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during corrective training: {str(e)}")
             logging.error(traceback.format_exc())
             return None, None
-    
+            
  
     def comprehensive_corrective_training(self, user_input, response_tokens, context):
         """
@@ -1704,13 +1700,13 @@ class LLaMA32TensorRTTool:
         return False
     
     def _calculate_perplexity(self, tokens):
-        # Early check for empty or invalid tokens
+        """Calculate perplexity while ensuring inputs are on the correct GPU."""
         if not tokens or (isinstance(tokens, list) and len(tokens) == 0) or (isinstance(tokens, torch.Tensor) and tokens.numel() == 0):
             logging.warning("Empty tokens received in _calculate_perplexity. Returning default perplexity value.")
             return 1.0  # Return lowest perplexity for empty responses
 
         try:
-            # Convert list to tensor if necessary
+            # Convert list to tensor and move to GPU if necessary
             if isinstance(tokens, list):
                 tokens = torch.tensor(tokens, dtype=torch.long, device=self.device)
             elif isinstance(tokens, torch.Tensor):
@@ -1718,12 +1714,11 @@ class LLaMA32TensorRTTool:
             else:
                 raise ValueError(f"Unexpected type for tokens: {type(tokens)}")
 
-            # Double-check for non-empty tensor before further processing
-            if tokens.numel() == 0 or tokens.size(0) == 0:
-                logging.warning("Empty or zero-sized tensor detected in _calculate_perplexity. Returning default perplexity value.")
+            if tokens.size(0) == 0:
+                logging.warning("Empty batch detected in _calculate_perplexity. Returning default perplexity value.")
                 return 1.0
 
-            inputs = tokens.unsqueeze(0)  # Add batch dimension
+            inputs = tokens.unsqueeze(0).to(self.device)  # Add batch dimension and ensure on GPU
 
             with torch.no_grad():
                 outputs = self.model(inputs, labels=inputs)
@@ -1733,18 +1728,14 @@ class LLaMA32TensorRTTool:
         except Exception as e:
             logging.error(f"Error calculating perplexity: {str(e)}")
             return float('inf')  # Return highest perplexity for error cases
-    
         
     def has_proper_structure(self, tokens):
+        """Check for proper structure in a decoded response."""
         try:
-            # Ensure the input is a list of IDs or a tensor, not a string
             if isinstance(tokens, str):
-                logging.error(f"Received raw string instead of token IDs in has_proper_structure: {tokens[:50]}...")
                 raise ValueError("Input to has_proper_structure must be a list of token IDs or a tensor.")
 
-            # Convert to decoded text if tokens is a list or tensor
             if isinstance(tokens, list) or isinstance(tokens, torch.Tensor):
-                # Check if the list or tensor is empty
                 if len(tokens) == 0 or (isinstance(tokens, torch.Tensor) and tokens.numel() == 0):
                     logging.warning("Empty tokens received in has_proper_structure.")
                     return False
@@ -1753,37 +1744,8 @@ class LLaMA32TensorRTTool:
             else:
                 raise ValueError(f"Unexpected type for tokens in has_proper_structure: {type(tokens)}")
 
-            # Ensure the decoded text is not empty
-            if not decoded_text or len(decoded_text.strip()) == 0:
-                logging.warning("Decoded text is empty in has_proper_structure.")
-                return False
-
-            # Split into sentences and validate structure
             sentences = re.split(r'(?<=[.!?])\s+', decoded_text.strip())
-
-            if not sentences or len(sentences) == 0:
-                logging.warning("No complete sentences found in the response.")
-                return False
-
-            # Ensure the first sentence starts with a capital letter
-            if not sentences[0][0].isupper():
-                logging.warning(f"First sentence doesn't start with a capital letter: '{sentences[0]}'")
-                return False
-
-            # Ensure the last sentence ends with proper punctuation
-            if sentences[-1][-1] not in '.!?':
-                logging.warning(f"Last sentence doesn't end with proper punctuation: '{sentences[-1]}'")
-                return False
-
-            # Calculate the ratio of properly formatted sentences
-            proper_sentences = sum(1 for s in sentences if s and s[0].isupper() and s[-1] in '.!?')
-            proper_ratio = proper_sentences / len(sentences) if len(sentences) > 0 else 0
-
-            if proper_ratio < 0.5:
-                logging.warning(f"Only {proper_ratio:.2f} of sentences have proper structure.")
-                return False
-
-            return True
+            return len(sentences) > 0 and sentences[0][0].isupper() and sentences[-1][-1] in '.!?'
         except Exception as e:
             logging.error(f"Error in has_proper_structure: {str(e)}")
             return False
@@ -1797,14 +1759,16 @@ class LLaMA32TensorRTTool:
     def train_kan_step(self, input_ids, target_ids, refusal_score):
         logging.info("Starting train_kan_step in comprehensive corrective training")
     
-        # Validate KAN model state
-        if not self.kan.is_valid_state():
-            logging.error("KAN model is in an invalid state. Aborting training step.")
-            return 0.0, 0.0
-    
-        # Ensure input_ids and target_ids are torch tensors, move to GPU, and validate device placement
-        input_ids = input_ids.to(self.device, dtype=torch.long, non_blocking=True)
-        target_ids = target_ids.to(self.device, dtype=torch.long, non_blocking=True)
+        # Ensure input_ids and target_ids are torch tensors, convert if they are not
+        if isinstance(input_ids, list):
+            input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
+        elif isinstance(input_ids, torch.Tensor):
+            input_ids = input_ids.to(self.device, dtype=torch.long, non_blocking=True)
+        
+        if isinstance(target_ids, list):
+            target_ids = torch.tensor(target_ids, dtype=torch.long, device=self.device)
+        elif isinstance(target_ids, torch.Tensor):
+            target_ids = target_ids.to(self.device, dtype=torch.long, non_blocking=True)
     
         # Confirm input tensor shapes and devices
         assert input_ids.device == self.device, f"Input IDs are on {input_ids.device} instead of {self.device}"
