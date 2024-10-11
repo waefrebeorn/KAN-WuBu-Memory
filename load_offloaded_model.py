@@ -137,8 +137,11 @@ class CustomAttentionLayer(nn.Module):
         k = k.view(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
         v = v.view(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
 
+        if position_ids is not None:
+            freqs_cis = freqs_cis[position_ids]
+
         # Apply rotary embeddings
-        q_rot, k_rot = apply_rotary_emb(q, k, freqs_cis[position_ids])
+        q_rot, k_rot = apply_rotary_emb(q, k, freqs_cis)
 
         # Handle past_key_values
         if past_key_value is not None:
@@ -183,14 +186,18 @@ class CustomLlamaModel(LlamaForCausalLM):
         
         self.freqs_cis = get_rotary_frequencies(self.hidden_size)
 
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, return_dict=True):
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, cache_position=None, return_dict=True):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
         batch_size, seq_length = input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
 
         if position_ids is None:
-            position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0)
+            if cache_position is not None:
+                position_ids = torch.arange(cache_position, cache_position + seq_length, dtype=torch.long, device=inputs_embeds.device)
+                position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+            else:
+                position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0).expand(batch_size, -1)
 
         if past_key_values is None:
             past_key_values = [None] * self.num_hidden_layers
@@ -199,7 +206,8 @@ class CustomLlamaModel(LlamaForCausalLM):
         presents = [] if use_cache else None
 
         for i, layer in enumerate(self.transformer_layers):
-            hidden_states, past = layer(hidden_states, self.freqs_cis, past_key_values[i], position_ids)
+            layer_past = past_key_values[i] if past_key_values is not None else None
+            hidden_states, past = layer(hidden_states, self.freqs_cis, layer_past, position_ids)
             if use_cache:
                 presents.append(past)
 
