@@ -886,6 +886,51 @@ class LLaMA32TensorRTTool:
         else:
             return tensor_or_dict
         
+    
+    def _load_dat_file(self, file_path, expected_shape, expected_dtype):
+        with open(file_path, 'rb') as f:
+            # Always load as float32
+            tensor_data = np.fromfile(f, dtype=np.float32)
+        
+        # Reshape the loaded data to match the expected shape
+        tensor_data = tensor_data.reshape(expected_shape)
+        
+        # Convert numpy array to torch tensor
+        loaded_tensor = torch.from_numpy(tensor_data)
+        
+        # Convert to the expected dtype
+        if expected_dtype != torch.float32:
+            loaded_tensor = loaded_tensor.to(expected_dtype)
+        
+        return loaded_tensor
+    
+    def _load_offloaded_weights(self, model, weights_dir):
+        for name, param in model.named_parameters():
+            file_name = name.replace('.', '_') + ".dat"
+            file_path = os.path.join(weights_dir, file_name)
+    
+            if os.path.exists(file_path):
+                expected_shape = param.shape
+                expected_dtype = param.dtype
+                
+                logging.info(f"Loading {file_name} into {name} with expected shape {expected_shape} and type {expected_dtype}")
+                
+                try:
+                    loaded_tensor = self._load_dat_file(file_path, expected_shape, expected_dtype)
+                    
+                    # Ensure the loaded tensor is on the correct device
+                    loaded_tensor = loaded_tensor.to(self.device)
+                    
+                    # Copy the data into the parameter
+                    param.data.copy_(loaded_tensor)
+                    
+                    logging.info(f"Successfully loaded weights for {name}")
+                except Exception as e:
+                    logging.error(f"Error loading weights for {name}: {str(e)}")
+                    raise
+            else:
+                logging.warning(f"Warning: {file_name} not found in offloaded directory.")
+    
     def _initialize_model_full_gpu(self):
         try:
             logging.info(f"Initializing the model on device: {self.device}")
@@ -895,16 +940,18 @@ class LLaMA32TensorRTTool:
             torch.cuda.set_device(self.device)
     
             # Load the model configuration
-            config = AutoConfig.from_pretrained(self.model_path)
+            config_path = os.path.join(self.model_path, "config.json")
+            with open(config_path, "r") as f:
+                config_data = json.load(f)
+            config = AutoConfig.from_pretrained(self.model_path, **config_data)
     
-            # Create an empty model on the specified device using `to_empty` correctly
-            model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16).to_empty(device=self.device)
+            # Create an empty model on the specified device
+            model = AutoModelForCausalLM.from_config(config)
+            model.to(self.device)
     
-            # Allocate all parameters on the specified GPU manually if needed
-            for name, param in model.named_parameters():
-                if param.device == torch.device("meta"):
-                    param.data = torch.empty(param.shape, dtype=param.dtype, device=self.device)
-                    logging.info(f"Allocated memory for parameter '{name}' on {self.device}.")
+            # Load offloaded weights
+            weights_dir = os.path.join(self.model_path, "offload")
+            self._load_offloaded_weights(model, weights_dir)
     
             # Set the model to evaluation mode
             model.eval()
@@ -916,7 +963,6 @@ class LLaMA32TensorRTTool:
             logging.error(f"Error during model initialization: {str(e)}")
             logging.error(traceback.format_exc())
             raise RuntimeError(f"Failed to initialize model on {self.device}.")
-    
     
     def _validate_model_device_placement(self, model):
         for name, param in model.named_parameters():
