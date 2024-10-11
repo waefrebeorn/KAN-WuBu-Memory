@@ -128,11 +128,16 @@ class CustomAttentionLayer(nn.Module):
             raise FileNotFoundError(f"Weight file {file_name} not found.")
 
     def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None):
+        batch_size, seq_length, _ = hidden_states.shape
         q = torch.matmul(hidden_states, self.query_weight.T)
         k = torch.matmul(hidden_states, self.key_weight.T)
         v = torch.matmul(hidden_states, self.value_weight.T)
 
-        # Apply rotary embeddings using position_ids
+        q = q.view(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
+        k = k.view(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
+        v = v.view(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
+
+        # Apply rotary embeddings
         q_rot, k_rot = apply_rotary_emb(q, k, freqs_cis[position_ids])
 
         # Handle past_key_values
@@ -145,9 +150,10 @@ class CustomAttentionLayer(nn.Module):
         attention_probs = nn.functional.softmax(attention_scores, dim=-1)
         output = torch.matmul(attention_probs, v)
 
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_length, -1)
         output = torch.matmul(output, self.output_weight.T)
-        past = (k_rot, v)
-        return output, past
+        
+        return output, (k_rot, v)
 
 # Modify the model's transformer layer to use the custom attention layer
 class CustomTransformerLayer(nn.Module):
@@ -156,12 +162,10 @@ class CustomTransformerLayer(nn.Module):
         self.attention = CustomAttentionLayer(hidden_size, num_heads, layer_index, weights_dir)
         self.layernorm = nn.LayerNorm(hidden_size)
 
-    def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None, cache_position=None):
-        if cache_position is not None:
-            hidden_states = hidden_states[:, cache_position:]
-
+    def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None):
         attention_output, past = self.attention(hidden_states, freqs_cis, past_key_value, position_ids)
-        return self.layernorm(attention_output), past
+        hidden_states = self.layernorm(hidden_states + attention_output)
+        return hidden_states, past
 
 # CustomLlamaModel that integrates custom transformer layers and rotary embeddings
 class CustomLlamaModel(LlamaForCausalLM):
@@ -172,41 +176,39 @@ class CustomLlamaModel(LlamaForCausalLM):
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
 
-        # Replace the model's transformer layers with custom transformer layers
         self.transformer_layers = nn.ModuleList(
             [CustomTransformerLayer(self.hidden_size, self.num_attention_heads, layer_index, weights_dir)
              for layer_index in range(self.num_hidden_layers)]
         )
         
-        # Generate rotary frequencies
         self.freqs_cis = get_rotary_frequencies(self.hidden_size)
 
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, cache_position=None, use_cache=False, return_dict=True):
-        # Get the embedding layer from the parent class (LlamaForCausalLM)
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
-        else:
-            hidden_states = self.get_input_embeddings()(input_ids)
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, return_dict=True):
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # Initialize past_key_values if not provided
-        if past_key_values is None:
-            past_key_values = [None] * len(self.transformer_layers)
+        batch_size, seq_length = input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
 
-        # Ensure position_ids are properly handled
         if position_ids is None:
-            position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0)
 
-        next_past_key_values = []
+        if past_key_values is None:
+            past_key_values = [None] * self.num_hidden_layers
+
+        hidden_states = inputs_embeds
+        presents = [] if use_cache else None
+
         for i, layer in enumerate(self.transformer_layers):
-            hidden_states, past = layer(hidden_states, self.freqs_cis, past_key_values[i], position_ids, cache_position)
-            next_past_key_values.append(past)
+            hidden_states, past = layer(hidden_states, self.freqs_cis, past_key_values[i], position_ids)
+            if use_cache:
+                presents.append(past)
 
         logits = self.lm_head(hidden_states)
 
         if return_dict:
-            return {"logits": logits, "past_key_values": next_past_key_values if use_cache else None}
+            return {"logits": logits, "past_key_values": presents if use_cache else None}
         else:
-            return logits, next_past_key_values if use_cache else None
+            return (logits, presents) if use_cache else logits
 
 
 
@@ -216,20 +218,13 @@ class CustomLlamaModel(LlamaForCausalLM):
 
 # Updated generation logic to ensure inputs are on the correct device
 def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
-    # Clean the history to avoid redundant prompts
-    history = [line for line in history if line.strip()]  # Remove empty lines
-    
-    # Create a simplified context prompt from the last few exchanges
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
     
-    # Prepare inputs for the model
     inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit)
     
-    # Move inputs to the same device as the model
     device = next(model.parameters()).device
     inputs = {key: value.to(device) for key, value in inputs.items()}
     
-    # Generate the response
     with torch.no_grad():
         outputs = model.generate(
             inputs["input_ids"],
@@ -241,20 +236,16 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
             top_p=0.9,
             repetition_penalty=1.2,
             pad_token_id=pad_token_id,
-            use_cache=True,  # Enable caching
+            use_cache=True,
         )
 
-    # Decode the response and format it properly
     response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
     
-    # Ensure clean history management and context length control
-    cleaned_response = response.split("User:")[-1].strip()  # Remove any overlap
-    cleaned_response = re.sub(r'\s+', ' ', cleaned_response)  # Clean excess whitespace
+    cleaned_response = response.split("User:")[-1].strip()
+    cleaned_response = re.sub(r'\s+', ' ', cleaned_response)
     
-    # Append the cleaned response to history
     history.append(f"User: {input_text}\nModel: {cleaned_response}")
     
-    # Trim history to prevent excessive accumulation
     if len(history) > 6:
         history = history[-6:]
 
