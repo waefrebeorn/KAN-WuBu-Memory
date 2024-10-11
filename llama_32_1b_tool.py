@@ -1316,16 +1316,15 @@ class LLaMA32TensorRTTool:
         return sentiment / len(words)
 
 
-    def generate_response(self, input_text, max_new_tokens=150, context_limit=512):
+    def generate_response(self, input_text, context, max_new_tokens=150):
         # Clean and prepare the input
         input_text = input_text.strip()
         
         # Prepare the prompt with the conversation history
-        history = self.memory_manager.get_context(self.emotional_state.get_emotion())
-        prompt = f"{history}\nUser: {input_text}\nAssistant:"
+        prompt = f"{context}\nUser: {input_text}\nAssistant:"
         
         # Tokenize the input
-        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit)
+        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=512)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
         try:
@@ -1334,7 +1333,7 @@ class LLaMA32TensorRTTool:
                 outputs = self.model.generate(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
-                    max_new_tokens=int(max_new_tokens),  # Ensure this is an integer
+                    max_new_tokens=150,  # Use a fixed value instead of max_new_tokens
                     do_sample=True,
                     temperature=0.7,
                     top_k=50,
@@ -1356,21 +1355,24 @@ class LLaMA32TensorRTTool:
             response = re.sub(r'\s+', ' ', response)  # Remove extra whitespace
             response = response.split("User:")[0].strip()  # Remove any generated "User:" prompt
             
+            # Calculate quality metrics
+            quality_metrics = self._calculate_quality_metrics(outputs[0], input_text)
+            
             # Update memory and emotional state
             self.memory_manager.update_memory({"role": "assistant", "content": response}, self.entropy_manager.global_entropy)
             self.update_emotional_state(response, self.entropy_manager.calculate_entropy(outputs.logits[:, -1, :]))
             
-            return response
+            return outputs[0], quality_metrics  # Return both tokens and quality metrics
     
         except RuntimeError as e:
             logging.error(f"RuntimeError during response generation: {str(e)}")
-            return "I apologize, but I encountered an error while generating a response."
+            return None, None
         
         except Exception as e:
             logging.error(f"Unexpected error during response generation: {str(e)}")
             logging.error(traceback.format_exc())
-            return "I'm sorry, but something unexpected occurred. Could you please try again?"
-            
+            return None, None  # Return None for both values in case of an error
+    
     def interact(self, user_input):
         if not self.components_initialized:
             raise RuntimeError("Components not initialized. Call _initialize_components() first.")
@@ -1671,6 +1673,11 @@ class LLaMA32TensorRTTool:
                 # Generate a new response
                 new_response_tokens, new_quality_metrics = self.generate_response(user_input, context)
     
+                # Check if generation was successful
+                if new_response_tokens is None or new_quality_metrics is None:
+                    logging.warning(f"Failed to generate response in iteration {training_iteration}")
+                    continue
+    
                 # Ensure new_response_tokens are on the correct device
                 new_response_tokens = torch.tensor(new_response_tokens, device=self.device, dtype=torch.long, non_blocking=True)
     
@@ -1737,7 +1744,7 @@ class LLaMA32TensorRTTool:
     
             # Clear CUDA cache to prevent memory issues
             torch.cuda.empty_cache()
-    
+            
     
 
     def sample_next_token(self, logits, temperature=1.0, top_p=None):
