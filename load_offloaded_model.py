@@ -5,6 +5,7 @@ import re
 import logging
 from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
 from typing import Tuple
+import json
 
 # Define paths to the directories and files
 SOURCE_DIR = "models/Llama_32_1B/"
