@@ -177,18 +177,21 @@ class CustomLlamaModel(LlamaForCausalLM):
         # Generate rotary frequencies
         self.freqs_cis = get_rotary_frequencies(self.hidden_size)
 
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None):
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None):
         # Handle the case where inputs_embeds are provided (for compatibility with generate())
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
         
+        # If position_ids are provided, they are ignored since rotary embeddings handle positional encodings
+        # Generate rotary embeddings based on the context and hidden size
         for layer in self.transformer_layers:
             hidden_states = layer(hidden_states, self.freqs_cis)
 
         logits = self.lm_head(hidden_states)
         return logits
+
 
 
 # Update the generation logic to include custom transformer layers
