@@ -1334,7 +1334,7 @@ class LLaMA32TensorRTTool:
                 outputs = self.model.generate(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=int(max_new_tokens),  # Ensure this is an integer
                     do_sample=True,
                     temperature=0.7,
                     top_k=50,
@@ -1370,7 +1370,7 @@ class LLaMA32TensorRTTool:
             logging.error(f"Unexpected error during response generation: {str(e)}")
             logging.error(traceback.format_exc())
             return "I'm sorry, but something unexpected occurred. Could you please try again?"
-    
+            
     def interact(self, user_input):
         if not self.components_initialized:
             raise RuntimeError("Components not initialized. Call _initialize_components() first.")
