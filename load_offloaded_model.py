@@ -82,7 +82,6 @@ tokenizer = load_tokenizer(SOURCE_DIR)
 
 # Rotary embedding application with frequency scaling
 def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Assuming xq and xk have shape [batch_size, seq_len, num_heads, head_dim]
     d_q, d_k = xq.shape[-1] // 2, xk.shape[-1] // 2
     xq_ = torch.complex(xq[..., :d_q], xq[..., d_q:])
     xk_ = torch.complex(xk[..., :d_k], xk[..., d_k:])
@@ -95,7 +94,6 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 
 # Generating scaled rotary frequencies for LLaMA 3.2
 def get_rotary_frequencies(hidden_size, max_position_embeddings=128000):
-    """Generate scaled rotary frequencies for LLaMA 3.2."""
     inv_freq = 1.0 / (10000 ** (torch.arange(0, hidden_size, 2).float() / hidden_size))
     
     # Scaling frequencies based on maximum position embeddings
@@ -107,7 +105,7 @@ def get_rotary_frequencies(hidden_size, max_position_embeddings=128000):
     return freqs_cis
 
 # Custom Attention Layer that applies rotary embeddings and processes attention
-class CustomAttentionLayer(torch.nn.Module):
+class CustomAttentionLayer(nn.Module):
     def __init__(self, hidden_size, num_heads, layer_index, weights_dir):
         super(CustomAttentionLayer, self).__init__()
         self.hidden_size = hidden_size
@@ -129,7 +127,6 @@ class CustomAttentionLayer(torch.nn.Module):
             raise FileNotFoundError(f"Weight file {file_name} not found.")
 
     def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None):
-        # Compute the projections
         q = torch.matmul(hidden_states, self.query_weight.T)
         k = torch.matmul(hidden_states, self.key_weight.T)
         v = torch.matmul(hidden_states, self.value_weight.T)
@@ -143,31 +140,24 @@ class CustomAttentionLayer(torch.nn.Module):
             k_rot = torch.cat([past_k, k_rot], dim=-2)
             v = torch.cat([past_v, v], dim=-2)
 
-        # Compute scaled dot-product attention
         attention_scores = torch.matmul(q_rot, k_rot.transpose(-1, -2)) * self.scale
-        attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1)
-
-        # Compute the output by multiplying the attention probabilities by the values
+        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
         output = torch.matmul(attention_probs, v)
 
-        # Final projection to the output
         output = torch.matmul(output, self.output_weight.T)
-
-        # Return new keys and values for caching
         past = (k_rot, v)
         return output, past
 
 # Modify the model's transformer layer to use the custom attention layer
-class CustomTransformerLayer(torch.nn.Module):
+class CustomTransformerLayer(nn.Module):
     def __init__(self, hidden_size, num_heads, layer_index, weights_dir):
         super(CustomTransformerLayer, self).__init__()
         self.attention = CustomAttentionLayer(hidden_size, num_heads, layer_index, weights_dir)
-        self.layernorm = torch.nn.LayerNorm(hidden_size)  # Add layernorm for attention output
+        self.layernorm = nn.LayerNorm(hidden_size)
 
     def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None, cache_position=None):
-        # If cache_position is provided, process only the new positions
         if cache_position is not None:
-            hidden_states = hidden_states[:, cache_position:]  # Slice to only use new positions
+            hidden_states = hidden_states[:, cache_position:]
 
         attention_output, past = self.attention(hidden_states, freqs_cis, past_key_value, position_ids)
         return self.layernorm(attention_output), past
@@ -182,7 +172,7 @@ class CustomLlamaModel(LlamaForCausalLM):
         self.num_attention_heads = config.num_attention_heads
 
         # Replace the model's transformer layers with custom transformer layers
-        self.transformer_layers = torch.nn.ModuleList(
+        self.transformer_layers = nn.ModuleList(
             [CustomTransformerLayer(self.hidden_size, self.num_attention_heads, layer_index, weights_dir)
              for layer_index in range(self.num_hidden_layers)]
         )
@@ -195,33 +185,36 @@ class CustomLlamaModel(LlamaForCausalLM):
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
-            # Use the embedding layer from the parent class
             hidden_states = self.get_input_embeddings()(input_ids)
-    
+
         # Ensure cache_position is handled properly and is an integer
         if position_ids is not None:
-            position_ids = position_ids[:, int(cache_position):] if cache_position is not None else position_ids
+            if cache_position is not None:
+                if isinstance(cache_position, torch.Tensor):
+                    if cache_position.numel() > 1:
+                        logging.warning("cache_position tensor has more than one element; using the first element.")
+                        cache_position = cache_position[0].item()  # Use the first element
+                    else:
+                        cache_position = cache_position.item()  # Convert single-element tensor to Python integer
+                position_ids = position_ids[:, cache_position:]
         else:
             position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
-    
-        # Initialize past_key_values if not provided
+
         if past_key_values is None:
             past_key_values = [None] * len(self.transformer_layers)
-    
-        # Process each transformer layer, passing along past_key_values and cache_position for caching
+
         next_past_key_values = []
         for i, layer in enumerate(self.transformer_layers):
             hidden_states, past = layer(hidden_states, self.freqs_cis, past_key_values[i], position_ids, cache_position)
             next_past_key_values.append(past)
-    
+
         logits = self.lm_head(hidden_states)
-    
-        # Determine return format based on return_dict
+
         if return_dict:
             return {"logits": logits, "past_key_values": next_past_key_values if use_cache else None}
         else:
             return logits, next_past_key_values if use_cache else None
-    
+
 
 
 
