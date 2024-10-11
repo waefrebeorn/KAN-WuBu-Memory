@@ -190,7 +190,7 @@ class CustomLlamaModel(LlamaForCausalLM):
         # Generate rotary frequencies
         self.freqs_cis = get_rotary_frequencies(self.hidden_size)
 
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, cache_position=None):
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, cache_position=None, use_cache=False):
         # Handle the case where inputs_embeds are provided (for compatibility with generate())
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -215,8 +215,12 @@ class CustomLlamaModel(LlamaForCausalLM):
 
         logits = self.lm_head(hidden_states)
 
-        # Return logits and the updated past_key_values
-        return {"logits": logits, "past_key_values": next_past_key_values}
+        # If use_cache is True, return past_key_values for caching
+        if use_cache:
+            return {"logits": logits, "past_key_values": next_past_key_values}
+        else:
+            return {"logits": logits}
+
 
 
 # Updated generation logic to ensure inputs are on the correct device
