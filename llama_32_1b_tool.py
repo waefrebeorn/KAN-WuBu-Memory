@@ -1316,98 +1316,102 @@ class LLaMA32TensorRTTool:
         return sentiment / len(words)
 
 
-    def _generate_response(self, user_input, context):
-        logging.info(f"Generating response for input: '{user_input}' with context size: {len(context)}")
-    
-        # Step 1: Create the input prompt and convert to GPU tensors
-        prompt = f"{context}\nUser: {user_input}\nAssistant:"
-        inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, 
-                                max_length=self.model.config.max_position_embeddings)
+    def generate_response(self, input_text, max_new_tokens=150, context_limit=512):
+        # Clean and prepare the input
+        input_text = input_text.strip()
         
-        # Step 2: Move all input tensors to GPU
-        inputs = {key: value.to(self.device) for key, value in inputs.items()}
-    
-        response_tokens = []
-        total_entropy = 0
-        stop_sequences = [self.tokenizer.eos_token_id, self.tokenizer.encode('<|eot_id|>')[0]]
-        max_response_length = 2000
-    
-        # Step 3: Generate response using mixed precision and ensure memory is handled efficiently
-        with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
-            for step in range(max_response_length):
-                try:
-                    # Ensure all inputs are fully on GPU to prevent device mismatch errors
-                    inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        # Prepare the prompt with the conversation history
+        history = self.memory_manager.get_context(self.emotional_state.get_emotion())
+        prompt = f"{history}\nUser: {input_text}\nAssistant:"
         
-                    # Step 4: Forward pass through the model
-                    outputs = self.model(**inputs)
-                    next_token_logits = outputs.logits[:, -1, :].to(self.device)
+        # Tokenize the input
+        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
+        try:
+            with torch.no_grad():
+                # Generate the response
+                outputs = self.model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_k=50,
+                    top_p=0.95,
+                    repetition_penalty=1.2,
+                    no_repeat_ngram_size=3,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    early_stopping=True
+                )
     
-                    # Calculate local entropy
-                    local_entropy = self.entropy_manager.calculate_entropy(next_token_logits)
-                    total_entropy += local_entropy
-    
-                    # Detect if the model output indicates an invalid state
-                    if self.is_garbage_output(local_entropy, response_tokens):
-                        logging.warning(f"Garbage detected mid-generation at step {step}. Engaging corrective training.")
-                        break
-    
-                    # Step 5: Sample the next token based on entropy-adjusted sampling parameters
-                    sampling_params = self.entropy_manager.adjust_sampling_parameters(local_entropy)
-                    next_token = self.sample_next_token(next_token_logits, **sampling_params)
-    
-                    # Break if stop sequence is detected or maximum response length is reached
-                    if next_token.item() in stop_sequences or len(response_tokens) >= max_response_length:
-                        break
-    
-                    response_tokens.append(next_token.item())
-    
-                    # Step 6: Update inputs by appending the newly generated token
-                    inputs['input_ids'] = torch.cat([inputs['input_ids'], next_token.unsqueeze(0).to(self.device)], dim=-1)
-                    inputs['attention_mask'] = torch.cat([inputs['attention_mask'], 
-                                                        torch.ones((1, 1), device=self.device)], dim=-1)
-    
-                except RuntimeError as e:
-                    if "CUDA out of memory" in str(e):
-                        logging.warning(f"CUDA memory error at step {step}. Attempting to recover...")
-                        torch.cuda.empty_cache()  # Clear CUDA cache to free memory
-                        
-                        # Retry moving inputs to GPU after clearing memory
-                        inputs = {key: value.to(self.device) for key, value in inputs.items()}
-                        continue  # Retry the current generation step
-    
-                    else:
-                        logging.error(f"RuntimeError during response generation at step {step}: {str(e)}")
-                        logging.error(traceback.format_exc())
-                        continue  # Attempt to proceed despite the error
-    
-                except Exception as e:
-                    logging.error(f"Unexpected error during response generation at step {step}: {str(e)}")
-                    logging.error(traceback.format_exc())
-                    raise  # Re-raise for unhandled exceptions
-    
-        # Step 7: Calculate average entropy for the response
-        avg_entropy = total_entropy / len(response_tokens) if response_tokens else 0
-        quality_metrics = self._calculate_quality_metrics(response_tokens, user_input)
-    
-        # Step 8: Check if the generated response is valid; if not, trigger corrective training
-        is_valid, detailed_metrics = self.response_quality_manager.evaluate_response(user_input, response_tokens, context)
-    
-        if is_valid:
-            logging.info("Valid response generated successfully.")
-            return response_tokens, quality_metrics
-        else:
-            logging.warning("Invalid response generated. Initiating corrective training.")
-            corrective_response = self._generate_corrective_response(user_input, context)
+            # Decode the generated response
+            generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            # Execute corrective training with the generated response
-            self.corrective_training(user_input, response_tokens, corrective_response)
+            # Extract only the assistant's response
+            response = generated_text.split("Assistant:")[-1].strip()
             
-            # Retry response generation after corrective adjustments
-            return self._generate_response(user_input, context)
+            # Clean up the response
+            response = re.sub(r'\s+', ' ', response)  # Remove extra whitespace
+            response = response.split("User:")[0].strip()  # Remove any generated "User:" prompt
             
+            # Update memory and emotional state
+            self.memory_manager.update_memory({"role": "assistant", "content": response}, self.entropy_manager.global_entropy)
+            self.update_emotional_state(response, self.entropy_manager.calculate_entropy(outputs.logits[:, -1, :]))
+            
+            return response
     
+        except RuntimeError as e:
+            logging.error(f"RuntimeError during response generation: {str(e)}")
+            return "I apologize, but I encountered an error while generating a response."
+        
+        except Exception as e:
+            logging.error(f"Unexpected error during response generation: {str(e)}")
+            logging.error(traceback.format_exc())
+            return "I'm sorry, but something unexpected occurred. Could you please try again?"
+    
+    def interact(self, user_input):
+        if not self.components_initialized:
+            raise RuntimeError("Components not initialized. Call _initialize_components() first.")
+    
+        self.interaction_count += 1
+    
+        try:
+            # Generate response
+            response = self.generate_response(user_input)
+            
+            # Evaluate response quality
+            is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, response, self.memory_manager.get_context(self.emotional_state.get_emotion()))
+            
+            # If the response is invalid, invoke comprehensive corrective training
+            if not is_valid:
+                logging.warning("Invalid response detected, triggering comprehensive corrective training.")
+                response = self.comprehensive_corrective_training(user_input, response, self.memory_manager.get_context(self.emotional_state.get_emotion()))
+    
+            # Calculate refusal score
+            refusal_score = self.refusal_detector.detect_refusal(self.tokenizer.encode(response))
+    
+            # Perform KAN training step
+            lm_loss, refusal_loss = self.train_kan_step(self.tokenizer.encode(response)[:-1], self.tokenizer.encode(response)[1:], refusal_score)
+            
+            # Validate KAN
+            validation_loss = self.validate_kan()
+    
+            # Update training metrics
+            self.update_training_metrics(lm_loss, validation_loss)
+    
+            # Create and save interaction result
+            interaction_result = self.create_interaction_result(response, refusal_score, lm_loss, refusal_loss, validation_loss)
+            self._save_interaction_state(interaction_result)
+    
+            return interaction_result
+    
+        except Exception as e:
+            logging.error(f"Error during interaction: {str(e)}")
+            logging.error(traceback.format_exc())
+            return {"response": "I apologize, but I encountered an error while processing your input."}
+            
     def _reload_model_parameters(self):
         """Reload model parameters to ensure they are on the correct device."""
         logging.info("Reloading model parameters to ensure they are on the GPU.")
@@ -2101,44 +2105,6 @@ class LLaMA32TensorRTTool:
         plt.savefig('visualization.png')
         plt.close()
 
-    def interact(self, user_input):
-        if not self.components_initialized:
-            raise RuntimeError("Components not initialized. Call _initialize_components() first.")
-    
-        self.interaction_count += 1
-        context = self.memory_manager.get_context(self.emotional_state.get_emotion())
-    
-        try:
-            with self.amp_context:
-                # Move user input to device
-                user_input_tensor = self.tokenizer.encode(user_input, return_tensors='pt')
-                user_input_tensor = user_input_tensor.to(self.device)
-    
-                response_tokens, quality_metrics = self._generate_response(user_input, context)
-            
-            # If the response is invalid, invoke comprehensive corrective training
-            if not self.is_valid_response(response_tokens):
-                logging.warning("Invalid response detected, triggering comprehensive corrective training.")
-                response_tokens, quality_metrics = self.comprehensive_corrective_training(user_input, response_tokens, context)
-    
-        except Exception as e:
-            logging.error(f"Error generating response: {str(e)}")
-            logging.error(traceback.format_exc())
-            return {"response": "I apologize, but I encountered an error while generating a response."}
-    
-        response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
-        self.memory_manager.update_memory({"role": "assistant", "content": response}, quality_metrics['relevance_score'])
-        refusal_score = self.refusal_detector.detect_refusal(response_tokens)
-        self.update_emotional_state(response, quality_metrics['perplexity'])
-    
-        lm_loss, refusal_loss = self.train_kan_step(response_tokens[:-1], response_tokens[1:], refusal_score)
-        validation_loss = self.validate_kan()
-    
-        self.update_training_metrics(lm_loss, validation_loss)
-        interaction_result = self.create_interaction_result(response, refusal_score, lm_loss, refusal_loss, validation_loss)
-        self._save_interaction_state(interaction_result)
-    
-        return interaction_result
         
     def _handle_invalid_response(self):
         logging.warning("Invalid response generated.")
