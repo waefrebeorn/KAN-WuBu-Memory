@@ -1380,22 +1380,33 @@ class LLaMA32TensorRTTool:
         self.interaction_count += 1
     
         try:
+            # Get the current context from the memory manager
+            context = self.memory_manager.get_context(self.emotional_state.get_emotion())
+    
             # Generate response
-            response = self.generate_response(user_input)
+            response_tokens, quality_metrics = self.generate_response(user_input, context)
+            
+            # Decode the response tokens
+            response = self.tokenizer.decode(response_tokens, skip_special_tokens=True) if response_tokens is not None else ""
             
             # Evaluate response quality
-            is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, response, self.memory_manager.get_context(self.emotional_state.get_emotion()))
+            is_valid, quality_metrics = self.response_quality_manager.evaluate_response(user_input, response, context)
             
             # If the response is invalid, invoke comprehensive corrective training
             if not is_valid:
                 logging.warning("Invalid response detected, triggering comprehensive corrective training.")
-                response = self.comprehensive_corrective_training(user_input, response, self.memory_manager.get_context(self.emotional_state.get_emotion()))
+                response_tokens, quality_metrics = self.comprehensive_corrective_training(user_input, response_tokens, context)
+                response = self.tokenizer.decode(response_tokens, skip_special_tokens=True) if response_tokens is not None else ""
     
             # Calculate refusal score
-            refusal_score = self.refusal_detector.detect_refusal(self.tokenizer.encode(response))
+            refusal_score = self.refusal_detector.detect_refusal(response_tokens) if response_tokens is not None else 1.0
     
             # Perform KAN training step
-            lm_loss, refusal_loss = self.train_kan_step(self.tokenizer.encode(response)[:-1], self.tokenizer.encode(response)[1:], refusal_score)
+            lm_loss, refusal_loss = self.train_kan_step(
+                torch.tensor(self.tokenizer.encode(response)[:-1], device=self.device),
+                torch.tensor(self.tokenizer.encode(response)[1:], device=self.device),
+                refusal_score
+            )
             
             # Validate KAN
             validation_loss = self.validate_kan()
@@ -1660,10 +1671,6 @@ class LLaMA32TensorRTTool:
             
  
     def comprehensive_corrective_training(self, user_input, response_tokens, context):
-        """
-        Perform corrective training indefinitely until the KAN produces a coherent response.
-        This method leverages all training tools (CoT, Entropy, Refusal Detection) to refine KAN's behavior.
-        """
         logging.info(f"Starting Indefinite Corrective Training for input: '{user_input}'")
     
         training_iteration = 0
