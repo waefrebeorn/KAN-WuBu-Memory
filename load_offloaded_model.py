@@ -197,30 +197,31 @@ class CustomLlamaModel(LlamaForCausalLM):
         else:
             # Use the embedding layer from the parent class
             hidden_states = self.get_input_embeddings()(input_ids)
-
-        # If position_ids are provided, use them for positional encoding
+    
+        # Ensure cache_position is handled properly and is an integer
         if position_ids is not None:
-            position_ids = position_ids[:, cache_position:] if cache_position is not None else position_ids
+            position_ids = position_ids[:, int(cache_position):] if cache_position is not None else position_ids
         else:
             position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
-
+    
         # Initialize past_key_values if not provided
         if past_key_values is None:
             past_key_values = [None] * len(self.transformer_layers)
-
+    
         # Process each transformer layer, passing along past_key_values and cache_position for caching
         next_past_key_values = []
         for i, layer in enumerate(self.transformer_layers):
             hidden_states, past = layer(hidden_states, self.freqs_cis, past_key_values[i], position_ids, cache_position)
             next_past_key_values.append(past)
-
+    
         logits = self.lm_head(hidden_states)
-
+    
         # Determine return format based on return_dict
         if return_dict:
             return {"logits": logits, "past_key_values": next_past_key_values if use_cache else None}
         else:
             return logits, next_past_key_values if use_cache else None
+    
 
 
 
