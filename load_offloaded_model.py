@@ -191,11 +191,12 @@ class CustomLlamaModel(LlamaForCausalLM):
         self.freqs_cis = get_rotary_frequencies(self.hidden_size)
 
     def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, cache_position=None, use_cache=False, return_dict=True):
-        # Handle the case where inputs_embeds are provided (for compatibility with generate())
+        # Get the embedding layer from the parent class (LlamaForCausalLM)
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
-            hidden_states = self.embed_tokens(input_ids)
+            # Use the embedding layer from the parent class
+            hidden_states = self.get_input_embeddings()(input_ids)
 
         # If position_ids are provided, use them for positional encoding
         if position_ids is not None:
