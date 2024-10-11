@@ -1669,7 +1669,7 @@ class LLaMA32TensorRTTool:
             training_iteration += 1
             try:
                 # Generate a new response
-                new_response_tokens, new_quality_metrics = self._generate_response(user_input, context)
+                new_response_tokens, new_quality_metrics = self.generate_response(user_input, context)
     
                 # Ensure new_response_tokens are on the correct device
                 new_response_tokens = torch.tensor(new_response_tokens, device=self.device, dtype=torch.long, non_blocking=True)
