@@ -5,7 +5,6 @@ import re
 import logging
 from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
 from typing import Tuple
-import json
 
 # Define paths to the directories and files
 SOURCE_DIR = "models/Llama_32_1B/"
@@ -128,14 +127,20 @@ class CustomAttentionLayer(torch.nn.Module):
         else:
             raise FileNotFoundError(f"Weight file {file_name} not found.")
 
-    def forward(self, hidden_states, freqs_cis):
+    def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None):
         # Compute the projections
         q = torch.matmul(hidden_states, self.query_weight.T)
         k = torch.matmul(hidden_states, self.key_weight.T)
         v = torch.matmul(hidden_states, self.value_weight.T)
 
-        # Apply rotary embeddings to queries and keys
-        q_rot, k_rot = apply_rotary_emb(q, k, freqs_cis)
+        # Apply rotary embeddings using position_ids
+        q_rot, k_rot = apply_rotary_emb(q, k, freqs_cis[position_ids])
+
+        # Handle past_key_values
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k_rot = torch.cat([past_k, k_rot], dim=-2)
+            v = torch.cat([past_v, v], dim=-2)
 
         # Compute scaled dot-product attention
         attention_scores = torch.matmul(q_rot, k_rot.transpose(-1, -2)) * self.scale
@@ -143,10 +148,13 @@ class CustomAttentionLayer(torch.nn.Module):
 
         # Compute the output by multiplying the attention probabilities by the values
         output = torch.matmul(attention_probs, v)
-        
+
         # Final projection to the output
         output = torch.matmul(output, self.output_weight.T)
-        return output
+
+        # Return new keys and values for caching
+        past = (k_rot, v)
+        return output, past
 
 # Modify the model's transformer layer to use the custom attention layer
 class CustomTransformerLayer(torch.nn.Module):
@@ -155,9 +163,13 @@ class CustomTransformerLayer(torch.nn.Module):
         self.attention = CustomAttentionLayer(hidden_size, num_heads, layer_index, weights_dir)
         self.layernorm = torch.nn.LayerNorm(hidden_size)  # Add layernorm for attention output
 
-    def forward(self, hidden_states, freqs_cis):
-        attention_output = self.attention(hidden_states, freqs_cis)
-        return self.layernorm(attention_output)
+    def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None, cache_position=None):
+        # If cache_position is provided, process only the new positions
+        if cache_position is not None:
+            hidden_states = hidden_states[:, cache_position:]  # Slice to only use new positions
+
+        attention_output, past = self.attention(hidden_states, freqs_cis, past_key_value, position_ids)
+        return self.layernorm(attention_output), past
 
 # CustomLlamaModel that integrates custom transformer layers and rotary embeddings
 class CustomLlamaModel(LlamaForCausalLM):
@@ -177,25 +189,36 @@ class CustomLlamaModel(LlamaForCausalLM):
         # Generate rotary frequencies
         self.freqs_cis = get_rotary_frequencies(self.hidden_size)
 
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, cache_position=None):
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, cache_position=None):
         # Handle the case where inputs_embeds are provided (for compatibility with generate())
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
-        
-        # Ignoring position_ids and cache_position as rotary embeddings handle positional encodings
-        # Proceed with passing through the transformer layers
-        for layer in self.transformer_layers:
-            hidden_states = layer(hidden_states, self.freqs_cis)
+
+        # If position_ids are provided, use them for positional encoding
+        if position_ids is not None:
+            position_ids = position_ids[:, cache_position:] if cache_position is not None else position_ids
+        else:
+            position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+
+        # Initialize past_key_values if not provided
+        if past_key_values is None:
+            past_key_values = [None] * len(self.transformer_layers)
+
+        # Process each transformer layer, passing along past_key_values and cache_position for caching
+        next_past_key_values = []
+        for i, layer in enumerate(self.transformer_layers):
+            hidden_states, past = layer(hidden_states, self.freqs_cis, past_key_values[i], position_ids, cache_position)
+            next_past_key_values.append(past)
 
         logits = self.lm_head(hidden_states)
-        return logits
+
+        # Return logits and the updated past_key_values
+        return {"logits": logits, "past_key_values": next_past_key_values}
 
 
-
-
-# Update the generation logic to include custom transformer layers
+# Updated generation logic to ensure inputs are on the correct device
 def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
     # Clean the history to avoid redundant prompts
     history = [line for line in history if line.strip()]  # Remove empty lines
@@ -240,7 +263,6 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
         history = history[-6:]
 
     return cleaned_response, history
-
 
 # Interactive input loop to query the model
 def user_input_loop(custom_model, tokenizer):
