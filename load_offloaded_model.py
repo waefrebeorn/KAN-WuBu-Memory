@@ -188,21 +188,13 @@ class CustomLlamaModel(LlamaForCausalLM):
         else:
             hidden_states = self.get_input_embeddings()(input_ids)
 
-        # Ensure cache_position is handled properly and is an integer
-        if position_ids is not None:
-            if cache_position is not None:
-                if isinstance(cache_position, torch.Tensor):
-                    if cache_position.numel() > 1:
-                        logging.warning("cache_position tensor has more than one element; using the first element.")
-                        cache_position = cache_position[0].item()  # Use the first element
-                    else:
-                        cache_position = cache_position.item()  # Convert single-element tensor to Python integer
-                position_ids = position_ids[:, cache_position:]
-        else:
-            position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
-
+        # Initialize past_key_values if not provided
         if past_key_values is None:
             past_key_values = [None] * len(self.transformer_layers)
+
+        # Ensure position_ids are properly handled
+        if position_ids is None:
+            position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
 
         next_past_key_values = []
         for i, layer in enumerate(self.transformer_layers):
@@ -215,6 +207,8 @@ class CustomLlamaModel(LlamaForCausalLM):
             return {"logits": logits, "past_key_values": next_past_key_values if use_cache else None}
         else:
             return logits, next_past_key_values if use_cache else None
+
+
 
 
 
@@ -240,14 +234,14 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
         outputs = model.generate(
             inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
-            max_new_tokens=max_new_tokens,  # Control new tokens
+            max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=0.7,
             top_k=50,
             top_p=0.9,
             repetition_penalty=1.2,
             pad_token_id=pad_token_id,
-            early_stopping=True
+            use_cache=True,  # Enable caching
         )
 
     # Decode the response and format it properly
