@@ -297,7 +297,7 @@ class RMSNorm(nn.Module):
 class MLP(nn.Module):
     def __init__(self, gate_proj, up_proj, down_proj, act_fn):
         super().__init__()
-        self.gate_proj = nn.Parameter(gate_proj)
+        self.gate_proj = nn.Parameter(gate_proj)  # We keep these as nn.Parameters (tensors)
         self.up_proj = nn.Parameter(up_proj)
         self.down_proj = nn.Parameter(down_proj)
         self.act_fn = act_fn
@@ -308,7 +308,15 @@ class MLP(nn.Module):
         x = x.to(device)
 
         # Perform the MLP computation
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate_out = torch.matmul(x, self.gate_proj.T)  # Matrix multiplication with gate_proj
+        up_out = torch.matmul(x, self.up_proj.T)      # Matrix multiplication with up_proj
+        activated_out = self.act_fn(gate_out)         # Apply activation function
+
+        # Perform element-wise multiplication and apply down_proj
+        output = torch.matmul(activated_out * up_out, self.down_proj.T)
+
+        return output
+
 
 
 
