@@ -128,36 +128,40 @@ class CustomAttentionLayer(nn.Module):
             raise FileNotFoundError(f"Weight file {file_name} not found.")
 
     def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None):
+        # Ensure hidden_states is moved to the same device as the weights
+        device = self.query_weight.device
+        hidden_states = hidden_states.to(device)
+    
         batch_size, seq_length, _ = hidden_states.shape
         q = torch.matmul(hidden_states, self.query_weight.T)
         k = torch.matmul(hidden_states, self.key_weight.T)
         v = torch.matmul(hidden_states, self.value_weight.T)
-
+    
         q = q.view(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
         k = k.view(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
         v = v.view(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
-
+    
         if position_ids is not None:
             freqs_cis = freqs_cis[position_ids]
-
+    
         # Apply rotary embeddings
         q_rot, k_rot = apply_rotary_emb(q, k, freqs_cis)
-
+    
         # Handle past_key_values
         if past_key_value is not None:
             past_k, past_v = past_key_value
             k_rot = torch.cat([past_k, k_rot], dim=-2)
             v = torch.cat([past_v, v], dim=-2)
-
+    
         attention_scores = torch.matmul(q_rot, k_rot.transpose(-1, -2)) * self.scale
         attention_probs = nn.functional.softmax(attention_scores, dim=-1)
         output = torch.matmul(attention_probs, v)
-
+    
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_length, -1)
         output = torch.matmul(output, self.output_weight.T)
-        
+    
         return output, (k_rot, v)
-
+    
 # Modify the model's transformer layer to use the custom attention layer
 class CustomTransformerLayer(nn.Module):
     def __init__(self, hidden_size, num_heads, layer_index, weights_dir):
