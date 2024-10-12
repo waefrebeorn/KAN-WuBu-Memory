@@ -101,15 +101,12 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     print("After reshaping - xk_ shape:", xk_.shape)
     
     # Reshape freqs_cis to match the expected dimensions
-    if freqs_cis.dim() == 5:  # If freqs_cis is [1, 1, 1, seq_len, d_q]
-        freqs_cis = freqs_cis.squeeze(0).squeeze(0).squeeze(0)
-    elif freqs_cis.dim() == 3:  # If freqs_cis is [1, seq_len, d_q]
+    if freqs_cis.dim() == 3:  # If freqs_cis is [1, seq_len, d_q]
         freqs_cis = freqs_cis.squeeze(0)
     print("After squeezing - freqs_cis shape:", freqs_cis.shape)
     
-    # Ensure freqs_cis has the correct sequence length
-    if freqs_cis.shape[0] > seq_len:
-        freqs_cis = freqs_cis[:seq_len, :]
+    # Ensure freqs_cis has the correct sequence length and dimension
+    freqs_cis = freqs_cis[:seq_len, :d_q]
     print("After slicing - freqs_cis shape:", freqs_cis.shape)
     
     # Reshape and expand freqs_cis to match the input tensors
