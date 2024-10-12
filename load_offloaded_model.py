@@ -83,27 +83,19 @@ logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
 tokenizer = load_tokenizer(SOURCE_DIR)
 
 # Rotary embedding application with frequency scaling
-def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    d = xq.shape[-1]
-    
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    
-    batch_size, num_heads, seq_len, _ = xq_.shape
+def apply_rotary_emb(q, k, freqs_cis):
+    q_real = q.float().view(*q.shape[:-1], -1, 2)
+    k_real = k.float().view(*k.shape[:-1], -1, 2)
+    q_complex = torch.view_as_complex(q_real)
+    k_complex = torch.view_as_complex(k_real)
 
-    if freqs_cis.dim() == 3:
-        freqs_cis = freqs_cis.squeeze(0)
+    freqs_cis = freqs_cis[:, :q.shape[-1] // 2, :]  # Use only half the dimension for frequency scaling
+    freqs_cis = freqs_cis.unsqueeze(0).expand_as(q_complex)
     
-    freqs_cis = freqs_cis[:seq_len, :d//2]
+    q_rot = torch.view_as_real(q_complex * freqs_cis).flatten(3)
+    k_rot = torch.view_as_real(k_complex * freqs_cis).flatten(3)
     
-    freqs_cis = freqs_cis.to(xq_.device)
-    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)
-    freqs_cis = freqs_cis.expand(batch_size, num_heads, seq_len, d//2)
-    
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    return q_rot, k_rot
 
 # Generating scaled rotary frequencies for LLaMA 3.2
 def get_rotary_frequencies(config):
@@ -363,9 +355,9 @@ def custom_generate(
     tokenizer, 
     input_ids, 
     max_new_tokens=150, 
-    temperature=1.0, 
+    temperature=0.6,  # Lower temperature for better coherence
     top_k=50, 
-    top_p=0.9, 
+    top_p=0.9,  # Higher top_p for diversity without overwhelming the coherence
     repetition_penalty=1.2, 
     pad_token_id=128001, 
     eos_token_id=None, 
@@ -380,16 +372,15 @@ def custom_generate(
             outputs = model(input_ids=generated, return_dict=True)
             logits = outputs["logits"][:, -1, :]  # [batch_size, vocab_size]
 
-            # Apply repetition penalty (optional)
+            # Apply repetition penalty
             if repetition_penalty != 1.0:
                 for i in range(generated.shape[0]):
                     unique_tokens = set(generated[i].tolist())
                     for token in unique_tokens:
                         logits[i, token] /= repetition_penalty
 
-            # Apply temperature scaling (optional)
-            if temperature != 1.0:
-                logits = logits / temperature
+            # Apply temperature scaling
+            logits = logits / temperature
 
             # Top-K sampling
             if top_k > 0:
@@ -397,20 +388,17 @@ def custom_generate(
                 logits[logits < top_k_logits[:, [-1]]] = -float('Inf')
 
             # Top-P (nucleus) sampling
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
 
-                # Remove tokens with cumulative probability above the threshold
-                sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift the indices to the right to keep at least one token
+            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+            sorted_indices_to_remove[:, 0] = 0
 
-                # Shift the indices to the right to keep at least one token
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                sorted_indices_to_remove[:, 0] = 0
-
-                # Scatter the sorted indices to the original logits tensor
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                logits[indices_to_remove] = -float('Inf')
+            # Scatter the sorted indices to the original logits tensor
+            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+            logits[indices_to_remove] = -float('Inf')
 
             # Sample from the filtered distribution
             probs = F.softmax(logits, dim=-1)
@@ -419,20 +407,9 @@ def custom_generate(
             # Append generated token
             generated = torch.cat([generated, next_token], dim=-1)  # [batch_size, seq_length +1]
 
-            # Check if any generated token is in eos_token_id
-            if eos_token_id is not None:
-                if isinstance(eos_token_id, list):
-                    # Create a tensor from eos_token_id list
-                    eos_tensor = torch.tensor(eos_token_id, device=device).unsqueeze(0)  # [1, num_eos]
-                    # Compare next_token with eos_tensor
-                    # Expand next_token to [batch_size, num_eos]
-                    next_token_expanded = next_token.expand(-1, len(eos_token_id))  # [batch_size, num_eos]
-                    # Check if any matches
-                    if torch.any(next_token_expanded == eos_tensor):
-                        break
-                else:
-                    if torch.any(next_token == eos_token_id):
-                        break
+            # Break on EOS token
+            if eos_token_id is not None and torch.any(next_token == eos_token_id):
+                break
 
     return generated
 
