@@ -165,10 +165,25 @@ class CustomTransformerLayer(nn.Module):
         self.attention = CustomAttentionLayer(hidden_size, num_heads, layer_index, weights_dir)
         self.layernorm = nn.LayerNorm(hidden_size)
 
-    def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None):
-        attention_output, past = self.attention(hidden_states, freqs_cis, past_key_value, position_ids)
+    def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None, use_cache=False):
+        # Check for past_key_value for caching
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+        else:
+            past_k, past_v = None, None
+
+        # Pass through attention
+        attention_output, new_past = self.attention(hidden_states, freqs_cis, (past_k, past_v), position_ids)
+
+        # Normalize the attention output
         hidden_states = self.layernorm(hidden_states + attention_output)
-        return hidden_states, past
+
+        # Return hidden states and past key values if caching is enabled
+        if use_cache:
+            return hidden_states, new_past
+        else:
+            return hidden_states, None
+
 
 # CustomLlamaModel that integrates custom transformer layers and rotary embeddings
 class CustomLlamaModel(LlamaForCausalLM):
