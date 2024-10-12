@@ -91,22 +91,23 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     xq_ = torch.complex(xq[..., :d_q], xq[..., d_q:])
     xk_ = torch.complex(xk[..., :d_k], xk[..., d_k:])
     
-    # Ensure the rotary embedding frequencies have the correct shape
+    # Ensure the rotary embedding frequencies have the correct shape (2D: sequence length, hidden size / 2)
     batch_size, num_heads, seq_len, _ = xq_.shape
 
-    # Slice freqs_cis to match the sequence length, then split it into real and imaginary parts
-    freqs_cis = freqs_cis[:seq_len, :].to(xq_.device)  # Match sequence length
-
-    # Split freqs_cis into real and imaginary parts before expansion
-    freqs_real = freqs_cis.real.unsqueeze(1).unsqueeze(0).expand(batch_size, num_heads, -1, -1)
-    freqs_imag = freqs_cis.imag.unsqueeze(1).unsqueeze(0).expand(batch_size, num_heads, -1, -1)
+    # Slice freqs_cis to match the sequence length
+    freqs_cis = freqs_cis[:seq_len, :].to(xq_.device)  # Match sequence length and hidden size / 2
+    
+    # Expand freqs_cis to match the batch size and number of attention heads
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)  # Add batch and heads dimensions
+    freqs_cis = freqs_cis.expand(batch_size, num_heads, seq_len, d_q)  # Match batch size, heads, and query/key dimensions
 
     # Apply the rotary embedding frequencies to the queries and keys
-    xq_out = torch.complex(xq_.real * freqs_real - xq_.imag * freqs_imag, xq_.real * freqs_imag + xq_.imag * freqs_real)
-    xk_out = torch.complex(xk_.real * freqs_real - xk_.imag * freqs_imag, xk_.real * freqs_imag + xk_.imag * freqs_real)
+    xq_out = torch.complex(xq_.real * freqs_cis.cos() - xq_.imag * freqs_cis.sin(), xq_.real * freqs_cis.sin() + xq_.imag * freqs_cis.cos())
+    xk_out = torch.complex(xk_.real * freqs_cis.cos() - xk_.imag * freqs_cis.sin(), xk_.real * freqs_cis.sin() + xk_.imag * freqs_cis.cos())
 
     # Convert the complex tensors back into real tensors
     return torch.view_as_real(xq_out).flatten(2), torch.view_as_real(xk_out).flatten(2)
+
 
 
 
