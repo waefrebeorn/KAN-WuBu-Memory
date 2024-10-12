@@ -351,13 +351,17 @@ class CustomLlamaModel(LlamaForCausalLM):
             if use_cache:
                 presents.append(past)
     
+        # Ensure hidden_states are on the same device as lm_head
+        hidden_states = hidden_states.to(self.lm_head.weight.device)
+        
+        # Apply the lm_head (final linear layer)
         logits = self.lm_head(hidden_states)
     
         if return_dict:
             return {"logits": logits, "past_key_values": presents if use_cache else None}
         else:
             return (logits, presents) if use_cache else logits
-    
+
 
 
 
