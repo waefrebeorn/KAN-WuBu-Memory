@@ -323,7 +323,7 @@ class CustomLlamaModel(LlamaForCausalLM):
         
         self.freqs_cis = get_rotary_frequencies(config)
 
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, cache_position=None, return_dict=True):
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, cache_position=None, return_dict=False):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
     
@@ -336,7 +336,6 @@ class CustomLlamaModel(LlamaForCausalLM):
             else:
                 position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0).expand(batch_size, -1)
     
-        # Initialize past_key_values if not provided
         if past_key_values is None:
             past_key_values = [None] * self.num_hidden_layers
     
@@ -344,24 +343,20 @@ class CustomLlamaModel(LlamaForCausalLM):
         presents = [] if use_cache else None
     
         for i, layer in enumerate(self.transformer_layers):
-            # Ensure that past_key_values are properly handled for each layer
             layer_past = past_key_values[i] if past_key_values is not None and len(past_key_values) > i else None
             hidden_states, past = layer(hidden_states, self.freqs_cis, layer_past, position_ids, use_cache)
     
             if use_cache:
                 presents.append(past)
     
-        # Ensure hidden_states are on the same device as lm_head
         hidden_states = hidden_states.to(self.lm_head.weight.device)
-        
-        # Apply the lm_head (final linear layer)
         logits = self.lm_head(hidden_states)
     
-        # Return output according to the return_dict flag
         if return_dict:
             return {"logits": logits, "past_key_values": presents if use_cache else None}
         else:
-            return logits, presents if use_cache else logits
+            return logits
+    
 
 
 
