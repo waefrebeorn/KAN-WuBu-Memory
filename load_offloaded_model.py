@@ -1,7 +1,7 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  
+import torch.nn.functional as F
 import numpy as np
 import re
 import logging
@@ -84,7 +84,6 @@ tokenizer = load_tokenizer(SOURCE_DIR)
 
 # Rotary embedding application with frequency scaling
 def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    
     d = xq.shape[-1]
     
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
@@ -106,12 +105,6 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-
-
-
-
-
-
 # Generating scaled rotary frequencies for LLaMA 3.2
 def get_rotary_frequencies(config):
     hidden_size = config.hidden_size
@@ -123,8 +116,6 @@ def get_rotary_frequencies(config):
     t = torch.arange(max_position_embeddings, device=inv_freq.device)
     freqs = torch.outer(t, inv_freq) * scaling_factor
     return torch.polar(torch.ones_like(freqs), freqs)
-
-
 
 # Custom Attention Layer that applies rotary embeddings and processes attention
 class CustomAttentionLayer(nn.Module):
@@ -198,9 +189,8 @@ class CustomAttentionLayer(nn.Module):
         attn_output = self.o_proj(attn_output)
     
         return attn_output, (k_rot, v)
-    
-        
-        
+
+# Custom Transformer Layer integrating Attention and Feed-Forward Network
 class CustomTransformerLayer(nn.Module):
     def __init__(self, config, layer_index, weights_dir):
         super(CustomTransformerLayer, self).__init__()
@@ -264,8 +254,8 @@ class CustomTransformerLayer(nn.Module):
             return hidden_states, new_past
         else:
             return hidden_states, None
-    
 
+# RMSNorm Layer
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
@@ -282,7 +272,7 @@ class RMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         return self.weight * hidden_states
 
-
+# MLP Layer
 class MLP(nn.Module):
     def __init__(self, gate_proj, up_proj, down_proj, act_fn):
         super().__init__()
@@ -306,10 +296,7 @@ class MLP(nn.Module):
 
         return output
 
-
-
-
-# CustomLlamaModel that integrates custom transformer layers and rotary embeddings
+# Custom LLaMA Model integrating custom transformer layers and rotary embeddings
 class CustomLlamaModel(LlamaForCausalLM):
     def __init__(self, config, weights_dir):
         super(CustomLlamaModel, self).__init__(config)
@@ -324,7 +311,6 @@ class CustomLlamaModel(LlamaForCausalLM):
         self.freqs_cis = get_rotary_frequencies(config)
 
     def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, cache_position=None, return_dict=False):
-        # Make sure return_dict is handled properly
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -353,11 +339,11 @@ class CustomLlamaModel(LlamaForCausalLM):
         hidden_states = hidden_states.to(self.lm_head.weight.device)
         logits = self.lm_head(hidden_states)
 
-        # Fix: Always return a dictionary with logits and past_key_values when return_dict is True
+        # Always return a dictionary with logits and past_key_values when return_dict=True
         if return_dict:
             return {"logits": logits, "past_key_values": presents if use_cache else None}
         else:
-            return logits  # Return just logits when return_dict is False
+            return logits  # Return just logits when return_dict=False
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
         # Prepare inputs for generation, ensuring past key values are handled correctly
@@ -371,19 +357,67 @@ class CustomLlamaModel(LlamaForCausalLM):
             "use_cache": kwargs.get("use_cache", True),
         }
 
+# Custom generate function (replaces generate in transformers)
+def custom_generate(
+    model, 
+    tokenizer, 
+    input_ids, 
+    max_new_tokens=150, 
+    temperature=1.0, 
+    top_k=50, 
+    top_p=0.9, 
+    repetition_penalty=1.2, 
+    pad_token_id=128001, 
+    eos_token_id=None, 
+    device="cuda"
+):
+    model.eval()  # Set model to evaluation mode
+    generated = input_ids.to(device)
+    
+    for _ in range(max_new_tokens):
+        with torch.no_grad():
+            # Get model outputs: logits
+            outputs = model(input_ids=generated, return_dict=True)
+            logits = outputs["logits"][:, -1, :]  # Get logits of the last token
 
+            # Apply repetition penalty (optional)
+            if repetition_penalty != 1.0:
+                for i in range(generated.shape[0]):
+                    for previous_token in set(generated[i].tolist()):
+                        logits[i, previous_token] /= repetition_penalty
 
+            # Apply temperature scaling (optional)
+            if temperature != 1.0:
+                logits = logits / temperature
 
+            # Top-K sampling
+            if top_k > 0:
+                top_k_logits, _ = torch.topk(logits, top_k)
+                logits[logits < top_k_logits[:, [-1]]] = -float('Inf')
 
+            # Top-P (nucleus) sampling
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()  # Shift one token to the right
+                sorted_indices_to_remove[:, 0] = 0  # Keep at least one token
+                logits[sorted_indices[sorted_indices_to_remove]] = -float('Inf')
 
+            # Sample from the filtered distribution
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
 
+            # Append generated token
+            generated = torch.cat([generated, next_token], dim=-1)
 
+            # Check if EOS token is generated
+            if eos_token_id is not None and torch.any(next_token == eos_token_id):
+                break
 
+    return generated
 
-
-
-
-# Updated generation logic to ensure inputs are on the correct device
+# Generate response method updated to call custom_generate
 def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
     
@@ -392,31 +426,25 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
 
     # Move inputs to the correct device (GPU)
     device = next(model.parameters()).device
-    inputs = {key: value.to(device) for key, value in inputs.items()}
+    input_ids = inputs["input_ids"].to(device)
 
-    with torch.no_grad():
-        # Use the model's generate method with handling for scores
-        outputs = model.generate(
-            inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=0.7,
-            top_k=50,
-            top_p=0.9,
-            repetition_penalty=1.2,
-            pad_token_id=pad_token_id,
-            use_cache=True,
-            return_dict_in_generate=True,  # Return both sequences and scores
-            output_scores=True,            # Ensure scores are included
-        )
+    # Generate the response using the custom generate function
+    generated_output = custom_generate(
+        model=model,
+        tokenizer=tokenizer,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        temperature=0.7,
+        top_k=50,
+        top_p=0.9,
+        repetition_penalty=1.2,
+        pad_token_id=pad_token_id,
+        eos_token_id=None,  # Set your EOS token ID if needed
+        device=device
+    )
 
     # Decode the generated output
-    generated_sequences = outputs.sequences
-    scores = outputs.scores  # Access the scores from the output dictionary
-
-    # Decode the generated sequences
-    response = tokenizer.decode(generated_sequences[0], skip_special_tokens=True).strip()
+    response = tokenizer.decode(generated_output[0], skip_special_tokens=True).strip()
 
     # Clean up the response to remove duplicate User tags or extraneous whitespace
     cleaned_response = response.split("User:")[-1].strip()
@@ -429,9 +457,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
     if len(history) > 6:
         history = history[-6:]
 
-    return cleaned_response, history, scores
-
-
+    return cleaned_response, history
 
 # Interactive input loop to query the model
 def user_input_loop(custom_model, tokenizer):
