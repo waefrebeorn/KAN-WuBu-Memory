@@ -323,11 +323,8 @@ class CustomLlamaModel(LlamaForCausalLM):
         
         self.freqs_cis = get_rotary_frequencies(config)
 
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, cache_position=None, return_dict=None):
-        # Set default for return_dict to False if it's None
-        if return_dict is None:
-            return_dict = False  # Ensure it's False during generation
-
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, cache_position=None, return_dict=False):
+        # Make sure return_dict is handled properly
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -356,17 +353,16 @@ class CustomLlamaModel(LlamaForCausalLM):
         hidden_states = hidden_states.to(self.lm_head.weight.device)
         logits = self.lm_head(hidden_states)
 
-        # Return dictionary with logits and past_key_values during generation
+        # Fix: Always return a dictionary with logits and past_key_values when return_dict is True
         if return_dict:
             return {"logits": logits, "past_key_values": presents if use_cache else None}
         else:
-            return logits
+            return logits  # Return just logits when return_dict is False
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
-        # Prepare inputs for the `generate` function
+        # Prepare inputs for generation, ensuring past key values are handled correctly
         if past_key_values:
-            # If past_key_values are provided, only pass the last token for further processing
-            input_ids = input_ids[:, -1:]
+            input_ids = input_ids[:, -1:]  # Only pass the last token when past_key_values exist
 
         return {
             "input_ids": input_ids,
@@ -374,6 +370,8 @@ class CustomLlamaModel(LlamaForCausalLM):
             "attention_mask": attention_mask,
             "use_cache": kwargs.get("use_cache", True),
         }
+
+
 
 
 
