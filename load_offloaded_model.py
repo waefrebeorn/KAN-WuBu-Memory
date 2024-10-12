@@ -438,8 +438,15 @@ def custom_generate(
             generated = torch.cat([generated, next_token], dim=-1)  # [batch_size, seq_length +1]
 
             # Break on EOS token
-            if eos_token_id is not None and torch.any(next_token == eos_token_id):
-                break
+            if eos_token_id is not None:
+                if isinstance(eos_token_id, list):
+                    eos_tensor = torch.tensor(eos_token_id, device=next_token.device)  # Ensure eos_token_id is a tensor
+                    if torch.any(torch.isin(next_token, eos_tensor)):
+                        break
+                else:
+                    if torch.any(next_token == eos_token_id):
+                        break
+            
 
     return generated
 
