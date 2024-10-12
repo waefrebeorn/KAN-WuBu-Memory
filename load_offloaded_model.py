@@ -214,6 +214,7 @@ class CustomLlamaModel(LlamaForCausalLM):
             else:
                 position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0).expand(batch_size, -1)
 
+        # Initialize past_key_values if not provided
         if past_key_values is None:
             past_key_values = [None] * self.num_hidden_layers
 
@@ -221,8 +222,10 @@ class CustomLlamaModel(LlamaForCausalLM):
         presents = [] if use_cache else None
 
         for i, layer in enumerate(self.transformer_layers):
-            layer_past = past_key_values[i] if past_key_values is not None else None
-            hidden_states, past = layer(hidden_states, self.freqs_cis, layer_past, position_ids)
+            # Ensure that past_key_values are properly handled for each layer
+            layer_past = past_key_values[i] if past_key_values[i] is not None else None
+            hidden_states, past = layer(hidden_states, self.freqs_cis, layer_past, position_ids, use_cache)
+
             if use_cache:
                 presents.append(past)
 
@@ -232,6 +235,7 @@ class CustomLlamaModel(LlamaForCausalLM):
             return {"logits": logits, "past_key_values": presents if use_cache else None}
         else:
             return (logits, presents) if use_cache else logits
+
 
 
 
@@ -250,7 +254,6 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
     device = next(model.parameters()).device
     inputs = {key: value.to(device) for key, value in inputs.items()}
 
-    # Do not manually set `past_key_values` here. Let the model handle it internally during generation.
     with torch.no_grad():
         # Use the model's generate method with proper handling for past_key_values
         outputs = model.generate(
@@ -281,6 +284,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
         history = history[-6:]
 
     return cleaned_response, history
+
 
 
 
