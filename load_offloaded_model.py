@@ -323,7 +323,11 @@ class CustomLlamaModel(LlamaForCausalLM):
         
         self.freqs_cis = get_rotary_frequencies(config)
 
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, cache_position=None, return_dict=False):
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, cache_position=None, return_dict=None):
+        # Set default for return_dict to False if it's None
+        if return_dict is None:
+            return_dict = False  # Ensure it's False during generation
+
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -353,11 +357,10 @@ class CustomLlamaModel(LlamaForCausalLM):
         logits = self.lm_head(hidden_states)
 
         if return_dict:
-            # Ensure we return only logits during generation
             return {"logits": logits, "past_key_values": presents if use_cache else None}
         else:
-            # If return_dict=False (during generation), return only the logits
             return logits
+
 
 
 
