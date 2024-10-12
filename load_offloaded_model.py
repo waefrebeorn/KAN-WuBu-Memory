@@ -91,16 +91,18 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     xq_ = torch.complex(xq[..., :d_q], xq[..., d_q:])
     xk_ = torch.complex(xk[..., :d_k], xk[..., d_k:])
     
-    # Ensure the rotary embedding frequencies have the correct shape (batch size, num heads, sequence length, half hidden size)
+    # Ensure the rotary embedding frequencies have the correct shape
+    # Adjust freqs_cis to match the sequence length of xq and xk tensors
     batch_size, num_heads, seq_len, _ = xq_.shape
-    freqs_cis = freqs_cis[:seq_len, :].to(xq_.device)  # Ensure freqs_cis matches sequence length
+    freqs_cis = freqs_cis[:seq_len, :].to(xq_.device)  # Match sequence length
     
     # Apply the rotary embedding frequencies to the queries and keys
-    xq_out = xq_ * freqs_cis.unsqueeze(0).unsqueeze(0)
+    xq_out = xq_ * freqs_cis.unsqueeze(0).unsqueeze(0)  # Adjusting for batch size and heads
     xk_out = xk_ * freqs_cis.unsqueeze(0).unsqueeze(0)
 
     # Convert the complex tensors back into real tensors
     return torch.view_as_real(xq_out).flatten(2), torch.view_as_real(xk_out).flatten(2)
+
 
 
 # Generating scaled rotary frequencies for LLaMA 3.2
@@ -115,6 +117,7 @@ def get_rotary_frequencies(hidden_size, max_position_embeddings=128000):
     # Convert to complex numbers for cosine and sine components
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # Convert into complex
     return freqs_cis
+
 
 
 # Custom Attention Layer that applies rotary embeddings and processes attention
