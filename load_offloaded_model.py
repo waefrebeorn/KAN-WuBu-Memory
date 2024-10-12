@@ -191,7 +191,7 @@ class CustomAttentionLayer(nn.Module):
     
         if past_key_value is not None:
             past_k, past_v = past_key_value
-            if past_k is not None and past_v i
+            if past_k is not None and past_v 
             
 # Modify the model's transformer layer to use the custom attention layer
 class CustomTransformerLayer(nn.Module):
