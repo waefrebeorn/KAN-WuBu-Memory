@@ -284,9 +284,15 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states):
+        # Ensure hidden_states and self.weight are on the same device
+        device = self.weight.device
+        hidden_states = hidden_states.to(device)
+
+        # Compute the variance and apply normalization
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         return self.weight * hidden_states
+
 
 class MLP(nn.Module):
     def __init__(self, gate_proj, up_proj, down_proj, act_fn):
@@ -297,7 +303,13 @@ class MLP(nn.Module):
         self.act_fn = act_fn
 
     def forward(self, x):
+        # Ensure input x is on the same device as the model parameters
+        device = self.gate_proj.device
+        x = x.to(device)
+
+        # Perform the MLP computation
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
 
 
 # CustomLlamaModel that integrates custom transformer layers and rotary embeddings
