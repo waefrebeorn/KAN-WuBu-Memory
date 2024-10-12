@@ -83,27 +83,39 @@ tokenizer = load_tokenizer(SOURCE_DIR)
 
 # Rotary embedding application with frequency scaling
 def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    d_q, d_k = xq.shape[-1] // 2, xk.shape[-1] // 2
+    # Get half the hidden size (because rotary embeddings are applied to half of the dimensions)
+    d_q = xq.shape[-1] // 2
+    d_k = xk.shape[-1] // 2
+    
+    # Split the query and key tensors into real and imaginary parts for rotary embedding
     xq_ = torch.complex(xq[..., :d_q], xq[..., d_q:])
     xk_ = torch.complex(xk[..., :d_k], xk[..., d_k:])
+    
+    # Ensure the rotary embedding frequencies have the correct shape (batch size, num heads, sequence length, half hidden size)
+    batch_size, num_heads, seq_len, _ = xq_.shape
+    freqs_cis = freqs_cis[:seq_len, :].to(xq_.device)  # Ensure freqs_cis matches sequence length
     
     # Apply the rotary embedding frequencies to the queries and keys
     xq_out = xq_ * freqs_cis.unsqueeze(0).unsqueeze(0)
     xk_out = xk_ * freqs_cis.unsqueeze(0).unsqueeze(0)
 
+    # Convert the complex tensors back into real tensors
     return torch.view_as_real(xq_out).flatten(2), torch.view_as_real(xk_out).flatten(2)
+
 
 # Generating scaled rotary frequencies for LLaMA 3.2
 def get_rotary_frequencies(hidden_size, max_position_embeddings=128000):
+    # Generate the inverse frequency
     inv_freq = 1.0 / (10000 ** (torch.arange(0, hidden_size, 2).float() / hidden_size))
     
-    # Scaling frequencies based on maximum position embeddings
+    # Calculate position ids and apply the inverse frequency
     position_ids = torch.arange(0, max_position_embeddings, device=inv_freq.device).float()
     freqs = torch.einsum("i,j->ij", position_ids, inv_freq)
     
     # Convert to complex numbers for cosine and sine components
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # Convert into complex
     return freqs_cis
+
 
 # Custom Attention Layer that applies rotary embeddings and processes attention
 class CustomAttentionLayer(nn.Module):
