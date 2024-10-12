@@ -146,17 +146,19 @@ class CustomAttentionLayer(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.weights_dir = weights_dir
         self.layer_index = layer_index
-        self.query_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_q_proj_weight.dat")
-        self.key_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_k_proj_weight.dat")
-        self.value_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_v_proj_weight.dat")
-        self.output_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_o_proj_weight.dat")
+        
+        # Adjust the sizes of the weight matrices
+        self.query_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_q_proj_weight.dat", (hidden_size, hidden_size))
+        self.key_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_k_proj_weight.dat", (hidden_size, hidden_size // 4))
+        self.value_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_v_proj_weight.dat", (hidden_size, hidden_size // 4))
+        self.output_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_o_proj_weight.dat", (hidden_size, hidden_size))
         self.scale = 1 / (self.head_dim ** 0.5)
 
-    def load_weight(self, file_name):
+    def load_weight(self, file_name, shape):
         file_path = os.path.join(self.weights_dir, file_name)
         if os.path.exists(file_path):
             tensor_data = np.fromfile(file_path, dtype=np.float32)
-            return torch.tensor(tensor_data).view(-1, self.hidden_size).to("cuda")
+            return torch.tensor(tensor_data).view(*shape).to("cuda")
         else:
             raise FileNotFoundError(f"Weight file {file_name} not found.")
 
@@ -174,8 +176,8 @@ class CustomAttentionLayer(nn.Module):
         print(f"v shape: {v.shape}")
     
         q = q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim // 4).transpose(1, 2)
+        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim // 4).transpose(1, 2)
     
         print(f"After reshape - q shape: {q.shape}")
         print(f"After reshape - k shape: {k.shape}")
@@ -205,8 +207,7 @@ class CustomAttentionLayer(nn.Module):
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_length, -1)
         output = torch.matmul(output, self.output_weight.T)
     
-        return output, (k_rot, v)
-        
+        return output, (k_rot, v)    
             
 # Modify the model's transformer layer to use the custom attention layer
 class CustomTransformerLayer(nn.Module):
