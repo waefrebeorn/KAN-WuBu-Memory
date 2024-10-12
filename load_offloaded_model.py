@@ -372,13 +372,13 @@ def custom_generate(
     device="cuda"
 ):
     model.eval()  # Set model to evaluation mode
-    generated = input_ids.to(device)
+    generated = input_ids.to(device)  # [batch_size, seq_length]
     
     for _ in range(max_new_tokens):
         with torch.no_grad():
             # Get model outputs: logits and past_key_values
             outputs = model(input_ids=generated, return_dict=True)
-            logits = outputs["logits"][:, -1, :]  # Get logits of the last token
+            logits = outputs["logits"][:, -1, :]  # [batch_size, vocab_size]
 
             # Apply repetition penalty (optional)
             if repetition_penalty != 1.0:
@@ -414,10 +414,10 @@ def custom_generate(
 
             # Sample from the filtered distribution
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = torch.multinomial(probs, num_samples=1)  # [batch_size, 1]
 
             # Append generated token
-            generated = torch.cat([generated, next_token], dim=-1)
+            generated = torch.cat([generated, next_token], dim=-1)  # [batch_size, seq_length +1]
 
             # Check if any generated token is in eos_token_id
             if eos_token_id is not None:
@@ -426,7 +426,7 @@ def custom_generate(
                     eos_tensor = torch.tensor(eos_token_id, device=device).unsqueeze(0)  # [1, num_eos]
                     # Compare next_token with eos_tensor
                     # Expand next_token to [batch_size, num_eos]
-                    next_token_expanded = next_token.unsqueeze(-1).expand(-1, len(eos_token_id))
+                    next_token_expanded = next_token.expand(-1, len(eos_token_id))  # [batch_size, num_eos]
                     # Check if any matches
                     if torch.any(next_token_expanded == eos_tensor):
                         break
@@ -492,8 +492,8 @@ def user_input_loop(custom_model, tokenizer):
             response, history = generate_response(user_input, custom_model, tokenizer, history=history)
             print(f"Model Response: {response}")
         except Exception as e:
-            logging.error(f"Error during generation: {e}")
-            print("An error occurred during generation. Please check the logs.")
+            print(f"An error occurred during generation: {e}")
+            # Optionally, you can add more detailed error handling here
 
 # Initialize the custom model and tokenizer
 config = load_configuration(MODEL_JSON_PATH)
