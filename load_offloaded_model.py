@@ -204,37 +204,38 @@ class CustomLlamaModel(LlamaForCausalLM):
     def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, cache_position=None, return_dict=True):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
-
+    
         batch_size, seq_length = input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
-
+    
         if position_ids is None:
             if cache_position is not None:
                 position_ids = torch.arange(cache_position, cache_position + seq_length, dtype=torch.long, device=inputs_embeds.device)
                 position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
             else:
                 position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0).expand(batch_size, -1)
-
+    
         # Initialize past_key_values if not provided
         if past_key_values is None:
             past_key_values = [None] * self.num_hidden_layers
-
+    
         hidden_states = inputs_embeds
         presents = [] if use_cache else None
-
+    
         for i, layer in enumerate(self.transformer_layers):
             # Ensure that past_key_values are properly handled for each layer
-            layer_past = past_key_values[i] if past_key_values[i] is not None else None
+            layer_past = past_key_values[i] if past_key_values is not None and len(past_key_values) > i else None
             hidden_states, past = layer(hidden_states, self.freqs_cis, layer_past, position_ids, use_cache)
-
+    
             if use_cache:
                 presents.append(past)
-
+    
         logits = self.lm_head(hidden_states)
-
+    
         if return_dict:
             return {"logits": logits, "past_key_values": presents if use_cache else None}
         else:
             return (logits, presents) if use_cache else logits
+    
 
 
 
