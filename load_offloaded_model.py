@@ -353,19 +353,11 @@ class CustomLlamaModel(LlamaForCausalLM):
         logits = self.lm_head(hidden_states)
 
         if return_dict:
+            # Ensure we return only logits during generation
             return {"logits": logits, "past_key_values": presents if use_cache else None}
         else:
-            return logits, presents if use_cache else logits
-
-    # Override prepare_inputs_for_generation
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
-        # Ensure the model handles inputs correctly for generation
-        return {
-            "input_ids": input_ids,
-            "past_key_values": past_key_values,
-            "attention_mask": attention_mask,
-            "use_cache": kwargs.get("use_cache", True)
-        }
+            # If return_dict=False (during generation), return only the logits
+            return logits
 
 
 
