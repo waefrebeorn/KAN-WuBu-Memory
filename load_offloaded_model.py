@@ -356,8 +356,8 @@ class CustomLlamaModel(LlamaForCausalLM):
         hidden_states = hidden_states.to(self.lm_head.weight.device)
         logits = self.lm_head(hidden_states)
 
-        # Always return logits directly during generation
-        if return_dict and not self.training:
+        # Return dictionary with logits and past_key_values during generation
+        if return_dict:
             return {"logits": logits, "past_key_values": presents if use_cache else None}
         else:
             return logits
