@@ -228,12 +228,18 @@ class CustomLlamaModel(LlamaForCausalLM):
 def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
     
+    # Tokenize the input prompt
     inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit)
-    
+
+    # Move inputs to the correct device (GPU)
     device = next(model.parameters()).device
     inputs = {key: value.to(device) for key, value in inputs.items()}
-    
+
+    # Ensure past_key_values is set to None initially
+    past_key_values = None
+
     with torch.no_grad():
+        # Use the model's generate method with proper handling for past_key_values
         outputs = model.generate(
             inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
@@ -244,20 +250,26 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
             top_p=0.9,
             repetition_penalty=1.2,
             pad_token_id=pad_token_id,
-            use_cache=True,
+            use_cache=True,  # Enable cache to allow faster generations by using past_key_values
+            past_key_values=past_key_values  # Pass the past_key_values to generate
         )
 
+    # Decode the generated output
     response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    
+
+    # Clean up the response to remove duplicate User tags or extraneous whitespace
     cleaned_response = response.split("User:")[-1].strip()
     cleaned_response = re.sub(r'\s+', ' ', cleaned_response)
-    
+
+    # Append this conversation turn to the history
     history.append(f"User: {input_text}\nModel: {cleaned_response}")
-    
+
+    # Trim the history to the last 6 conversation turns
     if len(history) > 6:
         history = history[-6:]
 
     return cleaned_response, history
+
 
 # Interactive input loop to query the model
 def user_input_loop(custom_model, tokenizer):
