@@ -84,9 +84,6 @@ tokenizer = load_tokenizer(SOURCE_DIR)
 
 # Rotary embedding application with frequency scaling
 def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    print("xq shape:", xq.shape)
-    print("xk shape:", xk.shape)
-    print("freqs_cis shape:", freqs_cis.shape)
     
     d = xq.shape[-1]
     
@@ -94,26 +91,18 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     
     batch_size, num_heads, seq_len, _ = xq_.shape
-    print("After reshaping - xq_ shape:", xq_.shape)
-    print("After reshaping - xk_ shape:", xk_.shape)
-    
+
     if freqs_cis.dim() == 3:
         freqs_cis = freqs_cis.squeeze(0)
-    print("After squeezing - freqs_cis shape:", freqs_cis.shape)
     
     freqs_cis = freqs_cis[:seq_len, :d//2]
-    print("After slicing - freqs_cis shape:", freqs_cis.shape)
     
     freqs_cis = freqs_cis.to(xq_.device)
     freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)
     freqs_cis = freqs_cis.expand(batch_size, num_heads, seq_len, d//2)
-    print("Final freqs_cis shape:", freqs_cis.shape)
     
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    
-    print("xq_out shape:", xq_out.shape)
-    print("xk_out shape:", xk_out.shape)
     
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
