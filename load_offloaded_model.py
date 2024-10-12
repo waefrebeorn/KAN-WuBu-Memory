@@ -93,17 +93,19 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     
     # Ensure the rotary embedding frequencies have the correct shape
     batch_size, num_heads, seq_len, _ = xq_.shape
-    
-    # Slice freqs_cis to match the sequence length and reshape it to match (batch_size, num_heads, seq_len)
+
+    # Slice freqs_cis to match the sequence length, and reshape to match batch and heads dimensions
     freqs_cis = freqs_cis[:seq_len, :].to(xq_.device)  # Match sequence length
-    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0).expand(batch_size, num_heads, -1, -1)  # Match batch size and heads
-    
+    freqs_cis = freqs_cis.unsqueeze(1)  # Add a dimension for attention heads
+    freqs_cis = freqs_cis.unsqueeze(0).expand(batch_size, num_heads, -1, -1)  # Match batch size and heads
+
     # Apply the rotary embedding frequencies to the queries and keys
     xq_out = xq_ * freqs_cis
     xk_out = xk_ * freqs_cis
 
     # Convert the complex tensors back into real tensors
     return torch.view_as_real(xq_out).flatten(2), torch.view_as_real(xk_out).flatten(2)
+
 
 
 
