@@ -383,7 +383,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
     inputs = {key: value.to(device) for key, value in inputs.items()}
 
     with torch.no_grad():
-        # Use the model's generate method with proper handling for past_key_values
+        # Use the model's generate method with handling for scores
         outputs = model.generate(
             inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
@@ -394,11 +394,17 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
             top_p=0.9,
             repetition_penalty=1.2,
             pad_token_id=pad_token_id,
-            use_cache=True  # Ensure cache is enabled for the model to handle past_key_values
+            use_cache=True,
+            return_dict_in_generate=True,  # Return both sequences and scores
+            output_scores=True,            # Ensure scores are included
         )
 
     # Decode the generated output
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    generated_sequences = outputs.sequences
+    scores = outputs.scores  # Access the scores from the output dictionary
+
+    # Decode the generated sequences
+    response = tokenizer.decode(generated_sequences[0], skip_special_tokens=True).strip()
 
     # Clean up the response to remove duplicate User tags or extraneous whitespace
     cleaned_response = response.split("User:")[-1].strip()
@@ -411,8 +417,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
     if len(history) > 6:
         history = history[-6:]
 
-    return cleaned_response, history
-
+    return cleaned_response, history, scores
 
 
 
