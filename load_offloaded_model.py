@@ -89,6 +89,10 @@ def apply_rotary_emb(q, k, freqs_cis, layer_index, rope_scaling):
     q_complex = torch.view_as_complex(q_real)
     k_complex = torch.view_as_complex(k_real)
 
+    # Ensure freqs_cis is on the same device as q_complex
+    device = q_complex.device
+    freqs_cis = freqs_cis.to(device)  # Move freqs_cis to the correct device
+
     # Get rope scaling parameters for this layer
     factor = rope_scaling['factor']
     high_freq_factor = rope_scaling['high_freq_factor']
