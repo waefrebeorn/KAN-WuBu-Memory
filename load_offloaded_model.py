@@ -324,7 +324,7 @@ class CustomLlamaModel(LlamaForCausalLM):
                 position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0).expand(batch_size, -1)
 
         if past_key_values is None:
-            past_key_values = [None] * self.config.num_hidden_layers  # Fixed: Use self.config.num_hidden_layers
+            past_key_values = [None] * self.config.num_hidden_layers  # Fixed access
 
         hidden_states = inputs_embeds
         presents = [] if use_cache else None
@@ -383,8 +383,9 @@ def custom_generate(
             # Apply repetition penalty (optional)
             if repetition_penalty != 1.0:
                 for i in range(generated.shape[0]):
-                    for previous_token in set(generated[i].tolist()):
-                        logits[i, previous_token] /= repetition_penalty
+                    unique_tokens = set(generated[i].tolist())
+                    for token in unique_tokens:
+                        logits[i, token] /= repetition_penalty
 
             # Apply temperature scaling (optional)
             if temperature != 1.0:
@@ -392,28 +393,46 @@ def custom_generate(
 
             # Top-K sampling
             if top_k > 0:
-                top_k_logits, _ = torch.topk(logits, top_k)
+                top_k_logits, _ = torch.topk(logits, top_k, dim=-1)
                 logits[logits < top_k_logits[:, [-1]]] = -float('Inf')
 
             # Top-P (nucleus) sampling
             if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+                # Remove tokens with cumulative probability above the threshold
                 sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()  # Shift one token to the right
-                sorted_indices_to_remove[:, 0] = 0  # Keep at least one token
-                logits[sorted_indices[sorted_indices_to_remove]] = -float('Inf')
+
+                # Shift the indices to the right to keep at least one token
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                sorted_indices_to_remove[:, 0] = 0
+
+                # Scatter the sorted indices to the original logits tensor
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = -float('Inf')
 
             # Sample from the filtered distribution
-            probs = torch.nn.functional.softmax(logits, dim=-1)
+            probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
 
             # Append generated token
             generated = torch.cat([generated, next_token], dim=-1)
 
-            # Check if EOS token is generated
-            if eos_token_id is not None and torch.any(next_token == eos_token_id):
-                break
+            # Check if any generated token is in eos_token_id
+            if eos_token_id is not None:
+                if isinstance(eos_token_id, list):
+                    # Create a tensor from eos_token_id list
+                    eos_tensor = torch.tensor(eos_token_id, device=device).unsqueeze(0)  # [1, num_eos]
+                    # Compare next_token with eos_tensor
+                    # Expand next_token to [batch_size, num_eos]
+                    next_token_expanded = next_token.unsqueeze(-1).expand(-1, len(eos_token_id))
+                    # Check if any matches
+                    if torch.any(next_token_expanded == eos_tensor):
+                        break
+                else:
+                    if torch.any(next_token == eos_token_id):
+                        break
 
     return generated
 
@@ -439,7 +458,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
         top_p=0.9,
         repetition_penalty=1.2,
         pad_token_id=pad_token_id,
-        eos_token_id=None,  # Set your EOS token ID if needed
+        eos_token_id=[128001, 128008, 128009],  # Set your EOS token IDs as per config
         device=device
     )
 
@@ -469,8 +488,12 @@ def user_input_loop(custom_model, tokenizer):
         if user_input.lower() == 'exit':
             print("Exiting...")
             break
-        response, history = generate_response(user_input, custom_model, tokenizer, history=history)
-        print(f"Model Response: {response}")
+        try:
+            response, history = generate_response(user_input, custom_model, tokenizer, history=history)
+            print(f"Model Response: {response}")
+        except Exception as e:
+            logging.error(f"Error during generation: {e}")
+            print("An error occurred during generation. Please check the logs.")
 
 # Initialize the custom model and tokenizer
 config = load_configuration(MODEL_JSON_PATH)
