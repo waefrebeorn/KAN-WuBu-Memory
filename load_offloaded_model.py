@@ -86,8 +86,8 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     print("xq shape:", xq.shape)
     print("xk shape:", xk.shape)
     print("freqs_cis shape:", freqs_cis.shape)
-
-    # Get half the hidden size (because rotary embeddings are applied to half of the dimensions)
+    
+    # Get half the hidden size for each tensor separately
     d_q = xq.shape[-1] // 2
     d_k = xk.shape[-1] // 2
     
@@ -95,29 +95,29 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     
-    # Ensure the rotary embedding frequencies have the correct shape
     batch_size, num_heads, seq_len, _ = xq_.shape
     print("After reshaping - xq_ shape:", xq_.shape)
     print("After reshaping - xk_ shape:", xk_.shape)
     
     # Reshape freqs_cis to match the expected dimensions
-    if freqs_cis.dim() == 3:  # If freqs_cis is [1, seq_len, d_q]
+    if freqs_cis.dim() == 3:  # If freqs_cis is [1, seq_len, d]
         freqs_cis = freqs_cis.squeeze(0)
     print("After squeezing - freqs_cis shape:", freqs_cis.shape)
     
     # Ensure freqs_cis has the correct sequence length and dimension
-    freqs_cis = freqs_cis[:seq_len, :d_q]
+    max_d = max(d_q, d_k)
+    freqs_cis = freqs_cis[:seq_len, :max_d]
     print("After slicing - freqs_cis shape:", freqs_cis.shape)
     
     # Reshape and expand freqs_cis to match the input tensors
     freqs_cis = freqs_cis.to(xq_.device)
     freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)
-    freqs_cis = freqs_cis.expand(batch_size, num_heads, seq_len, d_q)
+    freqs_cis = freqs_cis.expand(batch_size, num_heads, seq_len, max_d)
     print("Final freqs_cis shape:", freqs_cis.shape)
     
     # Apply the rotary embedding frequencies to the queries and keys
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    xq_out = torch.view_as_real(xq_ * freqs_cis[..., :d_q]).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis[..., :d_k]).flatten(3)
     
     print("xq_out shape:", xq_out.shape)
     print("xk_out shape:", xk_out.shape)
