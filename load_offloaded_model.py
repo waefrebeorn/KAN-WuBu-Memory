@@ -123,9 +123,12 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 
 
 # Generating scaled rotary frequencies for LLaMA 3.2
-def get_rotary_frequencies(hidden_size, max_position_embeddings, config):
+def get_rotary_frequencies(config):
+    hidden_size = config.hidden_size
+    max_position_embeddings = config.max_position_embeddings
     base = config.rope_theta
     scaling_factor = config.rope_scaling['factor']
+    
     inv_freq = 1.0 / (base ** (torch.arange(0, hidden_size, 2).float() / hidden_size))
     t = torch.arange(max_position_embeddings, device=inv_freq.device)
     freqs = torch.outer(t, inv_freq) * scaling_factor
@@ -288,7 +291,7 @@ class CustomLlamaModel(LlamaForCausalLM):
              for layer_index in range(config.num_hidden_layers)]
         )
         
-        self.freqs_cis = get_rotary_frequencies(config.hidden_size, config.max_position_embeddings)
+        self.freqs_cis = get_rotary_frequencies(config)
 
     def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, cache_position=None, return_dict=True):
         if inputs_embeds is None:
