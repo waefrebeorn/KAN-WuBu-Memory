@@ -123,35 +123,32 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 
 
 # Generating scaled rotary frequencies for LLaMA 3.2
-def get_rotary_frequencies(hidden_size, max_position_embeddings=128000):
-    # Generate the inverse frequency
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, hidden_size, 2).float() / hidden_size))
-    
-    # Calculate position ids and apply the inverse frequency
-    position_ids = torch.arange(0, max_position_embeddings, device=inv_freq.device).float()
-    freqs = torch.einsum("i,j->ij", position_ids, inv_freq)
-    
-    # Convert to complex numbers for cosine and sine components
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # Convert into complex
-    return freqs_cis
+def get_rotary_frequencies(hidden_size, max_position_embeddings, config):
+    base = config.rope_theta
+    scaling_factor = config.rope_scaling['factor']
+    inv_freq = 1.0 / (base ** (torch.arange(0, hidden_size, 2).float() / hidden_size))
+    t = torch.arange(max_position_embeddings, device=inv_freq.device)
+    freqs = torch.outer(t, inv_freq) * scaling_factor
+    return torch.polar(torch.ones_like(freqs), freqs)
 
 
 
 # Custom Attention Layer that applies rotary embeddings and processes attention
 class CustomAttentionLayer(nn.Module):
-    def __init__(self, hidden_size, num_heads, layer_index, weights_dir):
+    def __init__(self, config, layer_index, weights_dir):
         super(CustomAttentionLayer, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
         self.weights_dir = weights_dir
         self.layer_index = layer_index
-        
-        # Adjust the sizes of the weight matrices
-        self.query_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_q_proj_weight.dat", (hidden_size, hidden_size))
-        self.key_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_k_proj_weight.dat", (hidden_size, hidden_size // 4))
-        self.value_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_v_proj_weight.dat", (hidden_size, hidden_size // 4))
-        self.output_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_o_proj_weight.dat", (hidden_size, hidden_size))
+
+        self.q_proj = self.load_weight(f"model_layers_{layer_index}_self_attn_q_proj_weight.dat", (self.hidden_size, self.hidden_size))
+        self.k_proj = self.load_weight(f"model_layers_{layer_index}_self_attn_k_proj_weight.dat", (self.hidden_size, self.num_key_value_heads * self.head_dim))
+        self.v_proj = self.load_weight(f"model_layers_{layer_index}_self_attn_v_proj_weight.dat", (self.hidden_size, self.num_key_value_heads * self.head_dim))
+        self.o_proj = self.load_weight(f"model_layers_{layer_index}_self_attn_o_proj_weight.dat", (self.hidden_size, self.hidden_size))
+
         self.scale = 1 / (self.head_dim ** 0.5)
 
     def load_weight(self, file_name, shape):
@@ -163,77 +160,120 @@ class CustomAttentionLayer(nn.Module):
             raise FileNotFoundError(f"Weight file {file_name} not found.")
 
     def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None):
-        device = self.query_weight.device
-        hidden_states = hidden_states.to(device)
-    
         batch_size, seq_length, _ = hidden_states.shape
-        q = torch.matmul(hidden_states, self.query_weight.T)
-        k = torch.matmul(hidden_states, self.key_weight.T)
-        v = torch.matmul(hidden_states, self.value_weight.T)
-    
-        print(f"q shape: {q.shape}")
-        print(f"k shape: {k.shape}")
-        print(f"v shape: {v.shape}")
-    
+
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
         q = q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim // 4).transpose(1, 2)
-        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim // 4).transpose(1, 2)
-    
-        print(f"After reshape - q shape: {q.shape}")
-        print(f"After reshape - k shape: {k.shape}")
-        print(f"After reshape - v shape: {v.shape}")
-    
-        if position_ids is not None:
-            freqs_cis = freqs_cis[position_ids]
-    
+        k = k.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # Repeat k and v for multi-query attention
+        k = k.repeat_interleave(self.num_heads // self.num_key_value_heads, dim=1)
+        v = v.repeat_interleave(self.num_heads // self.num_key_value_heads, dim=1)
+
         q_rot, k_rot = apply_rotary_emb(q, k, freqs_cis)
-    
-        print(f"After rotary - q_rot shape: {q_rot.shape}")
-        print(f"After rotary - k_rot shape: {k_rot.shape}")
-    
+
         if past_key_value is not None:
             past_k, past_v = past_key_value
             if past_k is not None and past_v is not None:
-                k_rot = torch.cat([past_k, k_rot], dim=-2)
-                v = torch.cat([past_v, v], dim=-2)
-    
-        print(f"Final k_rot shape: {k_rot.shape}")
-        print(f"Final v shape: {v.shape}")
-    
-        attention_scores = torch.matmul(q_rot, k_rot.transpose(-1, -2)) * self.scale
-        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
-        output = torch.matmul(attention_probs, v)
-    
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_length, -1)
-        output = torch.matmul(output, self.output_weight.T)
-    
-        return output, (k_rot, v)    
-            
+                k_rot = torch.cat([past_k, k_rot], dim=2)
+                v = torch.cat([past_v, v], dim=2)
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q_rot, k_rot, v, attn_mask=None, dropout_p=0.0, is_causal=True
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch_size, seq_length, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, (k_rot, v)          
 # Modify the model's transformer layer to use the custom attention layer
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class CustomTransformerLayer(nn.Module):
-    def __init__(self, hidden_size, num_heads, layer_index, weights_dir):
+    def __init__(self, config, layer_index, weights_dir):
         super(CustomTransformerLayer, self).__init__()
-        self.attention = CustomAttentionLayer(hidden_size, num_heads, layer_index, weights_dir)
-        self.layernorm = nn.LayerNorm(hidden_size)
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.layer_index = layer_index
+        self.weights_dir = weights_dir
+
+        # Attention
+        self.attention = CustomAttentionLayer(config, layer_index, weights_dir)
+        
+        # Layer norms
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Feed-forward network
+        self.mlp = MLP(
+            gate_proj=self.load_weight(f"model_layers_{layer_index}_mlp_gate_proj_weight.dat", (self.intermediate_size, self.hidden_size)),
+            up_proj=self.load_weight(f"model_layers_{layer_index}_mlp_up_proj_weight.dat", (self.intermediate_size, self.hidden_size)),
+            down_proj=self.load_weight(f"model_layers_{layer_index}_mlp_down_proj_weight.dat", (self.hidden_size, self.intermediate_size)),
+            act_fn=F.silu
+        )
+
+    def load_weight(self, file_name, shape):
+        file_path = os.path.join(self.weights_dir, file_name)
+        if os.path.exists(file_path):
+            tensor_data = np.fromfile(file_path, dtype=np.float32)
+            return torch.tensor(tensor_data).view(*shape).to("cuda")
+        else:
+            raise FileNotFoundError(f"Weight file {file_name} not found.")
 
     def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None, use_cache=False):
-        # Check for past_key_value for caching
-        if past_key_value is not None:
-            past_k, past_v = past_key_value
-        else:
-            past_k, past_v = None, None
+        # Pre-attention norm
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
-        # Pass through attention
-        attention_output, new_past = self.attention(hidden_states, freqs_cis, (past_k, past_v), position_ids)
+        # Attention
+        attention_output, new_past = self.attention(hidden_states, freqs_cis, past_key_value, position_ids)
 
-        # Normalize the attention output
-        hidden_states = self.layernorm(hidden_states + attention_output)
+        # Residual connection
+        hidden_states = residual + attention_output
 
-        # Return hidden states and past key values if caching is enabled
+        # Pre-FFN norm
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+
+        # Feed-forward network
+        hidden_states = self.mlp(hidden_states)
+
+        # Residual connection
+        hidden_states = residual + hidden_states
+
         if use_cache:
             return hidden_states, new_past
         else:
             return hidden_states, None
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, hidden_states):
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return self.weight * hidden_states
+
+class MLP(nn.Module):
+    def __init__(self, gate_proj, up_proj, down_proj, act_fn):
+        super().__init__()
+        self.gate_proj = nn.Parameter(gate_proj)
+        self.up_proj = nn.Parameter(up_proj)
+        self.down_proj = nn.Parameter(down_proj)
+        self.act_fn = act_fn
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 # CustomLlamaModel that integrates custom transformer layers and rotary embeddings
@@ -241,16 +281,14 @@ class CustomLlamaModel(LlamaForCausalLM):
     def __init__(self, config, weights_dir):
         super(CustomLlamaModel, self).__init__(config)
         self.weights_dir = weights_dir
-        self.num_hidden_layers = config.num_hidden_layers
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
+        self.config = config
 
         self.transformer_layers = nn.ModuleList(
-            [CustomTransformerLayer(self.hidden_size, self.num_attention_heads, layer_index, weights_dir)
-             for layer_index in range(self.num_hidden_layers)]
+            [CustomTransformerLayer(config, layer_index, weights_dir)
+             for layer_index in range(config.num_hidden_layers)]
         )
         
-        self.freqs_cis = get_rotary_frequencies(self.hidden_size)
+        self.freqs_cis = get_rotary_frequencies(config.hidden_size, config.max_position_embeddings)
 
     def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, position_ids=None, past_key_values=None, use_cache=False, cache_position=None, return_dict=True):
         if inputs_embeds is None:
