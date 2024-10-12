@@ -174,37 +174,42 @@ class CustomAttentionLayer(nn.Module):
             raise FileNotFoundError(f"Weight file {file_name} not found.")
 
     def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None):
+        # Ensure hidden_states are on the same device as model parameters (GPU)
+        device = self.q_proj.weight.device
+        hidden_states = hidden_states.to(device)
+    
         batch_size, seq_length, _ = hidden_states.shape
-
+    
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
-
+    
         q = q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
+    
         # Repeat k and v for multi-query attention
         k = k.repeat_interleave(self.num_heads // self.num_key_value_heads, dim=1)
         v = v.repeat_interleave(self.num_heads // self.num_key_value_heads, dim=1)
-
+    
         q_rot, k_rot = apply_rotary_emb(q, k, freqs_cis)
-
+    
         if past_key_value is not None:
             past_k, past_v = past_key_value
             if past_k is not None and past_v is not None:
                 k_rot = torch.cat([past_k, k_rot], dim=2)
                 v = torch.cat([past_v, v], dim=2)
-
+    
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q_rot, k_rot, v, attn_mask=None, dropout_p=0.0, is_causal=True
         )
-
+    
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, seq_length, self.hidden_size)
         attn_output = self.o_proj(attn_output)
-
+    
         return attn_output, (k_rot, v)
+    
         
         
 class CustomTransformerLayer(nn.Module):
