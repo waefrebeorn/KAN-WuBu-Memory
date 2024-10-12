@@ -235,9 +235,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
     device = next(model.parameters()).device
     inputs = {key: value.to(device) for key, value in inputs.items()}
 
-    # Ensure past_key_values is set to None initially
-    past_key_values = None
-
+    # Do not manually set `past_key_values` here. Let the model handle it internally during generation.
     with torch.no_grad():
         # Use the model's generate method with proper handling for past_key_values
         outputs = model.generate(
@@ -250,8 +248,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
             top_p=0.9,
             repetition_penalty=1.2,
             pad_token_id=pad_token_id,
-            use_cache=True,  # Enable cache to allow faster generations by using past_key_values
-            past_key_values=past_key_values  # Pass the past_key_values to generate
+            use_cache=True  # Ensure cache is enabled for the model to handle past_key_values
         )
 
     # Decode the generated output
@@ -269,6 +266,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
         history = history[-6:]
 
     return cleaned_response, history
+
 
 
 # Interactive input loop to query the model
