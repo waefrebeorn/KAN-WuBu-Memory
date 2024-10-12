@@ -88,25 +88,24 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     d_k = xk.shape[-1] // 2
     
     # Split the query and key tensors into real and imaginary parts for rotary embedding
-    xq_ = torch.complex(xq[..., :d_q], xq[..., d_q:])
-    xk_ = torch.complex(xk[..., :d_k], xk[..., d_k:])
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     
-    # Ensure the rotary embedding frequencies have the correct shape (2D: sequence length, hidden size / 2)
+    # Ensure the rotary embedding frequencies have the correct shape
     batch_size, num_heads, seq_len, _ = xq_.shape
-
-    # Slice freqs_cis to match the sequence length
-    freqs_cis = freqs_cis[:seq_len, :].to(xq_.device)  # Match sequence length and hidden size / 2
+    
+    # Slice freqs_cis to match the sequence length and reshape
+    freqs_cis = freqs_cis[:seq_len, :].to(xq_.device)
+    freqs_cis = freqs_cis.reshape(1, 1, seq_len, d_q)
     
     # Expand freqs_cis to match the batch size and number of attention heads
-    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)  # Add batch and heads dimensions
-    freqs_cis = freqs_cis.expand(batch_size, num_heads, seq_len, d_q)  # Match batch size, heads, and query/key dimensions
-
+    freqs_cis = freqs_cis.expand(batch_size, num_heads, seq_len, d_q)
+    
     # Apply the rotary embedding frequencies to the queries and keys
-    xq_out = torch.complex(xq_.real * freqs_cis.cos() - xq_.imag * freqs_cis.sin(), xq_.real * freqs_cis.sin() + xq_.imag * freqs_cis.cos())
-    xk_out = torch.complex(xk_.real * freqs_cis.cos() - xk_.imag * freqs_cis.sin(), xk_.real * freqs_cis.sin() + xk_.imag * freqs_cis.cos())
-
-    # Convert the complex tensors back into real tensors
-    return torch.view_as_real(xq_out).flatten(2), torch.view_as_real(xk_out).flatten(2)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    
+    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
 
