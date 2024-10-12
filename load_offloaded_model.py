@@ -147,12 +147,22 @@ class CustomAttentionLayer(nn.Module):
         self.weights_dir = weights_dir
         self.layer_index = layer_index
 
-        self.q_proj = self.load_weight(f"model_layers_{layer_index}_self_attn_q_proj_weight.dat", (self.hidden_size, self.hidden_size))
-        self.k_proj = self.load_weight(f"model_layers_{layer_index}_self_attn_k_proj_weight.dat", (self.hidden_size, self.num_key_value_heads * self.head_dim))
-        self.v_proj = self.load_weight(f"model_layers_{layer_index}_self_attn_v_proj_weight.dat", (self.hidden_size, self.num_key_value_heads * self.head_dim))
-        self.o_proj = self.load_weight(f"model_layers_{layer_index}_self_attn_o_proj_weight.dat", (self.hidden_size, self.hidden_size))
+        # Create nn.Linear layers
+        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+
+        # Load weights into the layers
+        self.load_weights()
 
         self.scale = 1 / (self.head_dim ** 0.5)
+
+    def load_weights(self):
+        self.q_proj.weight.data = self.load_weight(f"model_layers_{self.layer_index}_self_attn_q_proj_weight.dat", (self.hidden_size, self.hidden_size))
+        self.k_proj.weight.data = self.load_weight(f"model_layers_{self.layer_index}_self_attn_k_proj_weight.dat", (self.num_key_value_heads * self.head_dim, self.hidden_size))
+        self.v_proj.weight.data = self.load_weight(f"model_layers_{self.layer_index}_self_attn_v_proj_weight.dat", (self.num_key_value_heads * self.head_dim, self.hidden_size))
+        self.o_proj.weight.data = self.load_weight(f"model_layers_{self.layer_index}_self_attn_o_proj_weight.dat", (self.hidden_size, self.hidden_size))
 
     def load_weight(self, file_name, shape):
         file_path = os.path.join(self.weights_dir, file_name)
@@ -193,12 +203,9 @@ class CustomAttentionLayer(nn.Module):
         attn_output = attn_output.reshape(batch_size, seq_length, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, (k_rot, v)          
-# Modify the model's transformer layer to use the custom attention layer
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
+        return attn_output, (k_rot, v)
+        
+        
 class CustomTransformerLayer(nn.Module):
     def __init__(self, config, layer_index, weights_dir):
         super(CustomTransformerLayer, self).__init__()
