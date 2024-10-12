@@ -138,6 +138,7 @@ class CustomAttentionLayer(nn.Module):
         self.head_dim = config.head_dim
         self.weights_dir = weights_dir
         self.layer_index = layer_index
+        self.rope_scaling = config.rope_scaling  # Add rope scaling from config
 
         # Create nn.Linear layers
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
@@ -182,8 +183,9 @@ class CustomAttentionLayer(nn.Module):
         # Repeat k and v for multi-query attention
         k = k.repeat_interleave(self.num_heads // self.num_key_value_heads, dim=1)
         v = v.repeat_interleave(self.num_heads // self.num_key_value_heads, dim=1)
-    
-        q_rot, k_rot = apply_rotary_emb(q, k, freqs_cis)
+
+        # Apply rotary embeddings with scaling based on layer index and rope scaling factors
+        q_rot, k_rot = apply_rotary_emb(q, k, freqs_cis, self.layer_index, self.rope_scaling)
     
         if past_key_value is not None:
             past_k, past_v = past_key_value
