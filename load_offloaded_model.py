@@ -244,30 +244,38 @@ class CustomTransformerLayer(nn.Module):
             raise FileNotFoundError(f"Weight file {file_name} not found.")
 
     def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None, use_cache=False):
+        # Ensure hidden_states are on the same device as model parameters (GPU)
+        device = self.attention.q_proj.weight.device
+        hidden_states = hidden_states.to(device)
+    
         # Pre-attention norm
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-
+    
         # Attention
         attention_output, new_past = self.attention(hidden_states, freqs_cis, past_key_value, position_ids)
-
+    
+        # Ensure residual and attention_output are on the same device
+        attention_output = attention_output.to(residual.device)
+    
         # Residual connection
         hidden_states = residual + attention_output
-
+    
         # Pre-FFN norm
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-
+    
         # Feed-forward network
         hidden_states = self.mlp(hidden_states)
-
+    
         # Residual connection
         hidden_states = residual + hidden_states
-
+    
         if use_cache:
             return hidden_states, new_past
         else:
             return hidden_states, None
+    
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
