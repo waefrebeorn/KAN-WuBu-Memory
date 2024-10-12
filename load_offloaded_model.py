@@ -362,6 +362,19 @@ class CustomLlamaModel(LlamaForCausalLM):
         else:
             return logits
 
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
+        # Prepare inputs for the `generate` function
+        if past_key_values:
+            # If past_key_values are provided, only pass the last token for further processing
+            input_ids = input_ids[:, -1:]
+
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
+            "use_cache": kwargs.get("use_cache", True),
+        }
+
 
 
 
