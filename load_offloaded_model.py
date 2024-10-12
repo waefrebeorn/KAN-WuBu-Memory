@@ -190,8 +190,9 @@ class CustomAttentionLayer(nn.Module):
         # Handle past_key_values
         if past_key_value is not None:
             past_k, past_v = past_key_value
-            k_rot = torch.cat([past_k, k_rot], dim=-2)
-            v = torch.cat([past_v, v], dim=-2)
+            if past_k is not None and past_v is not None:
+                k_rot = torch.cat([past_k, k_rot], dim=-2)
+                v = torch.cat([past_v, v], dim=-2)
     
         attention_scores = torch.matmul(q_rot, k_rot.transpose(-1, -2)) * self.scale
         attention_probs = nn.functional.softmax(attention_scores, dim=-1)
@@ -201,7 +202,7 @@ class CustomAttentionLayer(nn.Module):
         output = torch.matmul(output, self.output_weight.T)
     
         return output, (k_rot, v)
-    
+        
 # Modify the model's transformer layer to use the custom attention layer
 class CustomTransformerLayer(nn.Module):
     def __init__(self, hidden_size, num_heads, layer_index, weights_dir):
