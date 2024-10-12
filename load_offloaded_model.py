@@ -324,7 +324,7 @@ class CustomLlamaModel(LlamaForCausalLM):
                 position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0).expand(batch_size, -1)
 
         if past_key_values is None:
-            past_key_values = [None] * self.num_hidden_layers
+            past_key_values = [None] * self.config.num_hidden_layers  # Fixed: Use self.config.num_hidden_layers
 
         hidden_states = inputs_embeds
         presents = [] if use_cache else None
@@ -376,7 +376,7 @@ def custom_generate(
     
     for _ in range(max_new_tokens):
         with torch.no_grad():
-            # Get model outputs: logits
+            # Get model outputs: logits and past_key_values
             outputs = model(input_ids=generated, return_dict=True)
             logits = outputs["logits"][:, -1, :]  # Get logits of the last token
 
