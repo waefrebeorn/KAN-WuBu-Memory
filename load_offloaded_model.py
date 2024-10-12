@@ -96,24 +96,22 @@ def apply_rotary_emb(q, k, freqs_cis, layer_index, rope_scaling):
     original_max_pos = rope_scaling['original_max_position_embeddings']
 
     # Apply scaling based on the layer index and frequency factors
-    if layer_index < 16:  # Assuming lower layers use low frequency scaling
-        freq_factor = low_freq_factor
-    else:  # Higher layers use high frequency scaling
-        freq_factor = high_freq_factor
+    freq_factor = high_freq_factor if layer_index >= 16 else low_freq_factor
 
-    # Apply rotary embeddings with frequency scaling
-    if freqs_cis.dim() == 2:  # Handle case where freqs_cis is 2D
-        freqs_cis = freqs_cis[:, :q.shape[-1] // 2] * freq_factor
-    elif freqs_cis.dim() == 3:  # Handle case where freqs_cis is 3D
-        freqs_cis = freqs_cis[:, :q.shape[-1] // 2, :] * freq_factor
+    # Adjust freqs_cis to match q's shape, considering the sequence length
+    seq_len = q.shape[-2]  # Sequence length from query tensor
+    freqs_cis = freqs_cis[:seq_len, :q.shape[-1] // 2] * freq_factor
 
-    freqs_cis = freqs_cis.unsqueeze(0).expand_as(q_complex)
-    
+    # Expand freqs_cis to match the shape of q_complex
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(1)  # Expand for batch size and heads
+    freqs_cis = freqs_cis.expand_as(q_complex)  # Ensure it matches q_complex shape
+
     # Apply complex multiplication to both query and key tensors
     q_rot = torch.view_as_real(q_complex * freqs_cis).flatten(3)
     k_rot = torch.view_as_real(k_complex * freqs_cis).flatten(3)
     
     return q_rot, k_rot
+
 
 
 # Generating scaled rotary frequencies for LLaMA 3.2
