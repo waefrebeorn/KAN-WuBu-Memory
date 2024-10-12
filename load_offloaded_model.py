@@ -87,11 +87,8 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     print("xk shape:", xk.shape)
     print("freqs_cis shape:", freqs_cis.shape)
     
-    # Get half the hidden size for each tensor separately
-    d_q = xq.shape[-1] // 2
-    d_k = xk.shape[-1] // 2
+    d = xq.shape[-1]
     
-    # Split the query and key tensors into real and imaginary parts for rotary embedding
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     
@@ -99,25 +96,20 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     print("After reshaping - xq_ shape:", xq_.shape)
     print("After reshaping - xk_ shape:", xk_.shape)
     
-    # Reshape freqs_cis to match the expected dimensions
-    if freqs_cis.dim() == 3:  # If freqs_cis is [1, seq_len, d]
+    if freqs_cis.dim() == 3:
         freqs_cis = freqs_cis.squeeze(0)
     print("After squeezing - freqs_cis shape:", freqs_cis.shape)
     
-    # Ensure freqs_cis has the correct sequence length and dimension
-    max_d = max(d_q, d_k)
-    freqs_cis = freqs_cis[:seq_len, :max_d]
+    freqs_cis = freqs_cis[:seq_len, :d//2]
     print("After slicing - freqs_cis shape:", freqs_cis.shape)
     
-    # Reshape and expand freqs_cis to match the input tensors
     freqs_cis = freqs_cis.to(xq_.device)
     freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)
-    freqs_cis = freqs_cis.expand(batch_size, num_heads, seq_len, max_d)
+    freqs_cis = freqs_cis.expand(batch_size, num_heads, seq_len, d//2)
     print("Final freqs_cis shape:", freqs_cis.shape)
     
-    # Apply the rotary embedding frequencies to the queries and keys
-    xq_out = torch.view_as_real(xq_ * freqs_cis[..., :d_q]).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis[..., :d_k]).flatten(3)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     
     print("xq_out shape:", xq_out.shape)
     print("xk_out shape:", xk_out.shape)
@@ -151,13 +143,14 @@ class CustomAttentionLayer(nn.Module):
         super(CustomAttentionLayer, self).__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
         self.weights_dir = weights_dir
         self.layer_index = layer_index
         self.query_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_q_proj_weight.dat")
         self.key_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_k_proj_weight.dat")
         self.value_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_v_proj_weight.dat")
         self.output_weight = self.load_weight(f"model_layers_{layer_index}_self_attn_o_proj_weight.dat")
-        self.scale = 1 / (hidden_size // num_heads) ** 0.5
+        self.scale = 1 / (self.head_dim ** 0.5)
 
     def load_weight(self, file_name):
         file_path = os.path.join(self.weights_dir, file_name)
@@ -168,7 +161,6 @@ class CustomAttentionLayer(nn.Module):
             raise FileNotFoundError(f"Weight file {file_name} not found.")
 
     def forward(self, hidden_states, freqs_cis, past_key_value=None, position_ids=None):
-        # Ensure hidden_states is moved to the same device as the weights
         device = self.query_weight.device
         hidden_states = hidden_states.to(device)
     
@@ -177,32 +169,30 @@ class CustomAttentionLayer(nn.Module):
         k = torch.matmul(hidden_states, self.key_weight.T)
         v = torch.matmul(hidden_states, self.value_weight.T)
     
-        q = q.view(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
-        k = k.view(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
-        v = v.view(batch_size, seq_length, self.num_heads, -1).transpose(1, 2)
+        print(f"q shape: {q.shape}")
+        print(f"k shape: {k.shape}")
+        print(f"v shape: {v.shape}")
+    
+        q = q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+    
+        print(f"After reshape - q shape: {q.shape}")
+        print(f"After reshape - k shape: {k.shape}")
+        print(f"After reshape - v shape: {v.shape}")
     
         if position_ids is not None:
             freqs_cis = freqs_cis[position_ids]
     
-        # Apply rotary embeddings
         q_rot, k_rot = apply_rotary_emb(q, k, freqs_cis)
     
-        # Handle past_key_values
+        print(f"After rotary - q_rot shape: {q_rot.shape}")
+        print(f"After rotary - k_rot shape: {k_rot.shape}")
+    
         if past_key_value is not None:
             past_k, past_v = past_key_value
-            if past_k is not None and past_v is not None:
-                k_rot = torch.cat([past_k, k_rot], dim=-2)
-                v = torch.cat([past_v, v], dim=-2)
-    
-        attention_scores = torch.matmul(q_rot, k_rot.transpose(-1, -2)) * self.scale
-        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
-        output = torch.matmul(attention_probs, v)
-    
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_length, -1)
-        output = torch.matmul(output, self.output_weight.T)
-    
-        return output, (k_rot, v)
-        
+            if past_k is not None and past_v i
+            
 # Modify the model's transformer layer to use the custom attention layer
 class CustomTransformerLayer(nn.Module):
     def __init__(self, hidden_size, num_heads, layer_index, weights_dir):
