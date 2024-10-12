@@ -368,9 +368,16 @@ def custom_generate(
     
     for _ in range(max_new_tokens):
         with torch.no_grad():
-            # Get model outputs: logits and past_key_values
             outputs = model(input_ids=generated, return_dict=True)
-            logits = outputs["logits"][:, -1, :]  # [batch_size, vocab_size]
+            logits = outputs["logits"]
+    
+            # Check the number of dimensions and handle accordingly
+            if len(logits.shape) == 3:
+                logits = logits[:, -1, :]  # Standard case, 3D tensor
+            elif len(logits.shape) == 2:
+                logits = logits[:, :]  # Handle 2D logits
+    
+    
 
             # Apply repetition penalty
             if repetition_penalty != 1.0:
@@ -469,8 +476,9 @@ def user_input_loop(custom_model, tokenizer):
             response, history = generate_response(user_input, custom_model, tokenizer, history=history)
             print(f"Model Response: {response}")
         except Exception as e:
-            print(f"An error occurred during generation: {e}")
-            # Optionally, you can add more detailed error handling here
+            # Show full error without wrapping to allow for easier debugging
+            raise e
+
 
 # Initialize the custom model and tokenizer
 config = load_configuration(MODEL_JSON_PATH)
