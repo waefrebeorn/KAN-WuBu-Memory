@@ -4,7 +4,7 @@ transformers==4.45.1
 numpy
 matplotlib
 scikit-learn
-
+tqdm
 
 # GUI
 tk

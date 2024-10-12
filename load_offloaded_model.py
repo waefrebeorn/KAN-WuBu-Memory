@@ -8,6 +8,7 @@ import logging
 from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
 from typing import Tuple
 import json
+from tqdm import tqdm  # For progress bars
 
 # Define paths to the directories and files
 SOURCE_DIR = "models/Llama_32_1B/"
@@ -36,7 +37,7 @@ config = load_configuration(MODEL_JSON_PATH)
 model = LlamaForCausalLM(config)
 logging.info("Initialized empty LLaMA model.")
 
-# Load the offloaded weights from the `.dat` files
+# Load the offloaded weights from the `.dat` files with a progress bar
 def load_dat_file(file_path, dtype):
     with open(file_path, 'rb') as f:
         tensor_data = np.fromfile(f, dtype=dtype)
@@ -48,28 +49,33 @@ def load_dat_file(file_path, dtype):
     return loaded_tensor
 
 def load_offloaded_weights(model, weights_dir):
-    for name, param in model.named_parameters():
-        file_name = name.replace('.', '_') + ".dat"
-        file_path = os.path.join(weights_dir, file_name)
+    param_names = list(model.named_parameters())
+    # Create a progress bar for weight loading
+    with tqdm(total=len(param_names), desc="Loading weights", unit="param") as pbar:
+        for name, param in param_names:
+            file_name = name.replace('.', '_') + ".dat"
+            file_path = os.path.join(weights_dir, file_name)
 
-        if os.path.exists(file_path):
-            dtype_map = {
-                torch.float16: np.float16,
-                torch.float32: np.float32,
-                torch.int64: np.int64,
-                torch.int32: np.int32,
-                torch.bfloat16: np.float32,
-            }
-            expected_dtype = dtype_map.get(param.dtype, np.float32)
-            logging.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
-            loaded_tensor = load_dat_file(file_path, expected_dtype).view_as(param)
+            if os.path.exists(file_path):
+                dtype_map = {
+                    torch.float16: np.float16,
+                    torch.float32: np.float32,
+                    torch.int64: np.int64,
+                    torch.int32: np.int32,
+                    torch.bfloat16: np.float32,
+                }
+                expected_dtype = dtype_map.get(param.dtype, np.float32)
+                logging.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
+                loaded_tensor = load_dat_file(file_path, expected_dtype).view_as(param)
 
-            if param.dtype == torch.bfloat16:
-                loaded_tensor = loaded_tensor.to(torch.bfloat16)
+                if param.dtype == torch.bfloat16:
+                    loaded_tensor = loaded_tensor.to(torch.bfloat16)
 
-            param.data.copy_(loaded_tensor.to("cuda"))
-        else:
-            logging.warning(f"Warning: {file_name} not found in offloaded directory.")
+                param.data.copy_(loaded_tensor.to("cuda"))
+            else:
+                logging.warning(f"Warning: {file_name} not found in offloaded directory.")
+            
+            pbar.update(1)  # Update the progress bar after each parameter is loaded
 
 # Load the weights into the model
 load_offloaded_weights(model, WEIGHTS_DIR)
@@ -94,13 +100,7 @@ def apply_rotary_emb(q, k, freqs_cis, layer_index, rope_scaling):
     freqs_cis = freqs_cis.to(device)  # Move freqs_cis to the correct device
 
     # Get rope scaling parameters for this layer
-    factor = rope_scaling['factor']
-    high_freq_factor = rope_scaling['high_freq_factor']
-    low_freq_factor = rope_scaling['low_freq_factor']
-    original_max_pos = rope_scaling['original_max_position_embeddings']
-
-    # Apply scaling based on the layer index and frequency factors
-    freq_factor = high_freq_factor if layer_index >= 16 else low_freq_factor
+    freq_factor = rope_scaling['high_freq_factor'] if layer_index >= 16 else rope_scaling['low_freq_factor']
 
     # Adjust freqs_cis to match q's shape, considering the sequence length
     seq_len = q.shape[-2]  # Sequence length from query tensor
@@ -115,8 +115,6 @@ def apply_rotary_emb(q, k, freqs_cis, layer_index, rope_scaling):
     k_rot = torch.view_as_real(k_complex * freqs_cis).flatten(3)
     
     return q_rot, k_rot
-
-
 
 # Generating scaled rotary frequencies for LLaMA 3.2
 def get_rotary_frequencies(config):
@@ -389,78 +387,89 @@ def custom_generate(
     model.eval()  # Set model to evaluation mode
     generated = input_ids.to(device)  # [batch_size, seq_length]
     
-    for _ in range(max_new_tokens):
-        with torch.no_grad():
-            outputs = model(input_ids=generated, return_dict=True)
-            logits = outputs["logits"]
-    
-            # Check the number of dimensions and handle accordingly
-            if len(logits.shape) == 3:
-                logits = logits[:, -1, :]  # Standard case, 3D tensor
-            elif len(logits.shape) == 2:
-                logits = logits[:, :]  # Handle 2D logits
-    
-    
+    print(f"Initial Input IDs: {input_ids.tolist()}")  # Log the initial input
 
-            # Apply repetition penalty
-            if repetition_penalty != 1.0:
-                for i in range(generated.shape[0]):
-                    unique_tokens = set(generated[i].tolist())
-                    for token in unique_tokens:
-                        logits[i, token] /= repetition_penalty
+    # Create a progress bar to track the generation process
+    with tqdm(total=max_new_tokens, desc="Generating tokens", unit="token") as pbar:
+        for _ in range(max_new_tokens):
+            with torch.no_grad():
+                outputs = model(input_ids=generated, return_dict=True)
+                logits = outputs["logits"]
 
-            # Apply temperature scaling
-            logits = logits / temperature
+                # Check the number of dimensions and handle accordingly
+                if len(logits.shape) == 3:
+                    logits = logits[:, -1, :]  # Standard case, 3D tensor
+                elif len(logits.shape) == 2:
+                    logits = logits[:, :]  # Handle 2D logits
 
-            # Top-K sampling
-            if top_k > 0:
-                top_k_logits, _ = torch.topk(logits, top_k, dim=-1)
-                logits[logits < top_k_logits[:, [-1]]] = -float('Inf')
+                print(f"Logits shape: {logits.shape}")  # Log the shape of logits
 
-            # Top-P (nucleus) sampling
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
+                # Apply repetition penalty
+                if repetition_penalty != 1.0:
+                    for i in range(generated.shape[0]):
+                        unique_tokens = set(generated[i].tolist())
+                        for token in unique_tokens:
+                            logits[i, token] /= repetition_penalty
 
-            # Shift the indices to the right to keep at least one token
-            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-            sorted_indices_to_remove[:, 0] = 0
+                # Apply temperature scaling
+                logits = logits / temperature
 
-            # Scatter the sorted indices to the original logits tensor
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            logits[indices_to_remove] = -float('Inf')
+                # Top-K sampling
+                if top_k > 0:
+                    top_k_logits, _ = torch.topk(logits, top_k, dim=-1)
+                    logits[logits < top_k_logits[:, [-1]]] = -float('Inf')
 
-            # Sample from the filtered distribution
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # [batch_size, 1]
+                # Top-P (nucleus) sampling
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
 
-            # Append generated token
-            generated = torch.cat([generated, next_token], dim=-1)  # [batch_size, seq_length +1]
+                # Shift the indices to the right to keep at least one token
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                sorted_indices_to_remove[:, 0] = 0
 
-            # Break on EOS token
-            if eos_token_id is not None:
-                if isinstance(eos_token_id, list):
-                    eos_tensor = torch.tensor(eos_token_id, device=next_token.device)  # Ensure eos_token_id is a tensor
-                    if torch.any(torch.isin(next_token, eos_tensor)):
-                        break
-                else:
-                    if torch.any(next_token == eos_token_id):
-                        break
-            
+                # Scatter the sorted indices to the original logits tensor
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = -float('Inf')
 
+                # Sample from the filtered distribution
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)  # [batch_size, 1]
+
+                print(f"Generated Token ID: {next_token.tolist()}")  # Log the generated token
+
+                # Append generated token
+                generated = torch.cat([generated, next_token], dim=-1)  # [batch_size, seq_length +1]
+
+                # Break on EOS token
+                if eos_token_id is not None:
+                    if isinstance(eos_token_id, list):
+                        eos_tensor = torch.tensor(eos_token_id, device=next_token.device)  # Ensure eos_token_id is a tensor
+                        if torch.any(torch.isin(next_token, eos_tensor)):
+                            print("EOS token encountered. Ending generation.")
+                            break
+                    else:
+                        if torch.any(next_token == eos_token_id):
+                            print("EOS token encountered. Ending generation.")
+                            break
+                
+                pbar.update(1)  # Update progress bar after generating a token
+
+    print(f"Final Generated Output IDs: {generated.tolist()}")  # Log the final output
     return generated
 
 # Generate response method updated to call custom_generate
 def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
     
+    print(f"Prompt: {prompt}")  # Log the prompt to be tokenized
+    
     # Tokenize the input prompt
     inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit)
-
-    # Move inputs to the correct device (GPU)
-    device = next(model.parameters()).device
-    input_ids = inputs["input_ids"].to(device)
-
+    input_ids = inputs["input_ids"].to(next(model.parameters()).device)
+    
+    print(f"Tokenized Input IDs: {input_ids.tolist()}")  # Log tokenized input
+    
     # Generate the response using the custom generate function
     generated_output = custom_generate(
         model=model,
@@ -473,7 +482,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
         repetition_penalty=1.2,
         pad_token_id=pad_token_id,
         eos_token_id=[128001, 128008, 128009],  # Set your EOS token IDs as per config
-        device=device
+        device=next(model.parameters()).device
     )
 
     # Decode the generated output
@@ -482,6 +491,8 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
     # Clean up the response to remove duplicate User tags or extraneous whitespace
     cleaned_response = response.split("User:")[-1].strip()
     cleaned_response = re.sub(r'\s+', ' ', cleaned_response)
+
+    print(f"Final Generated Response: {cleaned_response}")  # Log the cleaned response
 
     # Append this conversation turn to the history
     history.append(f"User: {input_text}\nModel: {cleaned_response}")
