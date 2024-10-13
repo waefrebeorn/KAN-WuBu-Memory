@@ -174,9 +174,10 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
     probs = torch.softmax(model_output.logits, dim=-1)
     entropy = calculate_entropy(probs)
 
-    # Generate the response
-    response = tokenizer.decode(model_output.logits.argmax(dim=-1), skip_special_tokens=True).strip()
-    
+    # Get the most likely tokens and decode them
+    token_ids = model_output.logits.argmax(dim=-1).tolist()
+    response = tokenizer.decode(token_ids[0], skip_special_tokens=True).strip()  # Use the first sequence
+
     # Evaluate and refine response based on entropy
     response_quality_manager = ResponseQualityManager(model, tokenizer)
     refined_response = response_quality_manager.evaluate_response(input_text, response, entropy)
@@ -189,6 +190,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
         history = history[-6:]
 
     return refined_response, history
+
 
 # User input loop with refined response generation
 def user_input_loop(model, tokenizer):
