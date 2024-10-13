@@ -221,10 +221,10 @@ def user_input_loop(model, tokenizer):
         feedback = input("Please provide feedback on the response (good/bad): ")
         
         # Fine-tune the model based on user feedback
-        if feedback.lower() == 'good':
+       ## if feedback.lower() == 'good':
             # Reinforce the response pattern 
             # ... (code for reinforcement learning)
-        elif feedback.lower() == 'bad':
+       ## elif feedback.lower() == 'bad':
             # Penalize the response pattern
             # ... (code for reinforcement learning)
     
