@@ -136,100 +136,87 @@ def adjust_layers(model, quality_score, threshold=0.75):
 
 def generate_response(input_text, model, tokenizer, max_new_tokens=50, pad_token_id=128001, history=[], context_limit=512):
     # Clean the history to avoid redundant prompts
-    history = [line for line in history if line.strip()]  # Remove empty lines
+    history = [line for line in history if line.strip()]
     
-    # Create a simplified context prompt from the last few exchanges
-    prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
+    # Create a context prompt from the last few exchanges
+    context = ' '.join(history[-3:]) if history else ''
+    prompt = f"{context}\nUser: {input_text}\nModel:"
     
-    # Prepare inputs for the model  
+    # Prepare inputs for the model
     inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to("cuda")
 
     # Initialize response and keep track of tokens for refinement
     refined_response = ""
-    refined_token_ids = []  
-    full_response = ""
+    refined_token_ids = []
 
-    # Iteratively generate responses
-    for iteration in range(10):  # Number of iterations can be adjusted as needed
-        logging.info(f"Iteration {iteration + 1}: Generating tokens...")
-
-        # Generate a chunk of response
+    # Iteratively generate and refine the response
+    for iteration in range(10):  # Number of iterations can be adjusted
         with torch.no_grad():
             outputs = model.generate(
                 inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
-                max_new_tokens=max_new_tokens,  # Control new tokens per iteration
-                do_sample=True,  
+                max_new_tokens=max_new_tokens // 10,  # Distribute tokens across iterations
+                do_sample=True,
                 temperature=0.7,
                 top_k=50,
                 top_p=0.9,
                 repetition_penalty=1.2,
                 pad_token_id=pad_token_id,
-                early_stopping=True,  
-                output_scores=True,  # Enable outputting scores/logits
-                return_dict_in_generate=True  # Return full output with scores
+                eos_token_id=tokenizer.eos_token_id,
+                output_scores=True,
+                return_dict_in_generate=True
             )
 
-        # Retrieve the generated token IDs and logits (probabilities)
-        token_ids = outputs.sequences[0].tolist()  
-        refined_token_ids.extend(token_ids)
-
-        # Convert logits to probabilities and calculate entropy
-        logits = outputs.scores  # This contains the logits for each generated token
-        probs = torch.softmax(torch.stack(logits), dim=-1)  
-        entropies = calculate_entropy(probs)
+        # Retrieve the generated token IDs
+        new_token_ids = outputs.sequences[0][inputs["input_ids"].shape[1]:].tolist()
+        refined_token_ids.extend(new_token_ids)
 
         # Decode the generated response
         refined_response = tokenizer.decode(refined_token_ids, skip_special_tokens=True).strip()
 
-        # Evaluate the quality of the generated response
-        quality_score = evaluate_response_quality(refined_response, input_text, tokenizer)
-        
-        # Adjust layers based on the quality score
-        model = adjust_layers(model, quality_score)
-        
-        full_response = f"{full_response} {refined_response}".strip()
+        # Check if the response is complete
+        if refined_response.endswith(('.', '!', '?')) or 'User:' in refined_response:
+            break
+
+        # Update input for next iteration
+        inputs["input_ids"] = outputs.sequences
+
+    # Clean up the generated output
+    response = refined_response.replace(prompt, "").strip()
     
     # Append final cleaned response to history
-    history.append(f"User: {input_text}\nModel: {full_response}")
+    history.append(f"User: {input_text}")
+    history.append(f"Model: {response}")
     
     # Trim history to avoid excessive accumulation 
-    if len(history) > 6:
-        history = history[-6:]
+    if len(history) > 10:
+        history = history[-10:]
 
-    return full_response, history
-
-def user_input_loop(model, tokenizer):
-    print("\n--- LLaMA Instruct Model Interactive Query ---") 
-    print("Type 'exit' to quit.")
-    history = []  # Initialize a history buffer to keep track of conversation
+    return response, history
     
+def user_input_loop(model, tokenizer):
+    print("\n--- LLaMA Interactive Query ---")
+    print("Type 'exit' to quit.")
+    history = []
+
     while True:
         user_input = input("\nEnter your query: ")
-        if user_input.lower() == 'exit':  
+        if user_input.lower() == 'exit':
             print("Exiting...")
             break
         
-        # Summarize the conversation history
-        summarized_history = summarize_history(history, tokenizer)
-        
         # Generate response using the LLaMA model
-        response, history = generate_response(user_input, model, tokenizer, history=summarized_history)  
-        print(f"Model Response: {response}")
+        response, history = generate_response(user_input, model, tokenizer, history=history)
+        print(f"Model: {response}")
         
         # Get user feedback on the response
         feedback = input("Please provide feedback on the response (good/bad): ")
         
-        # Fine-tune the model based on user feedback
-       ## if feedback.lower() == 'good':
-            # Reinforce the response pattern 
-            # ... (code for reinforcement learning)
-       ## elif feedback.lower() == 'bad':
-            # Penalize the response pattern
-            # ... (code for reinforcement learning)
+        if feedback.lower() == 'bad':
+            print("Thank you for your feedback. We'll work on improving the model's responses.")
     
     # Save the final conversation history
-    with open("conversation_history.json", "w") as f:  
+    with open("conversation_history.json", "w") as f:
         json.dump(history, f)
 
 # Start the interactive query loop with the refined response generation
