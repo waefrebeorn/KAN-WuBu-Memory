@@ -157,16 +157,18 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=50, pad_token
                 top_p=0.9,
                 repetition_penalty=1.2,
                 pad_token_id=pad_token_id,
-                early_stopping=True
+                early_stopping=True,
+                output_scores=True,  # Enable outputting scores/logits
+                return_dict_in_generate=True  # Return full output with scores
             )
 
-        # Decode and refine based on entropy
-        token_ids = outputs[0].tolist()
+        # Retrieve the generated token IDs and logits (probabilities)
+        token_ids = outputs.sequences[0].tolist()
         refined_token_ids.extend(token_ids)
 
         # Convert logits to probabilities and calculate entropy
-        logits = outputs.logits
-        probs = torch.softmax(logits, dim=-1)
+        logits = outputs.scores  # This contains the logits for each generated token
+        probs = torch.softmax(torch.stack(logits), dim=-1)
         entropies = calculate_entropy(probs)
 
         # If entropy is manageable, continue refining; otherwise, break
