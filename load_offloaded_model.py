@@ -16,12 +16,6 @@ MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")
 # Initialize logging
 logging.basicConfig(level=logging.INFO)
 
-# Entropy calculation function
-def calculate_entropy(probs):
-    log_probs = torch.log(probs + 1e-10)  # Avoid log(0)
-    entropy = -torch.sum(probs * log_probs, dim=-1)
-    return entropy
-
 # Load the configuration from the JSON file
 def load_configuration(model_json_path):
     with open(model_json_path, "r") as f:
@@ -83,48 +77,21 @@ load_offloaded_weights(model, WEIGHTS_DIR)
 model.to('cuda')
 model.eval()
 
-# Load the tokenizer
+# Use AutoTokenizer to handle any tokenizer class discrepancies
 logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
 tokenizer = load_tokenizer(SOURCE_DIR)
 
-# Adaptive layer squeezing based on entropy
-def adaptive_layer_squeeze(model, inputs, entropy_threshold=0.5):
-    # Run the model and get the full output, which includes logits, hidden states, and attentions
-    outputs = model(inputs["input_ids"], output_hidden_states=True)
-    
-    # Access hidden states directly from the outputs
-    hidden_states = outputs.hidden_states  # This contains a list of hidden states from each layer
-    
-    # Process each hidden state for entropy-based layer squeezing
-    for i, hidden_state in enumerate(hidden_states):
-        # Calculate entropy for each layer's activations
-        layer_entropy = calculate_entropy(torch.softmax(hidden_state, dim=-1))
-        
-        # Squeeze (prune) layers based on entropy
-        if layer_entropy.mean() < entropy_threshold:
-            model.model.layers[i].forward = lambda x: x  # Skip this layer
-    
-    # Return the final model outputs after potential layer squeezing
-    return model(inputs["input_ids"])
-
-
-# ResponseQualityManager with entropy-based evaluation
+# ResponseQualityManager implementation for response evaluation
 class ResponseQualityManager:
     def __init__(self, kan_model, tokenizer):
         self.kan_model = kan_model
         self.tokenizer = tokenizer
         self.tfidf_vectorizer = TfidfVectorizer()
 
-    def evaluate_response(self, user_input, response, entropy):
+    def evaluate_response(self, user_input, response):
         relevance_score = self.calculate_relevance(user_input, response)
         structure_valid = self.has_proper_structure(response)
         is_garbled = self.detect_garbled_output(response)
-        
-        # Use entropy to refine response evaluation
-        if entropy.mean() > 0.7:
-            logging.info("High entropy detected, refining response.")
-            response = self.refine_response(response)
-        
         return relevance_score > 0.3 and structure_valid and not is_garbled
 
     def calculate_relevance(self, user_input, response):
@@ -152,51 +119,78 @@ class ResponseQualityManager:
         sentences = re.split(r'(?<=[.!?])\s+', response.strip())
         return len(sentences) > 0 and sentences[0][0].isupper() and sentences[-1][-1] in '.!?'
 
-    def refine_response(self, response):
-        # Implement response refinement logic (could include rerunning the model)
-        return response  # Placeholder
+# Helper function to calculate entropy
+def calculate_entropy(probs):
+    log_probs = torch.log(probs + 1e-10)  # Add small epsilon to avoid log(0)
+    entropy = -torch.sum(probs * log_probs, dim=-1)
+    return entropy
 
-# Response generation with entropy-driven refinement
-def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512, entropy_threshold=0.7):
+# Updated generation logic to handle context better, avoid repetitive responses, and include entropy-based refinement
+def generate_response(input_text, model, tokenizer, max_new_tokens=50, pad_token_id=128001, history=[], context_limit=512, entropy_threshold=0.7):
     # Clean the history to avoid redundant prompts
-    history = [line for line in history if line.strip()]
+    history = [line for line in history if line.strip()]  # Remove empty lines
     
     # Create a simplified context prompt from the last few exchanges
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
     
     # Prepare inputs for the model
     inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to("cuda")
-    
-    # Adaptive layer squeezing
-    model_output = adaptive_layer_squeeze(model, inputs)
-    
-    # Calculate entropy for the output logits
-    probs = torch.softmax(model_output.logits, dim=-1)
-    entropy = calculate_entropy(probs)
 
-    # Get the most likely tokens and decode them
-    token_ids = model_output.logits.argmax(dim=-1).tolist()
-    response = tokenizer.decode(token_ids[0], skip_special_tokens=True).strip()  # Use the first sequence
+    # Initialize response and keep track of tokens for refinement
+    refined_response = ""
+    refined_token_ids = []
+    full_response = ""
 
-    # Evaluate and refine response based on entropy
-    response_quality_manager = ResponseQualityManager(model, tokenizer)
-    refined_response = response_quality_manager.evaluate_response(input_text, response, entropy)
+    # Iteratively generate responses
+    for iteration in range(10):  # Number of iterations can be adjusted as needed
+        logging.info(f"Iteration {iteration + 1}: Generating tokens...")
 
-    # Append the refined response to history
-    history.append(f"User: {input_text}\nModel: {refined_response}")
+        # Generate a chunk of response
+        with torch.no_grad():
+            outputs = model.generate(
+                inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=max_new_tokens,  # Control new tokens per iteration
+                do_sample=True,
+                temperature=0.7,
+                top_k=50,
+                top_p=0.9,
+                repetition_penalty=1.2,
+                pad_token_id=pad_token_id,
+                early_stopping=True
+            )
+
+        # Decode and refine based on entropy
+        token_ids = outputs[0].tolist()
+        refined_token_ids.extend(token_ids)
+
+        # Convert logits to probabilities and calculate entropy
+        logits = outputs.logits
+        probs = torch.softmax(logits, dim=-1)
+        entropies = calculate_entropy(probs)
+
+        # If entropy is manageable, continue refining; otherwise, break
+        if entropies.mean() < entropy_threshold:
+            refined_response = tokenizer.decode(refined_token_ids, skip_special_tokens=True).strip()
+            full_response = f"{full_response} {refined_response}".strip()
+        else:
+            logging.warning("High entropy detected, refining response before continuing.")
+            break
+
+    # Append final cleaned response to history
+    history.append(f"User: {input_text}\nModel: {full_response}")
     
-    # Trim history to prevent excessive accumulation
+    # Trim history to avoid excessive accumulation
     if len(history) > 6:
         history = history[-6:]
 
-    return refined_response, history
+    return full_response, history
 
-
-# User input loop with refined response generation
+# Updated user input loop to handle context better
 def user_input_loop(model, tokenizer):
     print("\n--- LLaMA Instruct Model Interactive Query ---")
     print("Type 'exit' to quit.")
-    history = []
+    history = []  # Initialize a history buffer to keep track of conversation
     while True:
         user_input = input("\nEnter your query: ")
         if user_input.lower() == 'exit':
@@ -205,6 +199,6 @@ def user_input_loop(model, tokenizer):
         response, history = generate_response(user_input, model, tokenizer, history=history)
         print(f"Model Response: {response}")
 
-# Start the interactive query loop
+# Start the interactive query loop with the refined response generation
 logging.info("Model loaded successfully. You can now query the model.")
 user_input_loop(model, tokenizer)
