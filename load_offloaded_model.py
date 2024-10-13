@@ -89,17 +89,24 @@ tokenizer = load_tokenizer(SOURCE_DIR)
 
 # Adaptive layer squeezing based on entropy
 def adaptive_layer_squeeze(model, inputs, entropy_threshold=0.5):
-    hidden_states, _ = model(inputs["input_ids"], output_hidden_states=True).hidden_states
+    # Run the model and get the full output, which includes logits, hidden states, and attentions
+    outputs = model(inputs["input_ids"], output_hidden_states=True)
     
+    # Access hidden states directly from the outputs
+    hidden_states = outputs.hidden_states  # This contains a list of hidden states from each layer
+    
+    # Process each hidden state for entropy-based layer squeezing
     for i, hidden_state in enumerate(hidden_states):
-        # Calculate entropy for each layer
+        # Calculate entropy for each layer's activations
         layer_entropy = calculate_entropy(torch.softmax(hidden_state, dim=-1))
         
         # Squeeze (prune) layers based on entropy
         if layer_entropy.mean() < entropy_threshold:
             model.model.layers[i].forward = lambda x: x  # Skip this layer
     
+    # Return the final model outputs after potential layer squeezing
     return model(inputs["input_ids"])
+
 
 # ResponseQualityManager with entropy-based evaluation
 class ResponseQualityManager:
