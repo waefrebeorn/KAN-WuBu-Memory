@@ -80,7 +80,14 @@ class OptimizedStackedLlamaModule(nn.Module):
 
         x = input_ids
         for _ in range(self.num_layers):
-            x = checkpoint(forward_pass, x)
+            # Ensure x is LongTensor before passing to the model
+            if not torch.is_tensor(x):
+                raise ValueError("Input to shared_model must be a tensor.")
+            if x.dtype != torch.long:
+                logging.warning(f"Converting input tensor from {x.dtype} to torch.long")
+                x = x.long()
+            # Use use_reentrant=False to handle future PyTorch changes
+            x = checkpoint(forward_pass, x, use_reentrant=False)
         return x
 
 # Optimized Stacked LLaMA Network with shared components and LoRA
@@ -130,7 +137,7 @@ def load_offloaded_weights(model, weights_dir):
             }
             expected_dtype = dtype_map.get(param.dtype, np.float32)
             logging.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
-            
+
             # Load tensor directly to GPU and copy it to the model's parameters
             loaded_tensor = load_dat_file(file_path, expected_dtype).view_as(param)
             if param.dtype == torch.bfloat16:
@@ -182,13 +189,14 @@ class ResponseQualityManager:
 def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
     history = [line for line in history if line.strip()]  # Clean the history
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
-    
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to("cuda")
+
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to(device)
 
     # Ensure that input IDs (token indices) are in long format
     inputs["input_ids"] = inputs["input_ids"].long()
 
     with torch.no_grad():
+        # Call the model with the proper input format
         outputs = model(inputs["input_ids"], attention_mask=inputs["attention_mask"])
         output_ids = torch.argmax(outputs, dim=-1)
 
@@ -221,23 +229,27 @@ def user_input_loop(model, tokenizer):
 
 # Main execution flow
 if __name__ == "__main__":
-    # Initialize the optimized model
-    logging.info("Initializing the optimized Stacked LLaMA Network.")
-    model = OptimizedStackedLlamaNetwork(config, num_stacks=3).to(device)
+    try:
+        # Initialize the optimized model
+        logging.info("Initializing the optimized Stacked LLaMA Network.")
+        model = OptimizedStackedLlamaNetwork(config, num_stacks=3).to(device)
 
-    # Load weights and move to GPU
-    logging.info("Loading offloaded weights into the model.")
-    load_offloaded_weights(model, WEIGHTS_DIR)
-    model.to(device)
-    model.eval()
+        # Load weights and move to GPU
+        logging.info("Loading offloaded weights into the model.")
+        load_offloaded_weights(model, WEIGHTS_DIR)
+        model.to(device)
+        model.eval()
 
-    # Load tokenizer
-    logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
-    tokenizer = load_tokenizer(SOURCE_DIR)
+        # Load tokenizer
+        logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
+        tokenizer = load_tokenizer(SOURCE_DIR)
 
-    # Initialize ResponseQualityManager
-    quality_manager = ResponseQualityManager(model, tokenizer)
+        # Initialize ResponseQualityManager
+        quality_manager = ResponseQualityManager(model, tokenizer)
 
-    # Start the interactive query loop
-    logging.info("Optimized model loaded successfully. You can now query the model.")
-    user_input_loop(model, tokenizer)
+        # Start the interactive query loop
+        logging.info("Optimized model loaded successfully. You can now query the model.")
+        user_input_loop(model, tokenizer)
+    except Exception as main_e:
+        logging.error(f"Failed to initialize the model: {main_e}")
+        raise main_e
