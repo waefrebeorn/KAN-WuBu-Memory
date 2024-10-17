@@ -47,23 +47,29 @@ def load_model_config(config_path):
 def load_tokenizer(source_dir):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
 
-    # Directly set pad_token_id to 128001 without adding a new pad token
-    pad_token_id = 128001
+    # Use the existing pad token from the tokenizer configuration
+    predefined_pad_token_id = 128256
+
+    if tokenizer.pad_token_id is None:
+        # If pad_token_id is not set, set it to the predefined ID
+        tokenizer.pad_token_id = predefined_pad_token_id
+        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(predefined_pad_token_id)
+        logging.info(f"Set pad_token_id to predefined ID {predefined_pad_token_id}.")
+    else:
+        logging.info(f"Tokenizer already has a pad token with ID {tokenizer.pad_token_id}.")
 
     # Verify that pad_token_id exists within the tokenizer's vocabulary
-    if pad_token_id >= len(tokenizer):
-        raise ValueError(f"pad_token_id {pad_token_id} is out of bounds for the tokenizer's vocabulary size {len(tokenizer)}.")
+    if tokenizer.pad_token_id >= len(tokenizer):
+        raise ValueError(f"pad_token_id {tokenizer.pad_token_id} is out of bounds for the tokenizer's vocabulary size {len(tokenizer)}.")
 
-    # Set the pad_token to the corresponding token if it exists
-    pad_token = tokenizer.convert_ids_to_tokens(pad_token_id)
+    pad_token = tokenizer.convert_ids_to_tokens(tokenizer.pad_token_id)
     if pad_token is None:
-        raise ValueError(f"pad_token_id {pad_token_id} does not correspond to any token in the tokenizer.")
+        raise ValueError(f"pad_token_id {tokenizer.pad_token_id} does not correspond to any token in the tokenizer.")
 
     tokenizer.pad_token = pad_token
-    tokenizer.pad_token_id = pad_token_id
+    tokenizer.pad_token_id = tokenizer.pad_token_id
 
     return tokenizer
-
 
 # Load the tokenizer
 logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
@@ -112,9 +118,12 @@ class OptimizedStackedLlamaModule(nn.Module):
         self.shared_model = LlamaForCausalLM(config).to(device)
         self.num_layers = num_layers
 
+    def forward_pass(self, input_ids, attention_mask):
+        return self.shared_model(input_ids=input_ids, attention_mask=attention_mask).logits
+
     def forward(self, input_ids, attention_mask=None):
-        def forward_pass(x):
-            return self.shared_model(input_ids=x, attention_mask=attention_mask).logits
+        def forward_pass_fn(x):
+            return self.forward_pass(x, attention_mask)
 
         x = input_ids
         for _ in range(self.num_layers):
@@ -125,7 +134,7 @@ class OptimizedStackedLlamaModule(nn.Module):
                 logging.warning(f"Converting input tensor from {x.dtype} to torch.long")
                 x = x.long()
             # Use use_reentrant=False to handle future PyTorch changes
-            x = checkpoint(forward_pass, x, use_reentrant=False)
+            x = checkpoint(forward_pass_fn, x, use_reentrant=False)
         return x
 
 # Optimized Stacked LLaMA Network with shared components and LoRA
