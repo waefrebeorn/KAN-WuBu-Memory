@@ -20,7 +20,7 @@ WEIGHTS_DIR = os.path.join(SOURCE_DIR, "offload")
 MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")
 
 # Initialize logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
 
 # Check CUDA availability
 if not torch.cuda.is_available():
@@ -40,6 +40,7 @@ def load_tokenizer(source_dir):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
     # Manually add padding token if not present
     if tokenizer.pad_token is None:
+        logging.info("Pad token not found in tokenizer. Adding <PAD> token.")
         tokenizer.add_special_tokens({'pad_token': '<PAD>'})
     # Set pad_token_id as per config.json (128001)
     tokenizer.pad_token_id = 128001
@@ -48,6 +49,18 @@ def load_tokenizer(source_dir):
 # Load the model configuration
 logging.info(f"Loading model configuration from: {MODEL_JSON_PATH}")
 config = load_configuration(MODEL_JSON_PATH)
+
+# Load the tokenizer
+logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
+tokenizer = load_tokenizer(SOURCE_DIR)
+
+# Log tokenizer details
+logging.info(f"Tokenizer length (len(tokenizer)): {len(tokenizer)}")
+logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
+
+# Ensure that the tokenizer's vocab_size matches the model's config.vocab_size
+if len(tokenizer) != config.vocab_size:
+    raise ValueError(f"Tokenizer vocabulary size ({len(tokenizer)}) does not match the model's config vocab_size ({config.vocab_size}). Please ensure they are aligned.")
 
 # SharedLayer class remains unchanged
 class SharedLayer(nn.Module):
@@ -211,8 +224,8 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, history=
         input_ids = input_ids.long()
 
     # Check input_ids are within vocab_size
-    if (input_ids >= tokenizer.vocab_size).any():
-        invalid_ids = input_ids[input_ids >= tokenizer.vocab_size]
+    if (input_ids >= config.vocab_size).any():
+        invalid_ids = input_ids[input_ids >= config.vocab_size]
         raise ValueError(f"Out-of-bounds input_ids found: {invalid_ids}")
 
     with torch.no_grad():
@@ -263,6 +276,14 @@ if __name__ == "__main__":
         # Load tokenizer
         logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
         tokenizer = load_tokenizer(SOURCE_DIR)
+
+        # Log tokenizer details
+        logging.info(f"Tokenizer length (len(tokenizer)): {len(tokenizer)}")
+        logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
+
+        # Ensure that the tokenizer's vocab_size matches the model's config.vocab_size
+        if len(tokenizer) != config.vocab_size:
+            raise ValueError(f"Tokenizer vocabulary size ({len(tokenizer)}) does not match the model's config vocab_size ({config.vocab_size}). Please ensure they are aligned.")
 
         # Resize token embeddings in case new tokens were added
         model.shared_model.shared_model.resize_token_embeddings(len(tokenizer))
