@@ -36,6 +36,11 @@ def load_configuration(model_json_path):
     return config
 
 # Use AutoTokenizer instead of LlamaTokenizer to resolve class conflicts
+def load_model_config(config_path):
+    with open(config_path, "r") as f:
+        return json.load(f)
+
+# Load tokenizer with proper handling of the pad token
 def load_tokenizer(source_dir):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
 
