@@ -42,22 +42,18 @@ config = load_configuration(MODEL_JSON_PATH)
 def load_tokenizer(source_dir):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
 
-    # Use the predefined pad token ID
-    predefined_pad_token_id = 128256
+    # Use the predefined finetune padding token ID
+    predefined_pad_token_id = 128004  # <|finetune_right_pad_id|>
 
     if tokenizer.pad_token_id is None:
-        # If pad_token_id is not set, set it to the predefined ID
+        # Set the pad_token_id to the predefined padding token
         tokenizer.pad_token_id = predefined_pad_token_id
         tokenizer.pad_token = tokenizer.convert_ids_to_tokens(predefined_pad_token_id)
-        logging.info(f"Set pad_token_id to predefined ID {predefined_pad_token_id}.")
+        logging.info(f"Set pad_token_id to predefined finetune padding ID {predefined_pad_token_id}.")
     else:
         logging.info(f"Tokenizer already has a pad token with ID {tokenizer.pad_token_id}.")
 
-    # Verify that pad_token_id is not None before comparison
-    if tokenizer.pad_token_id is None:
-        raise ValueError("pad_token_id is not set or initialized correctly.")
-
-    # Verify that pad_token_id exists within the tokenizer's vocabulary
+    # Ensure that the pad_token_id is valid
     if tokenizer.pad_token_id >= tokenizer.vocab_size:
         raise ValueError(f"pad_token_id {tokenizer.pad_token_id} is out of bounds for the tokenizer's vocabulary size {tokenizer.vocab_size}.")
 
@@ -69,6 +65,7 @@ def load_tokenizer(source_dir):
     tokenizer.pad_token_id = tokenizer.pad_token_id
 
     return tokenizer
+
 
 # Load the tokenizer
 logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
