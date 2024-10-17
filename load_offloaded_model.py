@@ -178,20 +178,19 @@ class ResponseQualityManager:
         sentences = re.split(r'(?<=[.!?])\s+', response.strip())
         return len(sentences) > 0 and sentences[0][0].isupper() and sentences[-1][-1] in '.!?'
 
-# Function to generate responses with mixed precision and optimized memory usage
+# Function to generate responses with optimized memory usage
 def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
     history = [line for line in history if line.strip()]  # Clean the history
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
     
     inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to("cuda")
 
-    # Ensure that input IDs (token indices) are in long format before autocasting
+    # Ensure that input IDs (token indices) are in long format
     inputs["input_ids"] = inputs["input_ids"].long()
 
     with torch.no_grad():
-        with torch.amp.autocast("cuda"):  # Use the new `torch.amp.autocast` for mixed precision
-            outputs = model(inputs["input_ids"], attention_mask=inputs["attention_mask"])
-            output_ids = torch.argmax(outputs, dim=-1)
+        outputs = model(inputs["input_ids"], attention_mask=inputs["attention_mask"])
+        output_ids = torch.argmax(outputs, dim=-1)
 
     response = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
     cleaned_response = re.sub(r'\s+', ' ', response.split("User:")[-1].strip())
