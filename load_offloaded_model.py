@@ -56,54 +56,30 @@ def update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size):
 def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
     update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size)
 
-# Load tokenizer with proper handling of the pad token and ensuring vocab_size matches
-def load_tokenizer(source_dir, config):
-    # Ensure the tokenizer is loaded with the correct configuration and added tokens
-    tokenizer = AutoTokenizer.from_pretrained(
-        source_dir, 
-        config=config  # Ensure the tokenizer is aware of the model configuration
-    )
-    logging.info("Tokenizer loaded successfully.")
-    
-    # Verify if tokenizer's vocab_size matches model config
-    if tokenizer.vocab_size != config.vocab_size:
-        logging.error(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({config.vocab_size}).")
+
+def load_tokenizer_with_model_config(source_dir, config_path):
+    # Load the correct model configuration
+    with open(config_path, "r") as f:
+        model_config = json.load(f)
+
+    # Initialize tokenizer from the model config (ignoring tokenizer_config.json)
+    tokenizer = AutoTokenizer.from_pretrained(source_dir, config=model_config)
+    logging.info("Tokenizer loaded successfully using the model's config.json.")
+
+    # Check if vocab size matches the model config
+    if tokenizer.vocab_size != model_config['vocab_size']:
+        logging.error(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({model_config['vocab_size']}).")
         raise ValueError("Tokenizer vocab_size does not match model config vocab_size.")
     
-    # Ensure special tokens are correctly set
-    predefined_pad_token = "<|finetune_right_pad_id|>"
-    predefined_pad_token_id = 128004  # As per your tokenizer configuration
+    # Log the correct vocab size
+    logging.info(f"Tokenizer vocab_size is correctly set to: {tokenizer.vocab_size}")
 
-    if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({'pad_token': predefined_pad_token})
-        logging.info(f"Added pad_token: {predefined_pad_token}")
-    else:
-        logging.info(f"Tokenizer already has a pad token: {tokenizer.pad_token}")
+    # Ensure special tokens are correctly set based on the model config
+    tokenizer.bos_token_id = model_config["bos_token_id"]
+    tokenizer.eos_token_ids = model_config["eos_token_id"]
+    logging.info(f"BOS token ID set to: {tokenizer.bos_token_id}")
+    logging.info(f"EOS token IDs set to: {tokenizer.eos_token_ids}")
 
-    # Ensure pad_token_id is within vocab_size
-    if tokenizer.pad_token_id >= config.vocab_size:
-        logging.error(f"pad_token_id ({tokenizer.pad_token_id}) exceeds vocab_size ({config.vocab_size}).")
-        raise ValueError("pad_token_id exceeds vocab_size.")
-    else:
-        logging.info(f"pad_token_id ({tokenizer.pad_token_id}) is within vocab_size.")
-
-    # Ensure eos_token_id(s) are within vocab_size
-    predefined_eos_token_ids = [128001, 128008, 128009]  # As per your tokenizer configuration
-    for eos_id in predefined_eos_token_ids:
-        if eos_id >= config.vocab_size:
-            logging.error(f"eos_token_id ({eos_id}) exceeds vocab_size ({config.vocab_size}).")
-            raise ValueError("eos_token_id exceeds vocab_size.")
-        eos_token = tokenizer.convert_ids_to_tokens(eos_id)
-        if eos_token is None:
-            logging.error(f"eos_token_id ({eos_id}) does not correspond to any token in the tokenizer.")
-            raise ValueError(f"eos_token_id {eos_id} is invalid.")
-        logging.info(f"eos_token_id ({eos_id}) corresponds to token: {eos_token}")
-    
-    # Set tokenizer's eos_token_id to the first predefined EOS token
-    tokenizer.eos_token_id = predefined_eos_token_ids[0]
-    tokenizer.add_special_tokens({'eos_token': tokenizer.convert_ids_to_tokens(predefined_eos_token_ids[0])})
-    logging.info(f"Set eos_token_id to {tokenizer.eos_token_id} ({tokenizer.eos_token})")
-    
     return tokenizer
 
 # SharedLayer class remains unchanged
@@ -326,7 +302,7 @@ if __name__ == "__main__":
 
         # Load tokenizer
         logging.info("Loading tokenizer...")
-        tokenizer = load_tokenizer(SOURCE_DIR, config)
+        tokenizer = load_tokenizer_with_model_config(source_dir, config_path)
 
         # Initialize the optimized model
         logging.info("Initializing the optimized Stacked LLaMA Network.")
