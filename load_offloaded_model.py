@@ -16,6 +16,7 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 SOURCE_DIR = "models/Llama_32_1B/"
 WEIGHTS_DIR = os.path.join(SOURCE_DIR, "offload")
 MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")
+TOKENIZER_CONFIG_PATH = os.path.join(SOURCE_DIR, "tokenizer_config.json")  # Adjust if different
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
@@ -26,28 +27,44 @@ if not torch.cuda.is_available():
 
 device = torch.device('cuda')
 
-# Load the configuration from the JSON file
+# Load the model configuration from the JSON file
 def load_configuration(model_json_path):
     with open(model_json_path, "r") as f:
         config_data = json.load(f)
     config = LlamaConfig(**config_data)
     return config
 
-# Load configuration before the tokenizer
-config = load_configuration(MODEL_JSON_PATH)
+# Function to update tokenizer's vocab_size in config.json
+def update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size):
+    with open(tokenizer_config_path, "r") as f:
+        tokenizer_config = json.load(f)
+    
+    if tokenizer_config.get("vocab_size", None) != correct_vocab_size:
+        logging.info(f"Updating tokenizer vocab_size from {tokenizer_config.get('vocab_size')} to {correct_vocab_size}")
+        tokenizer_config["vocab_size"] = correct_vocab_size
+        with open(tokenizer_config_path, "w") as f:
+            json.dump(tokenizer_config, f, indent=2)
+        logging.info("Tokenizer config.json updated successfully.")
+    else:
+        logging.info(f"Tokenizer vocab_size is already set to {correct_vocab_size}.")
 
-# Load tokenizer with manual vocab size override and proper handling of special tokens
+# Load and possibly update tokenizer configuration
+def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
+    update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size)
+
+# Load tokenizer with proper handling of the pad token and ensuring vocab_size matches
 def load_tokenizer(source_dir, config):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
 
-    # Manually set the correct vocab size to match the model
-    correct_vocab_size = config.vocab_size
-    tokenizer.vocab_size = correct_vocab_size
-    logging.info(f"Manually set tokenizer vocab_size to: {tokenizer.vocab_size}")
+    # Verify that tokenizer's vocab_size matches the model's vocab_size
+    if tokenizer.vocab_size != config.vocab_size:
+        raise ValueError(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({config.vocab_size}). Please update the tokenizer's config.json.")
+    else:
+        logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size} matches model vocab_size: {config.vocab_size}")
 
     # Ensure pad_token_id is correct
     predefined_pad_token_id = 128004  # <|finetune_right_pad_id|>
-    if tokenizer.pad_token_id is None or tokenizer.pad_token_id >= correct_vocab_size:
+    if tokenizer.pad_token_id is None or tokenizer.pad_token_id >= config.vocab_size:
         tokenizer.pad_token_id = predefined_pad_token_id
         tokenizer.pad_token = tokenizer.convert_ids_to_tokens(predefined_pad_token_id)
         logging.info(f"Set pad_token_id to predefined padding ID {predefined_pad_token_id}.")
@@ -64,32 +81,18 @@ def load_tokenizer(source_dir, config):
     # Ensure eos_token_id is within vocab_size
     predefined_eos_token_ids = [128001, 128008, 128009]  # From config.json
     for eos_id in predefined_eos_token_ids:
-        if eos_id >= correct_vocab_size:
-            raise ValueError(f"eos_token_id {eos_id} exceeds vocab_size {correct_vocab_size}")
+        if eos_id >= config.vocab_size:
+            raise ValueError(f"eos_token_id {eos_id} exceeds vocab_size {config.vocab_size}")
         eos_token = tokenizer.convert_ids_to_tokens(eos_id)
         if eos_token is None:
             raise ValueError(f"eos_token_id {eos_id} does not correspond to any token in the tokenizer.")
 
-    # Update tokenizer's eos_token_ids
+    # Update tokenizer's eos_token_id
     tokenizer.eos_token_id = predefined_eos_token_ids
     tokenizer.add_special_tokens({'eos_token': tokenizer.convert_ids_to_tokens(predefined_eos_token_ids[0])})  # Ensure at least one EOS token is recognized
     logging.info(f"Set eos_token_id to predefined EOS token IDs {predefined_eos_token_ids}.")
 
-    # Verify vocab_size matches
-    if tokenizer.vocab_size != config.vocab_size:
-        raise ValueError(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({config.vocab_size}). Please update the tokenizer's config.json.")
-    else:
-        logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size} matches model vocab_size: {config.vocab_size}")
-
     return tokenizer
-
-# Load the tokenizer with manual vocab override
-logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
-tokenizer = load_tokenizer(SOURCE_DIR, config)
-
-# Log tokenizer details
-logging.info(f"Tokenizer length (len(tokenizer)): {len(tokenizer)}")
-logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
 
 # SharedLayer class remains unchanged
 class SharedLayer(nn.Module):
@@ -292,6 +295,10 @@ def user_input_loop(model, tokenizer):
 # Main execution flow
 if __name__ == "__main__":
     try:
+        # Load and prepare tokenizer configuration
+        config = load_configuration(MODEL_JSON_PATH)
+        prepare_tokenizer_config(TOKENIZER_CONFIG_PATH, config.vocab_size)
+
         # Initialize the optimized model
         logging.info("Initializing the optimized Stacked LLaMA Network.")
         model = OptimizedStackedLlamaNetwork(config, num_stacks=3).to(device)
