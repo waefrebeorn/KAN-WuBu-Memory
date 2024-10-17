@@ -31,8 +31,8 @@ if not torch.cuda.is_available():
 device = torch.device('cuda')
 
 # Load the model configuration from the JSON file
-def load_configuration(model_json_path):
-    with open(model_json_path, "r") as f:
+def load_configuration(MODEL_JSON_PATH):
+    with open(MODEL_JSON_PATH, "r") as f:
         config_data = json.load(f)
     config = LlamaConfig(**config_data)
     logging.info("Model configuration loaded successfully.")
@@ -57,18 +57,19 @@ def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
     update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size)
 
 
-def load_tokenizer_with_model_config(source_dir, config_path):
+def load_tokenizer_with_model_config(MODEL_JSON_PATH):
     # Load the correct model configuration
-    with open(config_path, "r") as f:
+    with open(MODEL_JSON_PATH, "r") as f:
         model_config = json.load(f)
 
-    # Initialize tokenizer from the model config (ignoring tokenizer_config.json)
-    tokenizer = AutoTokenizer.from_pretrained(source_dir)
+    # Initialize tokenizer by loading the config directly from MODEL_JSON_PATH
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_JSON_PATH)
     logging.info("Tokenizer loaded successfully using the model's config.json.")
 
-    # Force-set the correct vocab_size from model_config
-    tokenizer.vocab_size = model_config['vocab_size']
-    logging.info(f"Tokenizer vocab_size set to: {tokenizer.vocab_size}")
+    # Check if vocab size matches the model config (since we can't set vocab_size directly)
+    if tokenizer.vocab_size != model_config['vocab_size']:
+        logging.error(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({model_config['vocab_size']}).")
+        raise ValueError("Tokenizer vocab_size does not match model config vocab_size.")
 
     # Ensure special tokens are correctly set based on the model config
     tokenizer.bos_token_id = model_config["bos_token_id"]
@@ -77,6 +78,7 @@ def load_tokenizer_with_model_config(source_dir, config_path):
     logging.info(f"EOS token IDs set to: {tokenizer.eos_token_ids}")
 
     return tokenizer
+
 
 
 # SharedLayer class remains unchanged
