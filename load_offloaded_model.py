@@ -33,20 +33,7 @@ def load_tokenizer(source_dir):
 logging.info(f"Loading model configuration from: {MODEL_JSON_PATH}")
 config = load_configuration(MODEL_JSON_PATH)
 
-# Custom module for multiple stacked LLaMA layers (equivalent to 6x Mamba2 in NVIDIA presentation)
-class StackedLlamaModule(nn.Module):
-    def __init__(self, config, num_layers=6):
-        super(StackedLlamaModule, self).__init__()
-        self.layers = nn.ModuleList([LlamaForCausalLM(config) for _ in range(num_layers)])  # Mimicking 6x Mamba2
-
-    def forward(self, input_ids, attention_mask=None):
-        x = input_ids
-        for layer in self.layers:
-            outputs = layer(input_ids=x, attention_mask=attention_mask)
-            x = outputs.logits
-        return x
-
-# Define shared components (e.g., Shared1 and Shared2) used in the modular structure
+# SharedLayer class remains unchanged
 class SharedLayer(nn.Module):
     def __init__(self, hidden_size):
         super(SharedLayer, self).__init__()
@@ -62,7 +49,7 @@ class SharedLayer(nn.Module):
         x, _ = self.attention(x, x, x)
         return x
 
-# Define Low-Rank Adaptation (LoRA) for efficient fine-tuning
+# LoRA class remains unchanged
 class LoRA(nn.Module):
     def __init__(self, hidden_size, rank=8):
         super(LoRA, self).__init__()
@@ -73,40 +60,40 @@ class LoRA(nn.Module):
     def forward(self, x):
         return x + self.lora_B(self.lora_A(x))
 
-# Complete Stacked LLaMA model with shared components, stacking, and LoRA
-class StackedLlamaNetwork(nn.Module):
-    def __init__(self, config, shared1, shared2, num_stacks=3):
-        super(StackedLlamaNetwork, self).__init__()
-        self.blocks = nn.ModuleList()
-        
-        for i in range(num_stacks):
-            specialization = "early" if i == 0 else "mid" if i == 1 else "late"
-            self.blocks.append(
-                nn.ModuleDict({
-                    "transformer_block": StackedLlamaModule(config),  # Equivalent to 6x Mamba2
-                    "linear": nn.Linear(config.hidden_size, config.hidden_size),
-                    "shared": shared1 if i % 2 == 0 else shared2,  # Alternating shared layers
-                    "lora_adapter": LoRA(config.hidden_size)  # Optional LoRA for fine-tuning
-                })
-            )
+# Optimized module for multiple stacked LLaMA layers using shared weights
+class OptimizedStackedLlamaModule(nn.Module):
+    def __init__(self, config, num_layers=6):
+        super(OptimizedStackedLlamaModule, self).__init__()
+        self.shared_model = LlamaForCausalLM(config)
+        self.num_layers = num_layers
 
     def forward(self, input_ids, attention_mask=None):
         x = input_ids
-        intermediate_outputs = []
-
-        for block in self.blocks:
-            x = block["transformer_block"](x, attention_mask)
-            x = block["linear"](x)
-            x = block["shared"](x)
-            x = block["lora_adapter"](x)
-            intermediate_outputs.append(x)
-
-        # Concatenation of intermediate outputs (mimicking 'cat' operation in the image)
-        x = torch.cat(intermediate_outputs, dim=-1)
-        
+        for _ in range(self.num_layers):
+            outputs = self.shared_model(input_ids=x, attention_mask=attention_mask)
+            x = outputs.logits
         return x
 
-# Load the offloaded weights from the `.dat` files
+# Optimized Stacked LLaMA Network with shared components and LoRA
+class OptimizedStackedLlamaNetwork(nn.Module):
+    def __init__(self, config, num_stacks=3):
+        super(OptimizedStackedLlamaNetwork, self).__init__()
+        self.shared_model = OptimizedStackedLlamaModule(config)
+        self.num_stacks = num_stacks
+        self.linears = nn.ModuleList([nn.Linear(config.hidden_size, config.hidden_size) for _ in range(num_stacks)])
+        self.shared_layer = SharedLayer(config.hidden_size)
+        self.lora_adapters = nn.ModuleList([LoRA(config.hidden_size) for _ in range(num_stacks)])
+
+    def forward(self, input_ids, attention_mask=None):
+        x = input_ids
+        for i in range(self.num_stacks):
+            x = self.shared_model(x, attention_mask)
+            x = self.linears[i](x)
+            x = self.shared_layer(x)
+            x = self.lora_adapters[i](x)
+        return x
+
+# Function to load tensors from .dat files
 def load_dat_file(file_path, dtype):
     with open(file_path, 'rb') as f:
         tensor_data = np.fromfile(f, dtype=dtype)
@@ -117,48 +104,33 @@ def load_dat_file(file_path, dtype):
         loaded_tensor = loaded_tensor.to(torch.bfloat16)
     return loaded_tensor
 
-def load_offloaded_weights(stacked_model, weights_dir):
-    for i, llama_model in enumerate(stacked_model.blocks):
-        logging.info(f"Loading weights for LLaMA stack {i + 1}")
-        for name, param in llama_model["transformer_block"].layers.named_parameters():
-            file_name = name.replace('.', '_') + ".dat"
-            file_path = os.path.join(weights_dir, file_name)
+# Optimized weight loading function to load weights once for the shared model
+def load_offloaded_weights(model, weights_dir):
+    logging.info("Loading weights for the shared LLaMA model")
+    for name, param in model.shared_model.shared_model.named_parameters():
+        file_name = name.replace('.', '_') + ".dat"
+        file_path = os.path.join(weights_dir, file_name)
 
-            if os.path.exists(file_path):
-                dtype_map = {
-                    torch.float16: np.float16,
-                    torch.float32: np.float32,
-                    torch.int64: np.int64,
-                    torch.int32: np.int32,
-                    torch.bfloat16: np.float32,
-                }
-                expected_dtype = dtype_map.get(param.dtype, np.float32)
-                logging.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
-                loaded_tensor = load_dat_file(file_path, expected_dtype).view_as(param)
+        if os.path.exists(file_path):
+            dtype_map = {
+                torch.float16: np.float16,
+                torch.float32: np.float32,
+                torch.int64: np.int64,
+                torch.int32: np.int32,
+                torch.bfloat16: np.float32,
+            }
+            expected_dtype = dtype_map.get(param.dtype, np.float32)
+            logging.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
+            loaded_tensor = load_dat_file(file_path, expected_dtype).view_as(param)
 
-                if param.dtype == torch.bfloat16:
-                    loaded_tensor = loaded_tensor.to(torch.bfloat16)
+            if param.dtype == torch.bfloat16:
+                loaded_tensor = loaded_tensor.to(torch.bfloat16)
 
-                param.data.copy_(loaded_tensor.to("cuda"))
-            else:
-                logging.warning(f"Warning: {file_name} not found in offloaded directory.")
+            param.data.copy_(loaded_tensor.to("cuda"))
+        else:
+            logging.warning(f"Warning: {file_name} not found in offloaded directory.")
 
-# Load the weights into the model
-shared1 = SharedLayer(config.hidden_size)
-shared2 = SharedLayer(config.hidden_size)
-num_stacks = 3  # Number of stacked LLaMA instances
-model = StackedLlamaNetwork(config, shared1, shared2, num_stacks=num_stacks)
-load_offloaded_weights(model, WEIGHTS_DIR)
-
-# Move the model to GPU for inference
-model.to('cuda')
-model.eval()
-
-# Load the tokenizer for LLaMA
-logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
-tokenizer = load_tokenizer(SOURCE_DIR)
-
-# ResponseQualityManager class for evaluating and improving responses
+# ResponseQualityManager class remains unchanged
 class ResponseQualityManager:
     def __init__(self, kan_model, tokenizer):
         self.kan_model = kan_model
@@ -196,18 +168,16 @@ class ResponseQualityManager:
         sentences = re.split(r'(?<=[.!?])\s+', response.strip())
         return len(sentences) > 0 and sentences[0][0].isupper() and sentences[-1][-1] in '.!?'
 
-# Quality Manager instance for response evaluation
-quality_manager = ResponseQualityManager(model, tokenizer)
-
-# Updated generation logic to handle context better and avoid repetitive responses
+# Function to generate responses with mixed precision and optimized memory usage
 def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
     history = [line for line in history if line.strip()]  # Clean the history
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
     inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to("cuda")
     
-    with torch.no_grad():
-        outputs = model(inputs["input_ids"], attention_mask=inputs["attention_mask"])
-        output_ids = torch.argmax(outputs, dim=-1)
+    with torch.cuda.amp.autocast():  # Enable mixed precision
+        with torch.no_grad():
+            outputs = model(inputs["input_ids"], attention_mask=inputs["attention_mask"])
+            output_ids = torch.argmax(outputs, dim=-1)
 
     response = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
     cleaned_response = re.sub(r'\s+', ' ', response.split("User:")[-1].strip())
@@ -231,6 +201,25 @@ def user_input_loop(model, tokenizer):
         response, history = generate_response(user_input, model, tokenizer, history=history)
         print(f"Model Response: {response}")
 
-# Start the interactive query loop
-logging.info("Model loaded successfully. You can now query the model.")
-user_input_loop(model, tokenizer)
+# Main execution flow
+if __name__ == "__main__":
+    # Initialize the optimized model
+    logging.info("Initializing the optimized Stacked LLaMA Network.")
+    model = OptimizedStackedLlamaNetwork(config, num_stacks=3)
+
+    # Load weights and move to GPU
+    logging.info("Loading offloaded weights into the model.")
+    load_offloaded_weights(model, WEIGHTS_DIR)
+    model.to('cuda')
+    model.eval()
+
+    # Load tokenizer
+    logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
+    tokenizer = load_tokenizer(SOURCE_DIR)
+
+    # Initialize ResponseQualityManager
+    quality_manager = ResponseQualityManager(model, tokenizer)
+
+    # Start the interactive query loop
+    logging.info("Optimized model loaded successfully. You can now query the model.")
+    user_input_loop(model, tokenizer)
