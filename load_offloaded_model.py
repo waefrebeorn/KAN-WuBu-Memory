@@ -1,7 +1,6 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import json
 import numpy as np
 import re
@@ -9,7 +8,6 @@ import logging
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
-from torch.utils.checkpoint import checkpoint
 
 # Enable CUDA launch blocking for accurate error reporting
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -38,18 +36,21 @@ def load_configuration(model_json_path):
 # Load configuration before the tokenizer
 config = load_configuration(MODEL_JSON_PATH)
 
-# Load tokenizer with proper handling of the pad token
-def load_tokenizer(source_dir):
+# Load tokenizer with manual vocab size override and proper handling of special tokens
+def load_tokenizer(source_dir, config):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
 
-    # Use the predefined finetune padding token ID
-    predefined_pad_token_id = 128004  # <|finetune_right_pad_id|>
+    # Manually set the correct vocab size to match the model
+    correct_vocab_size = config.vocab_size
+    tokenizer.vocab_size = correct_vocab_size
+    logging.info(f"Manually set tokenizer vocab_size to: {tokenizer.vocab_size}")
 
-    if tokenizer.pad_token_id is None:
-        # Set the pad_token_id to the predefined padding token
+    # Ensure pad_token_id is correct
+    predefined_pad_token_id = 128004  # <|finetune_right_pad_id|>
+    if tokenizer.pad_token_id is None or tokenizer.pad_token_id >= correct_vocab_size:
         tokenizer.pad_token_id = predefined_pad_token_id
         tokenizer.pad_token = tokenizer.convert_ids_to_tokens(predefined_pad_token_id)
-        logging.info(f"Set pad_token_id to predefined finetune padding ID {predefined_pad_token_id}.")
+        logging.info(f"Set pad_token_id to predefined padding ID {predefined_pad_token_id}.")
     else:
         logging.info(f"Tokenizer already has a pad token with ID {tokenizer.pad_token_id}.")
 
@@ -60,12 +61,31 @@ def load_tokenizer(source_dir):
     tokenizer.pad_token = pad_token
     tokenizer.pad_token_id = tokenizer.pad_token_id
 
+    # Ensure eos_token_id is within vocab_size
+    predefined_eos_token_ids = [128001, 128008, 128009]  # From config.json
+    for eos_id in predefined_eos_token_ids:
+        if eos_id >= correct_vocab_size:
+            raise ValueError(f"eos_token_id {eos_id} exceeds vocab_size {correct_vocab_size}")
+        eos_token = tokenizer.convert_ids_to_tokens(eos_id)
+        if eos_token is None:
+            raise ValueError(f"eos_token_id {eos_id} does not correspond to any token in the tokenizer.")
+
+    # Update tokenizer's eos_token_ids
+    tokenizer.eos_token_id = predefined_eos_token_ids
+    tokenizer.add_special_tokens({'eos_token': tokenizer.convert_ids_to_tokens(predefined_eos_token_ids[0])})  # Ensure at least one EOS token is recognized
+    logging.info(f"Set eos_token_id to predefined EOS token IDs {predefined_eos_token_ids}.")
+
+    # Verify vocab_size matches
+    if tokenizer.vocab_size != config.vocab_size:
+        raise ValueError(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({config.vocab_size}). Please update the tokenizer's config.json.")
+    else:
+        logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size} matches model vocab_size: {config.vocab_size}")
+
     return tokenizer
 
-
-# Load the tokenizer
+# Load the tokenizer with manual vocab override
 logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
-tokenizer = load_tokenizer(SOURCE_DIR)
+tokenizer = load_tokenizer(SOURCE_DIR, config)
 
 # Log tokenizer details
 logging.info(f"Tokenizer length (len(tokenizer)): {len(tokenizer)}")
@@ -109,19 +129,15 @@ class OptimizedStackedLlamaModule(nn.Module):
         return self.shared_model(input_ids=input_ids, attention_mask=attention_mask).logits
 
     def forward(self, input_ids, attention_mask=None):
-        def forward_pass_fn(x):
-            return self.forward_pass(x, attention_mask)
-
         x = input_ids
-        for _ in range(self.num_layers):
+        for layer_num in range(self.num_layers):
             # Ensure x is LongTensor before passing to the model
             if not torch.is_tensor(x):
                 raise ValueError("Input to shared_model must be a tensor.")
             if x.dtype != torch.long:
                 logging.warning(f"Converting input tensor from {x.dtype} to torch.long")
                 x = x.long()
-            # Use use_reentrant=False to handle future PyTorch changes
-            x = checkpoint(forward_pass_fn, x, use_reentrant=False)
+            x = self.forward_pass(x, attention_mask)  # Direct forward pass without checkpoint
         return x
 
 # Optimized Stacked LLaMA Network with shared components and LoRA
@@ -226,19 +242,20 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, history=
 
     inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit)
 
-    # Move tensors to device, preserving data types
-    input_ids = inputs["input_ids"].to(device)
+    # Move tensors to device, ensuring input_ids are long type
+    input_ids = inputs["input_ids"].to(device).long()  # Ensure long type
     attention_mask = inputs["attention_mask"].to(device)
-
-    # Ensure that input IDs are torch.long
-    if input_ids.dtype != torch.long:
-        logging.warning(f"Converting input tensor from {input_ids.dtype} to torch.long")
-        input_ids = input_ids.long()
 
     # Check input_ids are within vocab_size
     if (input_ids >= config.vocab_size).any():
         invalid_ids = input_ids[input_ids >= config.vocab_size]
         raise ValueError(f"Out-of-bounds input_ids found: {invalid_ids}")
+
+    # Truncate input if necessary
+    max_length = config.max_position_embeddings
+    if input_ids.shape[1] > max_length:
+        input_ids = input_ids[:, :max_length]
+        attention_mask = attention_mask[:, :max_length]
 
     with torch.no_grad():
         # Call the model with the proper input format
@@ -287,7 +304,7 @@ if __name__ == "__main__":
 
         # Load tokenizer
         logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
-        tokenizer = load_tokenizer(SOURCE_DIR)
+        tokenizer = load_tokenizer(SOURCE_DIR, config)
 
         # Log tokenizer details
         logging.info(f"Tokenizer length (len(tokenizer)): {len(tokenizer)}")
