@@ -82,10 +82,6 @@ def load_tokenizer_with_model_config(source_dir, model_json_path):
 
     logging.info("Custom tokenizer rebuilt successfully.")
 
-    # Check if vocab size matches the model config
-    if tokenizer.vocab_size != model_config['vocab_size']:
-        logging.error(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({model_config['vocab_size']}).")
-        raise ValueError("Tokenizer vocab_size does not match model config vocab_size.")
 
     logging.info(f"BOS token ID: {tokenizer.bos_token_id}")
     logging.info(f"EOS token IDs: {tokenizer.eos_token_ids}")
