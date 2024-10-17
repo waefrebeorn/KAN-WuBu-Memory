@@ -53,10 +53,6 @@ def load_tokenizer(source_dir):
     else:
         logging.info(f"Tokenizer already has a pad token with ID {tokenizer.pad_token_id}.")
 
-    # Ensure that the pad_token_id is valid
-    if tokenizer.pad_token_id >= tokenizer.vocab_size:
-        raise ValueError(f"pad_token_id {tokenizer.pad_token_id} is out of bounds for the tokenizer's vocabulary size {tokenizer.vocab_size}.")
-
     pad_token = tokenizer.convert_ids_to_tokens(tokenizer.pad_token_id)
     if pad_token is None:
         raise ValueError(f"pad_token_id {tokenizer.pad_token_id} does not correspond to any token in the tokenizer.")
