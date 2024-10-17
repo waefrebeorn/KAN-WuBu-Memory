@@ -84,7 +84,7 @@ def load_tokenizer_with_model_config(source_dir, model_json_path):
 
 
     logging.info(f"BOS token ID: {tokenizer.bos_token_id}")
-    logging.info(f"EOS token IDs: {tokenizer.eos_token_ids}")
+    logging.info(f"EOS token IDs: {tokenizer.eos_token_id}")
     logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
 
     return tokenizer
