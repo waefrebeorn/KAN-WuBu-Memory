@@ -9,6 +9,7 @@ import logging
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
+from torch.utils.checkpoint import checkpoint
 
 # Define paths to the directories and files
 SOURCE_DIR = "models/Llama_32_1B/"
@@ -17,6 +18,12 @@ MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO)
+
+# Check CUDA availability
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available. Please ensure that a compatible GPU is installed and CUDA is properly configured.")
+
+device = torch.device('cuda')
 
 # Load the configuration from the JSON file
 def load_configuration(model_json_path):
@@ -64,14 +71,16 @@ class LoRA(nn.Module):
 class OptimizedStackedLlamaModule(nn.Module):
     def __init__(self, config, num_layers=6):
         super(OptimizedStackedLlamaModule, self).__init__()
-        self.shared_model = LlamaForCausalLM(config)
+        self.shared_model = LlamaForCausalLM(config).to(device)
         self.num_layers = num_layers
 
     def forward(self, input_ids, attention_mask=None):
+        def forward_pass(x):
+            return self.shared_model(input_ids=x, attention_mask=attention_mask).logits
+
         x = input_ids
         for _ in range(self.num_layers):
-            outputs = self.shared_model(input_ids=x, attention_mask=attention_mask)
-            x = outputs.logits
+            x = checkpoint(forward_pass, x)
         return x
 
 # Optimized Stacked LLaMA Network with shared components and LoRA
@@ -80,9 +89,9 @@ class OptimizedStackedLlamaNetwork(nn.Module):
         super(OptimizedStackedLlamaNetwork, self).__init__()
         self.shared_model = OptimizedStackedLlamaModule(config)
         self.num_stacks = num_stacks
-        self.linears = nn.ModuleList([nn.Linear(config.hidden_size, config.hidden_size) for _ in range(num_stacks)])
-        self.shared_layer = SharedLayer(config.hidden_size)
-        self.lora_adapters = nn.ModuleList([LoRA(config.hidden_size) for _ in range(num_stacks)])
+        self.linears = nn.ModuleList([nn.Linear(config.hidden_size, config.hidden_size).to(device) for _ in range(num_stacks)])
+        self.shared_layer = SharedLayer(config.hidden_size).to(device)
+        self.lora_adapters = nn.ModuleList([LoRA(config.hidden_size).to(device) for _ in range(num_stacks)])
 
     def forward(self, input_ids, attention_mask=None):
         x = input_ids
@@ -93,12 +102,12 @@ class OptimizedStackedLlamaNetwork(nn.Module):
             x = self.lora_adapters[i](x)
         return x
 
-# Function to load tensors from .dat files
+# Function to load tensors from .dat files directly to GPU
 def load_dat_file(file_path, dtype):
     with open(file_path, 'rb') as f:
         tensor_data = np.fromfile(f, dtype=dtype)
-    loaded_tensor = torch.tensor(tensor_data)
-    
+    loaded_tensor = torch.tensor(tensor_data, device=device)  # Directly load to GPU
+
     # If dtype was mapped to float32 for bfloat16 compatibility, convert back
     if dtype == np.float32 and "bfloat16" in file_path:
         loaded_tensor = loaded_tensor.to(torch.bfloat16)
@@ -121,12 +130,13 @@ def load_offloaded_weights(model, weights_dir):
             }
             expected_dtype = dtype_map.get(param.dtype, np.float32)
             logging.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
+            
+            # Load tensor directly to GPU and copy it to the model's parameters
             loaded_tensor = load_dat_file(file_path, expected_dtype).view_as(param)
-
             if param.dtype == torch.bfloat16:
                 loaded_tensor = loaded_tensor.to(torch.bfloat16)
 
-            param.data.copy_(loaded_tensor.to("cuda"))
+            param.data.copy_(loaded_tensor)
         else:
             logging.warning(f"Warning: {file_name} not found in offloaded directory.")
 
@@ -172,7 +182,7 @@ class ResponseQualityManager:
 def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
     history = [line for line in history if line.strip()]  # Clean the history
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to("cuda")
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to(device)
     
     with torch.cuda.amp.autocast():  # Enable mixed precision
         with torch.no_grad():
@@ -194,23 +204,28 @@ def user_input_loop(model, tokenizer):
     print("Type 'exit' to quit.")
     history = []  # Initialize a history buffer to keep track of conversation
     while True:
-        user_input = input("\nEnter your query: ")
-        if user_input.lower() == 'exit':
-            print("Exiting...")
-            break
-        response, history = generate_response(user_input, model, tokenizer, history=history)
-        print(f"Model Response: {response}")
+        try:
+            user_input = input("\nEnter your query: ")
+            if user_input.lower() == 'exit':
+                print("Exiting...")
+                break
+            response, history = generate_response(user_input, model, tokenizer, history=history)
+            print(f"Model Response: {response}")
+        except Exception as e:
+            logging.error(f"An error occurred: {e}")
+            torch.cuda.empty_cache()
+            raise e  # Reraise the exception to see full crash details
 
 # Main execution flow
 if __name__ == "__main__":
     # Initialize the optimized model
     logging.info("Initializing the optimized Stacked LLaMA Network.")
-    model = OptimizedStackedLlamaNetwork(config, num_stacks=3)
+    model = OptimizedStackedLlamaNetwork(config, num_stacks=3).to(device)
 
     # Load weights and move to GPU
     logging.info("Loading offloaded weights into the model.")
     load_offloaded_weights(model, WEIGHTS_DIR)
-    model.to('cuda')
+    model.to(device)
     model.eval()
 
     # Load tokenizer
