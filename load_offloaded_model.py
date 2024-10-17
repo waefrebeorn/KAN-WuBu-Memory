@@ -16,10 +16,10 @@ from torch.utils.checkpoint import checkpoint
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 # Define paths to the directories and files
-SOURCE_DIR = "models/Llama_32_1B/"
+SOURCE_DIR = r"C:\Projects\KAN-WuBu-Memory\models\Llama_32_1B"
 WEIGHTS_DIR = os.path.join(SOURCE_DIR, "offload")
 MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")
-TOKENIZER_CONFIG_PATH = os.path.join(SOURCE_DIR, "tokenizer_config.json")  # Adjust if different
+TOKENIZER_CONFIG_PATH = os.path.join(SOURCE_DIR, "tokenizer_config.json")
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
@@ -35,9 +35,10 @@ def load_configuration(model_json_path):
     with open(model_json_path, "r") as f:
         config_data = json.load(f)
     config = LlamaConfig(**config_data)
+    logging.info("Model configuration loaded successfully.")
     return config
 
-# Function to update tokenizer's vocab_size in config.json
+# Function to update tokenizer's vocab_size in tokenizer_config.json
 def update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size):
     with open(tokenizer_config_path, "r") as f:
         tokenizer_config = json.load(f)
@@ -58,37 +59,50 @@ def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
 # Load tokenizer with proper handling of the pad token and ensuring vocab_size matches
 def load_tokenizer(source_dir, config):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
-
-    # Ensure pad_token_id is correct
-    predefined_pad_token_id = 128004  # <|finetune_right_pad_id|>
-    if tokenizer.pad_token_id is None or tokenizer.pad_token_id >= config.vocab_size:
-        tokenizer.pad_token_id = predefined_pad_token_id
-        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(predefined_pad_token_id)
-        logging.info(f"Set pad_token_id to predefined padding ID {predefined_pad_token_id}.")
+    logging.info("Tokenizer loaded successfully.")
+    
+    # Verify tokenizer vocab_size matches model config
+    if tokenizer.vocab_size != config.vocab_size:
+        logging.warning(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({config.vocab_size}).")
+        # Optionally, handle the mismatch here. For now, we raise an error.
+        raise ValueError("Tokenizer vocab_size does not match model config vocab_size.")
     else:
-        logging.info(f"Tokenizer already has a pad token with ID {tokenizer.pad_token_id}.")
+        logging.info(f"Tokenizer vocab_size matches model config: {tokenizer.vocab_size}")
+    
+    # Ensure special tokens are correctly set
+    predefined_pad_token = "<|finetune_right_pad_id|>"
+    predefined_pad_token_id = 128004  # As per tokenizer_config.json
 
-    pad_token = tokenizer.convert_ids_to_tokens(tokenizer.pad_token_id)
-    if pad_token is None:
-        raise ValueError(f"pad_token_id {tokenizer.pad_token_id} does not correspond to any token in the tokenizer.")
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': predefined_pad_token})
+        logging.info(f"Added pad_token: {predefined_pad_token}")
+    else:
+        logging.info(f"Tokenizer already has a pad token: {tokenizer.pad_token}")
 
-    tokenizer.pad_token = pad_token
-    tokenizer.pad_token_id = tokenizer.pad_token_id
+    # Ensure pad_token_id is within vocab_size
+    if tokenizer.pad_token_id >= config.vocab_size:
+        logging.error(f"pad_token_id ({tokenizer.pad_token_id}) exceeds vocab_size ({config.vocab_size}).")
+        raise ValueError("pad_token_id exceeds vocab_size.")
+    else:
+        logging.info(f"pad_token_id ({tokenizer.pad_token_id}) is within vocab_size.")
 
-    # Ensure eos_token_id is within vocab_size
-    predefined_eos_token_ids = [128001, 128008, 128009]  # From config.json
+    # Ensure eos_token_id(s) are within vocab_size
+    predefined_eos_token_ids = [128001, 128008, 128009]  # As per tokenizer_config.json
     for eos_id in predefined_eos_token_ids:
         if eos_id >= config.vocab_size:
-            raise ValueError(f"eos_token_id {eos_id} exceeds vocab_size {config.vocab_size}")
+            logging.error(f"eos_token_id ({eos_id}) exceeds vocab_size ({config.vocab_size}).")
+            raise ValueError("eos_token_id exceeds vocab_size.")
         eos_token = tokenizer.convert_ids_to_tokens(eos_id)
         if eos_token is None:
-            raise ValueError(f"eos_token_id {eos_id} does not correspond to any token in the tokenizer.")
-
-    # Update tokenizer's eos_token_id
-    tokenizer.eos_token_id = predefined_eos_token_ids
-    tokenizer.add_special_tokens({'eos_token': tokenizer.convert_ids_to_tokens(predefined_eos_token_ids[0])})  # Ensure at least one EOS token is recognized
-    logging.info(f"Set eos_token_id to predefined EOS token IDs {predefined_eos_token_ids}.")
-
+            logging.error(f"eos_token_id ({eos_id}) does not correspond to any token in the tokenizer.")
+            raise ValueError(f"eos_token_id {eos_id} is invalid.")
+        logging.info(f"eos_token_id ({eos_id}) corresponds to token: {eos_token}")
+    
+    # Set tokenizer's eos_token_id to the first predefined EOS token
+    tokenizer.eos_token_id = predefined_eos_token_ids[0]
+    tokenizer.add_special_tokens({'eos_token': tokenizer.convert_ids_to_tokens(predefined_eos_token_ids[0])})
+    logging.info(f"Set eos_token_id to {tokenizer.eos_token_id} ({tokenizer.eos_token})")
+    
     return tokenizer
 
 # SharedLayer class remains unchanged
@@ -125,9 +139,13 @@ class OptimizedStackedLlamaModule(nn.Module):
         self.num_layers = num_layers
         # Create a list of deep-copied models to ensure each layer has its own instance
         self.models = nn.ModuleList([copy.deepcopy(LlamaForCausalLM(config).to(device)) for _ in range(self.num_layers)])
+        logging.info(f"Initialized {self.num_layers} LlamaForCausalLM instances for shared layers.")
 
     def forward_pass(self, input_ids, attention_mask, layer_num):
-        return self.models[layer_num](input_ids=input_ids, attention_mask=attention_mask).logits
+        if layer_num >= self.num_layers:
+            raise IndexError(f"layer_num {layer_num} is out of range for {self.num_layers} layers.")
+        outputs = self.models[layer_num](input_ids=input_ids, attention_mask=attention_mask)
+        return outputs.logits
 
     def forward(self, input_ids, attention_mask=None):
         x = input_ids
@@ -149,6 +167,7 @@ class OptimizedStackedLlamaNetwork(nn.Module):
         self.linears = nn.ModuleList([nn.Linear(config.hidden_size, config.hidden_size).to(device) for _ in range(num_stacks)])
         self.shared_layer = SharedLayer(config.hidden_size).to(device)
         self.lora_adapters = nn.ModuleList([LoRA(config.hidden_size).to(device) for _ in range(num_stacks)])
+        logging.info(f"Initialized OptimizedStackedLlamaNetwork with {self.num_stacks} stacks.")
 
     def forward(self, input_ids, attention_mask=None):
         x = input_ids
@@ -172,8 +191,10 @@ def load_dat_file(file_path, dtype):
 
 # Optimized weight loading function to load weights once for the shared model
 def load_offloaded_weights(model, weights_dir):
-    logging.info("Loading weights for the shared LLaMA model")
-    for name, param in model.shared_model.models[0].named_parameters():
+    logging.info("Loading weights for the shared LLaMA model.")
+    # Load weights for the first model instance
+    first_model = model.shared_model.models[0]
+    for name, param in first_model.named_parameters():
         file_name = name.replace('.', '_') + ".dat"
         file_path = os.path.join(weights_dir, file_name)
 
@@ -194,13 +215,13 @@ def load_offloaded_weights(model, weights_dir):
                 loaded_tensor = loaded_tensor.to(torch.bfloat16)
 
             param.data.copy_(loaded_tensor)
-            logging.info(f"Loaded weights for {name}")
+            logging.info(f"Loaded weights for parameter: {name}")
         else:
             logging.warning(f"Warning: {file_name} not found in offloaded directory.")
 
-    # Share the loaded weights across all model instances
+    # Share the loaded weights across all other model instances
     for i, model_copy in enumerate(model.shared_model.models[1:], start=1):
-        model_copy.load_state_dict(model.shared_model.models[0].state_dict())
+        model_copy.load_state_dict(first_model.state_dict())
         logging.info(f"Shared weights loaded for model layer {i}")
 
 # ResponseQualityManager class remains unchanged
@@ -302,6 +323,10 @@ if __name__ == "__main__":
         config = load_configuration(MODEL_JSON_PATH)
         prepare_tokenizer_config(TOKENIZER_CONFIG_PATH, config.vocab_size)
 
+        # Load tokenizer
+        logging.info("Loading tokenizer...")
+        tokenizer = load_tokenizer(SOURCE_DIR, config)
+
         # Initialize the optimized model
         logging.info("Initializing the optimized Stacked LLaMA Network.")
         model = OptimizedStackedLlamaNetwork(config, num_stacks=3).to(device)
@@ -311,10 +336,6 @@ if __name__ == "__main__":
         load_offloaded_weights(model, WEIGHTS_DIR)
         model.to(device)
         model.eval()
-
-        # Load tokenizer
-        logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
-        tokenizer = load_tokenizer(SOURCE_DIR, config)
 
         # Log tokenizer details
         logging.info(f"Tokenizer length (len(tokenizer)): {len(tokenizer)}")
