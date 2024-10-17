@@ -38,11 +38,6 @@ def load_configuration(model_json_path):
 # Load configuration before the tokenizer
 config = load_configuration(MODEL_JSON_PATH)
 
-# Use AutoTokenizer instead of LlamaTokenizer to resolve class conflicts
-def load_model_config(config_path):
-    with open(config_path, "r") as f:
-        return json.load(f)
-
 # Load tokenizer with proper handling of the pad token
 def load_tokenizer(source_dir):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
@@ -59,8 +54,8 @@ def load_tokenizer(source_dir):
         logging.info(f"Tokenizer already has a pad token with ID {tokenizer.pad_token_id}.")
 
     # Verify that pad_token_id exists within the tokenizer's vocabulary
-    if tokenizer.pad_token_id >= len(tokenizer):
-        raise ValueError(f"pad_token_id {tokenizer.pad_token_id} is out of bounds for the tokenizer's vocabulary size {len(tokenizer)}.")
+    if tokenizer.pad_token_id >= tokenizer.vocab_size:
+        raise ValueError(f"pad_token_id {tokenizer.pad_token_id} is out of bounds for the tokenizer's vocabulary size {tokenizer.vocab_size}.")
 
     pad_token = tokenizer.convert_ids_to_tokens(tokenizer.pad_token_id)
     if pad_token is None:
@@ -80,9 +75,9 @@ logging.info(f"Tokenizer length (len(tokenizer)): {len(tokenizer)}")
 logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
 
 # Ensure that the tokenizer's vocab_size matches the model's config.vocab_size
-if len(tokenizer) != config.vocab_size:
-    logging.warning(f"Tokenizer vocabulary size ({len(tokenizer)}) does not match the model's config vocab_size ({config.vocab_size}). Adjusting config vocab_size.")
-    config.vocab_size = len(tokenizer)  # Adjust config to match tokenizer
+if tokenizer.vocab_size != config.vocab_size:
+    logging.error(f"Tokenizer vocabulary size ({tokenizer.vocab_size}) does not match the model's config vocab_size ({config.vocab_size}). Please ensure they are aligned.")
+    raise ValueError(f"Tokenizer vocabulary size ({tokenizer.vocab_size}) does not match the model's config vocab_size ({config.vocab_size}). Please ensure they are aligned.")
 
 # SharedLayer class remains unchanged
 class SharedLayer(nn.Module):
@@ -307,11 +302,11 @@ if __name__ == "__main__":
         logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
 
         # Ensure that the tokenizer's vocab_size matches the model's config.vocab_size
-        if len(tokenizer) != config.vocab_size:
-            raise ValueError(f"Tokenizer vocabulary size ({len(tokenizer)}) does not match the model's config vocab_size ({config.vocab_size}). Please ensure they are aligned.")
+        if tokenizer.vocab_size != config.vocab_size:
+            raise ValueError(f"Tokenizer vocabulary size ({tokenizer.vocab_size}) does not match the model's config vocab_size ({config.vocab_size}). Please ensure they are aligned.")
 
         # Resize token embeddings in case new tokens were added
-        model.shared_model.shared_model.resize_token_embeddings(len(tokenizer))
+        model.shared_model.shared_model.resize_token_embeddings(tokenizer.vocab_size)
 
         # Initialize ResponseQualityManager
         quality_manager = ResponseQualityManager(model, tokenizer)
