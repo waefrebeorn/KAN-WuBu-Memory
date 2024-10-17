@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import json
 import numpy as np
+import copy
 import re
 import logging
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -122,20 +123,18 @@ class OptimizedStackedLlamaModule(nn.Module):
         super(OptimizedStackedLlamaModule, self).__init__()
         self.shared_model = LlamaForCausalLM(config).to(device)
         self.num_layers = num_layers
+        self.models = nn.ModuleList([copy.deepcopy(self.shared_model) for _ in range(self.num_layers)])
 
-    def forward_pass(self, input_ids, attention_mask):
-        return self.shared_model(input_ids=input_ids, attention_mask=attention_mask).logits
+    def forward_pass(self, input_ids, attention_mask, layer_num):
+        return self.models[layer_num](input_ids=input_ids, attention_mask=attention_mask).logits
 
     def forward(self, input_ids, attention_mask=None):
         x = input_ids
         for layer_num in range(self.num_layers):
-            # Ensure x is LongTensor before passing to the model
-            if not torch.is_tensor(x):
-                raise ValueError("Input to shared_model must be a tensor.")
             if x.dtype != torch.long:
                 logging.warning(f"Converting input tensor from {x.dtype} to torch.long")
                 x = x.long()
-            x = self.forward_pass(x, attention_mask)  # Direct forward pass without checkpoint
+            x = self.forward_pass(x, attention_mask, layer_num)
         return x
 
 # Optimized Stacked LLaMA Network with shared components and LoRA
