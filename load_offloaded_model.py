@@ -1,5 +1,4 @@
 import os
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +10,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
 from torch.utils.checkpoint import checkpoint
+
+# Enable CUDA launch blocking for accurate error reporting
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 # Define paths to the directories and files
 SOURCE_DIR = "models/Llama_32_1B/"
@@ -35,7 +37,13 @@ def load_configuration(model_json_path):
 
 # Use AutoTokenizer instead of LlamaTokenizer to resolve class conflicts
 def load_tokenizer(source_dir):
-    return AutoTokenizer.from_pretrained(source_dir)
+    tokenizer = AutoTokenizer.from_pretrained(source_dir)
+    # Manually add padding token if not present
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '<PAD>'})
+    # Set pad_token_id as per config.json (128001)
+    tokenizer.pad_token_id = 128001
+    return tokenizer
 
 # Load the model configuration
 logging.info(f"Loading model configuration from: {MODEL_JSON_PATH}")
@@ -114,7 +122,7 @@ class OptimizedStackedLlamaNetwork(nn.Module):
 def load_dat_file(file_path, dtype):
     with open(file_path, 'rb') as f:
         tensor_data = np.fromfile(f, dtype=dtype)
-    loaded_tensor = torch.tensor(tensor_data, device=device)  # Directly load to GPU
+    loaded_tensor = torch.tensor(tensor_data, device=device)
 
     # If dtype was mapped to float32 for bfloat16 compatibility, convert back
     if dtype == np.float32 and "bfloat16" in file_path:
@@ -187,19 +195,30 @@ class ResponseQualityManager:
         return len(sentences) > 0 and sentences[0][0].isupper() and sentences[-1][-1] in '.!?'
 
 # Function to generate responses with optimized memory usage
-def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
+def generate_response(input_text, model, tokenizer, max_new_tokens=150, history=[], context_limit=512):
     history = [line for line in history if line.strip()]  # Clean the history
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
 
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to(device)
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit)
 
-    # Ensure that input IDs (token indices) are in long format
-    inputs["input_ids"] = inputs["input_ids"].long()
+    # Move tensors to device, preserving data types
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs["attention_mask"].to(device)
+
+    # Ensure that input IDs are torch.long
+    if input_ids.dtype != torch.long:
+        logging.warning(f"Converting input tensor from {input_ids.dtype} to torch.long")
+        input_ids = input_ids.long()
+
+    # Check input_ids are within vocab_size
+    if (input_ids >= tokenizer.vocab_size).any():
+        invalid_ids = input_ids[input_ids >= tokenizer.vocab_size]
+        raise ValueError(f"Out-of-bounds input_ids found: {invalid_ids}")
 
     with torch.no_grad():
         # Call the model with the proper input format
-        outputs = model(inputs["input_ids"], attention_mask=inputs["attention_mask"])
-        output_ids = torch.argmax(outputs, dim=-1)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        output_ids = torch.argmax(outputs.logits, dim=-1)
 
     response = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
     cleaned_response = re.sub(r'\s+', ' ', response.split("User:")[-1].strip())
@@ -244,6 +263,9 @@ if __name__ == "__main__":
         # Load tokenizer
         logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
         tokenizer = load_tokenizer(SOURCE_DIR)
+
+        # Resize token embeddings in case new tokens were added
+        model.shared_model.shared_model.resize_token_embeddings(len(tokenizer))
 
         # Initialize ResponseQualityManager
         quality_manager = ResponseQualityManager(model, tokenizer)
