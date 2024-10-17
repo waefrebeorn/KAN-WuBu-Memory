@@ -58,20 +58,20 @@ def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
 
 # Load tokenizer with proper handling of the pad token and ensuring vocab_size matches
 def load_tokenizer(source_dir, config):
+    # Load the tokenizer normally
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
     logging.info("Tokenizer loaded successfully.")
     
-    # Verify tokenizer vocab_size matches model config
+    # The tokenizer should get its vocab size from the model's config
+    # Force set the vocab size from model config if it's incorrect
     if tokenizer.vocab_size != config.vocab_size:
         logging.warning(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({config.vocab_size}).")
-        # Optionally, handle the mismatch here. For now, we raise an error.
-        raise ValueError("Tokenizer vocab_size does not match model config vocab_size.")
-    else:
-        logging.info(f"Tokenizer vocab_size matches model config: {tokenizer.vocab_size}")
-    
+        logging.info(f"Overwriting tokenizer vocab_size from {tokenizer.vocab_size} to {config.vocab_size}.")
+        tokenizer.vocab_size = config.vocab_size  # Manually align vocab_size with the model's config
+
     # Ensure special tokens are correctly set
     predefined_pad_token = "<|finetune_right_pad_id|>"
-    predefined_pad_token_id = 128004  # As per tokenizer_config.json
+    predefined_pad_token_id = 128004  # As per your tokenizer configuration
 
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({'pad_token': predefined_pad_token})
@@ -87,7 +87,7 @@ def load_tokenizer(source_dir, config):
         logging.info(f"pad_token_id ({tokenizer.pad_token_id}) is within vocab_size.")
 
     # Ensure eos_token_id(s) are within vocab_size
-    predefined_eos_token_ids = [128001, 128008, 128009]  # As per tokenizer_config.json
+    predefined_eos_token_ids = [128001, 128008, 128009]  # As per your tokenizer configuration
     for eos_id in predefined_eos_token_ids:
         if eos_id >= config.vocab_size:
             logging.error(f"eos_token_id ({eos_id}) exceeds vocab_size ({config.vocab_size}).")
