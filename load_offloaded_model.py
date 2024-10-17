@@ -3,12 +3,14 @@ import torch
 import torch.nn as nn
 import json
 import numpy as np
-import copy
 import re
 import logging
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
+
+import copy
+from torch.utils.checkpoint import checkpoint
 
 # Enable CUDA launch blocking for accurate error reporting
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -56,7 +58,6 @@ def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
 # Load tokenizer with proper handling of the pad token and ensuring vocab_size matches
 def load_tokenizer(source_dir, config):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
-
 
     # Ensure pad_token_id is correct
     predefined_pad_token_id = 128004  # <|finetune_right_pad_id|>
@@ -121,9 +122,9 @@ class LoRA(nn.Module):
 class OptimizedStackedLlamaModule(nn.Module):
     def __init__(self, config, num_layers=6):
         super(OptimizedStackedLlamaModule, self).__init__()
-        self.shared_model = LlamaForCausalLM(config).to(device)
         self.num_layers = num_layers
-        self.models = nn.ModuleList([copy.deepcopy(self.shared_model) for _ in range(self.num_layers)])
+        # Create a list of deep-copied models to ensure each layer has its own instance
+        self.models = nn.ModuleList([copy.deepcopy(LlamaForCausalLM(config).to(device)) for _ in range(self.num_layers)])
 
     def forward_pass(self, input_ids, attention_mask, layer_num):
         return self.models[layer_num](input_ids=input_ids, attention_mask=attention_mask).logits
@@ -131,6 +132,8 @@ class OptimizedStackedLlamaModule(nn.Module):
     def forward(self, input_ids, attention_mask=None):
         x = input_ids
         for layer_num in range(self.num_layers):
+            if not torch.is_tensor(x):
+                raise ValueError("Input to shared_model must be a tensor.")
             if x.dtype != torch.long:
                 logging.warning(f"Converting input tensor from {x.dtype} to torch.long")
                 x = x.long()
@@ -170,7 +173,7 @@ def load_dat_file(file_path, dtype):
 # Optimized weight loading function to load weights once for the shared model
 def load_offloaded_weights(model, weights_dir):
     logging.info("Loading weights for the shared LLaMA model")
-    for name, param in model.shared_model.shared_model.named_parameters():
+    for name, param in model.shared_model.models[0].named_parameters():
         file_name = name.replace('.', '_') + ".dat"
         file_path = os.path.join(weights_dir, file_name)
 
@@ -191,8 +194,14 @@ def load_offloaded_weights(model, weights_dir):
                 loaded_tensor = loaded_tensor.to(torch.bfloat16)
 
             param.data.copy_(loaded_tensor)
+            logging.info(f"Loaded weights for {name}")
         else:
             logging.warning(f"Warning: {file_name} not found in offloaded directory.")
+
+    # Share the loaded weights across all model instances
+    for i, model_copy in enumerate(model.shared_model.models[1:], start=1):
+        model_copy.load_state_dict(model.shared_model.models[0].state_dict())
+        logging.info(f"Shared weights loaded for model layer {i}")
 
 # ResponseQualityManager class remains unchanged
 class ResponseQualityManager:
@@ -233,7 +242,7 @@ class ResponseQualityManager:
         return len(sentences) > 0 and sentences[0][0].isupper() and sentences[-1][-1] in '.!?'
 
 # Function to generate responses with optimized memory usage
-def generate_response(input_text, model, tokenizer, max_new_tokens=150, history=[], context_limit=512):
+def generate_response(input_text, model, tokenizer, config, max_new_tokens=150, history=[], context_limit=512):
     history = [line for line in history if line.strip()]  # Clean the history
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
 
@@ -257,7 +266,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, history=
     with torch.no_grad():
         # Call the model with the proper input format
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        output_ids = torch.argmax(outputs.logits, dim=-1)
+        output_ids = torch.argmax(outputs, dim=-1)
 
     response = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
     cleaned_response = re.sub(r'\s+', ' ', response.split("User:")[-1].strip())
@@ -269,7 +278,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, history=
     return cleaned_response, history
 
 # Interactive query loop with refined response generation
-def user_input_loop(model, tokenizer):
+def user_input_loop(model, tokenizer, config):
     print("\n--- LLaMA Instruct Model Interactive Query ---")
     print("Type 'exit' to quit.")
     history = []  # Initialize a history buffer to keep track of conversation
@@ -279,7 +288,7 @@ def user_input_loop(model, tokenizer):
             if user_input.lower() == 'exit':
                 print("Exiting...")
                 break
-            response, history = generate_response(user_input, model, tokenizer, history=history)
+            response, history = generate_response(user_input, model, tokenizer, config, history=history)
             print(f"Model Response: {response}")
         except Exception as e:
             logging.error(f"An error occurred: {e}")
@@ -316,7 +325,7 @@ if __name__ == "__main__":
 
         # Start the interactive query loop
         logging.info("Optimized model loaded successfully. You can now query the model.")
-        user_input_loop(model, tokenizer)
+        user_input_loop(model, tokenizer, config)
     except Exception as main_e:
         logging.error(f"Failed to initialize the model: {main_e}")
         raise main_e
