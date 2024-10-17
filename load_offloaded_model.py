@@ -35,6 +35,9 @@ def load_configuration(model_json_path):
     config = LlamaConfig(**config_data)
     return config
 
+# Load configuration before the tokenizer
+config = load_configuration(MODEL_JSON_PATH)
+
 # Use AutoTokenizer instead of LlamaTokenizer to resolve class conflicts
 def load_model_config(config_path):
     with open(config_path, "r") as f:
@@ -60,6 +63,7 @@ def load_tokenizer(source_dir):
     tokenizer.pad_token_id = pad_token_id
 
     return tokenizer
+
 
 # Load the tokenizer
 logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
