@@ -301,7 +301,7 @@ if __name__ == "__main__":
 
         # Load tokenizer
         logging.info("Loading tokenizer...")
-        tokenizer = load_tokenizer_with_model_config(SOURCE_DIR, MODEL_JSON_PATH)
+        tokenizer = load_tokenizer_with_model_config(MODEL_JSON_PATH)
 
         # Initialize the optimized model
         logging.info("Initializing the optimized Stacked LLaMA Network.")
