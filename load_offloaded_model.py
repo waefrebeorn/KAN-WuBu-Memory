@@ -293,13 +293,6 @@ if __name__ == "__main__":
         logging.info(f"Tokenizer length (len(tokenizer)): {len(tokenizer)}")
         logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
 
-        # Ensure that the tokenizer's vocab_size matches the model's config.vocab_size
-        if tokenizer.vocab_size != config.vocab_size:
-            raise ValueError(f"Tokenizer vocabulary size ({tokenizer.vocab_size}) does not match the model's config vocab_size ({config.vocab_size}). Please ensure they are aligned.")
-
-        # Resize token embeddings in case new tokens were added
-        model.shared_model.shared_model.resize_token_embeddings(tokenizer.vocab_size)
-
         # Initialize ResponseQualityManager
         quality_manager = ResponseQualityManager(model, tokenizer)
 
