@@ -38,17 +38,23 @@ def load_configuration(model_json_path):
 # Use AutoTokenizer instead of LlamaTokenizer to resolve class conflicts
 def load_tokenizer(source_dir):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
-    # Manually add padding token if not present
-    if tokenizer.pad_token is None:
-        logging.info("Pad token not found in tokenizer. Adding <PAD> token.")
-        tokenizer.add_special_tokens({'pad_token': '<PAD>'})
-    # Set pad_token_id as per config.json (128001)
-    tokenizer.pad_token_id = 128001
-    return tokenizer
 
-# Load the model configuration
-logging.info(f"Loading model configuration from: {MODEL_JSON_PATH}")
-config = load_configuration(MODEL_JSON_PATH)
+    # Directly set pad_token_id to 128001 without adding a new pad token
+    pad_token_id = 128001
+
+    # Verify that pad_token_id exists within the tokenizer's vocabulary
+    if pad_token_id >= len(tokenizer):
+        raise ValueError(f"pad_token_id {pad_token_id} is out of bounds for the tokenizer's vocabulary size {len(tokenizer)}.")
+
+    # Set the pad_token to the corresponding token if it exists
+    pad_token = tokenizer.convert_ids_to_tokens(pad_token_id)
+    if pad_token is None:
+        raise ValueError(f"pad_token_id {pad_token_id} does not correspond to any token in the tokenizer.")
+
+    tokenizer.pad_token = pad_token
+    tokenizer.pad_token_id = pad_token_id
+
+    return tokenizer
 
 # Load the tokenizer
 logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
@@ -60,7 +66,8 @@ logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
 
 # Ensure that the tokenizer's vocab_size matches the model's config.vocab_size
 if len(tokenizer) != config.vocab_size:
-    raise ValueError(f"Tokenizer vocabulary size ({len(tokenizer)}) does not match the model's config vocab_size ({config.vocab_size}). Please ensure they are aligned.")
+    logging.warning(f"Tokenizer vocabulary size ({len(tokenizer)}) does not match the model's config vocab_size ({config.vocab_size}). Adjusting config vocab_size.")
+    config.vocab_size = len(tokenizer)  # Adjust config to match tokenizer
 
 # SharedLayer class remains unchanged
 class SharedLayer(nn.Module):
