@@ -42,7 +42,7 @@ config = load_configuration(MODEL_JSON_PATH)
 def load_tokenizer(source_dir):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
 
-    # Use the existing pad token from the tokenizer configuration
+    # Use the predefined pad token ID
     predefined_pad_token_id = 128256
 
     if tokenizer.pad_token_id is None:
@@ -52,6 +52,10 @@ def load_tokenizer(source_dir):
         logging.info(f"Set pad_token_id to predefined ID {predefined_pad_token_id}.")
     else:
         logging.info(f"Tokenizer already has a pad token with ID {tokenizer.pad_token_id}.")
+
+    # Verify that pad_token_id is not None before comparison
+    if tokenizer.pad_token_id is None:
+        raise ValueError("pad_token_id is not set or initialized correctly.")
 
     # Verify that pad_token_id exists within the tokenizer's vocabulary
     if tokenizer.pad_token_id >= tokenizer.vocab_size:
