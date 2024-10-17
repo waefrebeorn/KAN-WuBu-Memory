@@ -58,17 +58,18 @@ def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
 
 # Load tokenizer with proper handling of the pad token and ensuring vocab_size matches
 def load_tokenizer(source_dir, config):
-    # Load the tokenizer normally
-    tokenizer = AutoTokenizer.from_pretrained(source_dir)
+    # Ensure the tokenizer is loaded with the correct configuration and added tokens
+    tokenizer = AutoTokenizer.from_pretrained(
+        source_dir, 
+        config=config  # Ensure the tokenizer is aware of the model configuration
+    )
     logging.info("Tokenizer loaded successfully.")
     
-    # The tokenizer should get its vocab size from the model's config
-    # Force set the vocab size from model config if it's incorrect
+    # Verify if tokenizer's vocab_size matches model config
     if tokenizer.vocab_size != config.vocab_size:
-        logging.warning(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({config.vocab_size}).")
-        logging.info(f"Overwriting tokenizer vocab_size from {tokenizer.vocab_size} to {config.vocab_size}.")
-        tokenizer.vocab_size = config.vocab_size  # Manually align vocab_size with the model's config
-
+        logging.error(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({config.vocab_size}).")
+        raise ValueError("Tokenizer vocab_size does not match model config vocab_size.")
+    
     # Ensure special tokens are correctly set
     predefined_pad_token = "<|finetune_right_pad_id|>"
     predefined_pad_token_id = 128004  # As per your tokenizer configuration
