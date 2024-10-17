@@ -57,27 +57,42 @@ def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
     update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size)
 
 
-def load_tokenizer_with_model_config(MODEL_JSON_PATH):
-    # Load the correct model configuration
-    with open(MODEL_JSON_PATH, "r") as f:
+from transformers import PreTrainedTokenizerFast
+
+def load_tokenizer_with_model_config(source_dir, model_json_path):
+    # Load the correct model configuration from config.json
+    with open(model_json_path, "r") as f:
         model_config = json.load(f)
 
-    # Initialize tokenizer by loading the config directly from MODEL_JSON_PATH
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_JSON_PATH)
-    logging.info("Tokenizer loaded successfully using the model's config.json.")
+    # Manually define special tokens from the model config
+    special_tokens = {
+        'bos_token': "<|begin_of_text|>",
+        'eos_token': "<|end_of_text|>",
+        'pad_token': "<|finetune_right_pad_id|>",  # Use pad token from your config if needed
+    }
 
-    # Check if vocab size matches the model config (since we can't set vocab_size directly)
+    # Load tokenizer while bypassing tokenizer_config.json's influence
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=os.path.join(source_dir, "tokenizer.json"),
+        bos_token=special_tokens['bos_token'],
+        eos_token=special_tokens['eos_token'],
+        pad_token=special_tokens['pad_token'],
+        model_max_length=model_config['max_position_embeddings']
+    )
+
+    logging.info("Custom tokenizer rebuilt successfully.")
+
+    # Check if vocab size matches the model config
     if tokenizer.vocab_size != model_config['vocab_size']:
         logging.error(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({model_config['vocab_size']}).")
         raise ValueError("Tokenizer vocab_size does not match model config vocab_size.")
 
-    # Ensure special tokens are correctly set based on the model config
-    tokenizer.bos_token_id = model_config["bos_token_id"]
-    tokenizer.eos_token_ids = model_config["eos_token_id"]
-    logging.info(f"BOS token ID set to: {tokenizer.bos_token_id}")
-    logging.info(f"EOS token IDs set to: {tokenizer.eos_token_ids}")
+    logging.info(f"BOS token ID: {tokenizer.bos_token_id}")
+    logging.info(f"EOS token IDs: {tokenizer.eos_token_ids}")
+    logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
 
     return tokenizer
+
 
 
 
@@ -301,7 +316,7 @@ if __name__ == "__main__":
 
         # Load tokenizer
         logging.info("Loading tokenizer...")
-        tokenizer = load_tokenizer_with_model_config(MODEL_JSON_PATH)
+        tokenizer = load_tokenizer_with_model_config(SOURCE_DIR, MODEL_JSON_PATH)
 
         # Initialize the optimized model
         logging.info("Initializing the optimized Stacked LLaMA Network.")
