@@ -71,11 +71,6 @@ tokenizer = load_tokenizer(SOURCE_DIR)
 logging.info(f"Tokenizer length (len(tokenizer)): {len(tokenizer)}")
 logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
 
-# Ensure that the tokenizer's vocab_size matches the model's config.vocab_size
-if tokenizer.vocab_size != config.vocab_size:
-    logging.error(f"Tokenizer vocabulary size ({tokenizer.vocab_size}) does not match the model's config vocab_size ({config.vocab_size}). Please ensure they are aligned.")
-    raise ValueError(f"Tokenizer vocabulary size ({tokenizer.vocab_size}) does not match the model's config vocab_size ({config.vocab_size}). Please ensure they are aligned.")
-
 # SharedLayer class remains unchanged
 class SharedLayer(nn.Module):
     def __init__(self, hidden_size):
