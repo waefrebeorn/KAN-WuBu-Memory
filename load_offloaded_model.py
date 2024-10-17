@@ -182,8 +182,12 @@ class ResponseQualityManager:
 def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
     history = [line for line in history if line.strip()]  # Clean the history
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to(device)
     
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to("cuda")
+    
+    # Ensure that input IDs (token indices) are in long format
+    inputs["input_ids"] = inputs["input_ids"].long()
+
     with torch.cuda.amp.autocast():  # Enable mixed precision
         with torch.no_grad():
             outputs = model(inputs["input_ids"], attention_mask=inputs["attention_mask"])
@@ -197,6 +201,7 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
         history = history[-6:]
 
     return cleaned_response, history
+
 
 # Interactive query loop with refined response generation
 def user_input_loop(model, tokenizer):
