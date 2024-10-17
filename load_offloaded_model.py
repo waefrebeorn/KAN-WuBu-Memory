@@ -57,9 +57,9 @@ def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
     update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size)
 
 
-def load_tokenizer_with_model_config(SOURCE_DIR, config_path):
+def load_tokenizer_with_model_config(SOURCE_DIR, MODEL_JSON_PATH):
     # Load the correct model configuration
-    with open(config_path, "r") as f:
+    with open(MODEL_JSON_PATH, "r") as f:
         model_config = json.load(f)
 
     # Initialize tokenizer from the model config (ignoring tokenizer_config.json)
@@ -302,7 +302,7 @@ if __name__ == "__main__":
 
         # Load tokenizer
         logging.info("Loading tokenizer...")
-        tokenizer = load_tokenizer_with_model_config(SOURCE_DIR, config_path)
+        tokenizer = load_tokenizer_with_model_config(SOURCE_DIR, MODEL_JSON_PATH)
 
         # Initialize the optimized model
         logging.info("Initializing the optimized Stacked LLaMA Network.")
