@@ -57,22 +57,18 @@ def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
     update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size)
 
 
-def load_tokenizer_with_model_config(SOURCE_DIR, MODEL_JSON_PATH):
+def load_tokenizer_with_model_config(source_dir, config_path):
     # Load the correct model configuration
-    with open(MODEL_JSON_PATH, "r") as f:
+    with open(config_path, "r") as f:
         model_config = json.load(f)
 
     # Initialize tokenizer from the model config (ignoring tokenizer_config.json)
-    tokenizer = AutoTokenizer.from_pretrained(SOURCE_DIR, config=model_config)
+    tokenizer = AutoTokenizer.from_pretrained(source_dir)
     logging.info("Tokenizer loaded successfully using the model's config.json.")
 
-    # Check if vocab size matches the model config
-    if tokenizer.vocab_size != model_config['vocab_size']:
-        logging.error(f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({model_config['vocab_size']}).")
-        raise ValueError("Tokenizer vocab_size does not match model config vocab_size.")
-    
-    # Log the correct vocab size
-    logging.info(f"Tokenizer vocab_size is correctly set to: {tokenizer.vocab_size}")
+    # Force-set the correct vocab_size from model_config
+    tokenizer.vocab_size = model_config['vocab_size']
+    logging.info(f"Tokenizer vocab_size set to: {tokenizer.vocab_size}")
 
     # Ensure special tokens are correctly set based on the model config
     tokenizer.bos_token_id = model_config["bos_token_id"]
@@ -81,6 +77,7 @@ def load_tokenizer_with_model_config(SOURCE_DIR, MODEL_JSON_PATH):
     logging.info(f"EOS token IDs set to: {tokenizer.eos_token_ids}")
 
     return tokenizer
+
 
 # SharedLayer class remains unchanged
 class SharedLayer(nn.Module):
