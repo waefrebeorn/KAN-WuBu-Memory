@@ -305,7 +305,7 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
 
     for _ in range(max_tokens):
         outputs = model(generated_ids)
-        logits = outputs.logits[:, -1, :]
+        logits = outputs.logits[:, -1, :]  # Get logits for the last generated token
         probs = torch.softmax(logits, dim=-1)
 
         entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).item()
@@ -315,14 +315,14 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
         # Sample a single token and ensure correct dimensions
         token_id = sample_token(probs, top_k, top_p, temperature)
 
-        # Ensure token_id is 2D (batch_size, 1)
-        token_id = token_id.unsqueeze(0) if token_id.dim() == 1 else token_id.unsqueeze(-1)
+        # Ensure token_id is a scalar tensor (1D) with shape (batch_size, 1)
+        token_id = token_id.unsqueeze(0) if token_id.dim() == 1 else token_id
 
-        # Ensure generated_ids and token_id have compatible dimensions
-        token_id = token_id.squeeze(-1)  # Ensure token_id is compatible with generated_ids
+        # Ensure token_id has the shape (batch_size, 1) for concatenation
+        token_id = token_id.unsqueeze(-1)
 
         # Concatenate the generated token to the sequence
-        generated_ids = torch.cat([generated_ids, token_id.unsqueeze(0)], dim=1)
+        generated_ids = torch.cat([generated_ids, token_id], dim=1)
 
         token_log.append({
             "token_id": token_id.item(),  # Log the token
