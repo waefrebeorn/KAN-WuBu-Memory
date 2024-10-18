@@ -181,14 +181,58 @@ class ImprovedResponseQualityManager:
 
         return mean_entropy, std_entropy
 
+# --------------------------- Entropy-Based Temperature and Sampling Adjustment --------------------------- #
+
+def adjust_temperature_based_on_entropy(entropy, low_threshold=2.0, high_threshold=25.0):
+    if entropy > high_threshold:
+        return max(0.7, 1.0 - ((entropy - high_threshold) / 10))  # Lower the temperature
+    elif entropy < low_threshold:
+        return min(1.5, 1.0 + ((low_threshold - entropy) / 10))  # Increase temperature
+    return 1.0  # Default temperature
+
+def adjust_sampling_parameters(entropy, low_k=50, high_k=5, low_p=0.95, high_p=0.8):
+    if entropy > 20.0:
+        return high_k, high_p  # Focused, deterministic sampling
+    elif entropy < 10.0:
+        return low_k, low_p  # More diverse sampling
+    return (int((high_k + low_k) / 2), (high_p + low_p) / 2)
+
+def sample_token(probs, top_k, top_p, temperature):
+    # Apply temperature
+    probs = probs / temperature
+    # Apply top_k and top_p
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # Remove tokens with cumulative probability above the threshold
+    sorted_indices_to_remove = cumulative_probs > top_p
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = False
+
+    indices_to_remove = sorted_indices_to_remove.scatter(
+        dim=1, index=sorted_indices, src=sorted_indices_to_remove
+    )
+    probs[indices_to_remove] = 0.0
+    probs = probs / probs.sum()
+
+    # Top-K
+    if top_k > 0:
+        topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
+        probs = topk_probs
+        indices = topk_indices
+    else:
+        indices = torch.multinomial(probs, num_samples=1)
+
+    return indices.squeeze(0)
+
 # --------------------------- Context Management --------------------------- #
 
-def calculate_cosine_similarity(text1, text2, tokenizer):
+def calculate_cosine_similarity(text1, text2, tokenizer, model):
     tokens1 = tokenizer.encode(text1, return_tensors='pt').to(device)
     tokens2 = tokenizer.encode(text2, return_tensors='pt').to(device)
 
     with torch.no_grad():
-        embeddings1 = model.model.embed_tokens(tokens1)  # Corrected attribute access
+        embeddings1 = model.model.embed_tokens(tokens1)
         embeddings2 = model.model.embed_tokens(tokens2)
 
     embedding1 = embeddings1.mean(dim=1)
@@ -201,110 +245,139 @@ def sanitize_input(user_input):
     sanitized = re.sub(r'[^\w\s.,!?]', '', user_input)
     return sanitized[:500]
 
-def improved_dynamic_context(history, user_input, tokenizer, max_context=MAX_CONTEXT_LENGTH):
-    if not history:
-        prompt = f"User: {user_input}\nModel:"
-        return prompt, [{"user": user_input, "model": ""}]
+def summarize_memories(relevant_memories, tokenizer, max_length=512):
+    # Simple summarization: concatenate and truncate
+    summary = " ".join([f"User said: {entry['user']} Model replied: {entry['model']}" for entry in relevant_memories])
+    if len(summary) > max_length:
+        summary = summary[:max_length]
+    return summary
 
-    # Calculate relevance for each user part in history
+def recall_important_memories(history, user_input, tokenizer, model):
+    # Identify key moments in the history that are relevant to the current input
     relevance_scores = []
     for exchange in history:
         user_part = exchange["user"]
-        relevance = calculate_cosine_similarity(user_input, user_part, tokenizer)
+        relevance = calculate_cosine_similarity(user_input, user_part, tokenizer, model)
         relevance_scores.append(relevance)
-
+    
     # Select top 3 most relevant exchanges
     top_indices = np.argsort(relevance_scores)[-3:]
     selected_history = [history[i] for i in reversed(top_indices) if i < len(history)]
-
-    # Construct the prompt
-    prompt = ""
-    for entry in selected_history:
-        prompt += f"User: {entry['user']}\nModel: {entry['model']}\n"
     
-    # Add the current user input
-    prompt += f"User: {user_input}\nModel:"
+    # Summarize the selected history
+    memory = summarize_memories(selected_history, tokenizer)
+    return memory
 
+def create_base_prompt(user_input, memory):
+    BASE_PROMPT = "This is a conversation between a user and an AI model. The AI maintains a friendly and helpful demeanor without referencing past conversations unless necessary."
+    base_prompt = f"{BASE_PROMPT}\nUser: {user_input}\nAI:"
+    if memory:
+        # Implicitly add memory as context but not part of the system response
+        base_prompt += f"\n[Memory]: {memory}\nAI:"
+    return base_prompt
+
+def improved_dynamic_context(history, user_input, tokenizer, model, max_context=MAX_CONTEXT_LENGTH):
+    if not history:
+        prompt = create_base_prompt(user_input, "")
+        return prompt, [{"user": user_input, "model": ""}]
+    
+    # Recall important memories
+    memory = recall_important_memories(history, user_input, tokenizer, model)
+    
+    # Create the base prompt with memory
+    prompt = create_base_prompt(user_input, memory)
+    
     # Tokenize and truncate if necessary
     tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_context)
     truncated_prompt = tokenizer.decode(tokenized["input_ids"][0], skip_special_tokens=True)
-
+    
     # Update history
     new_history_entry = {"user": user_input, "model": ""}
-    updated_history = selected_history + [new_history_entry]
-
+    updated_history = history + [new_history_entry]
+    
     return truncated_prompt, updated_history
 
 # --------------------------- Response Generation --------------------------- #
 
-def improved_generate_response(input_text, model, tokenizer, history, quality_manager):
-    sanitized_input = sanitize_input(input_text)
-    prompt, updated_history = improved_dynamic_context(history, sanitized_input, tokenizer)
-
+def generate_macroprocessed_response(prompt, model, tokenizer):
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
         truncation=True,
         max_length=MAX_CONTEXT_LENGTH
     ).to(device)
+    input_ids = inputs["input_ids"]
 
-    input_length = len(sanitized_input.split())
-    default_max_tokens = 200
-    max_tokens = min(1024, max(default_max_tokens, input_length * 10))
+    max_tokens = 200  # Adjust as needed
+    generated_ids = input_ids
 
-    outputs = model.generate(
-        inputs["input_ids"],
-        attention_mask=inputs["attention_mask"],
-        max_new_tokens=max_tokens,
-        do_sample=True,
-        temperature=0.8,
-        top_k=50,
-        top_p=0.9,
-        repetition_penalty=1.5,
-        pad_token_id=tokenizer.pad_token_id,
-        num_beams=3,
-        early_stopping=True
-    )
+    token_log = []
 
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    response = response.split("Model:")[-1].strip()
-    response = quality_manager.remove_eot_tokens(response)
+    for _ in range(max_tokens):
+        outputs = model(generated_ids)
+        logits = outputs.logits[:, -1, :]
+        probs = torch.softmax(logits, dim=-1)
+        
+        entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).item()
+        temperature = adjust_temperature_based_on_entropy(entropy)
+        top_k, top_p = adjust_sampling_parameters(entropy)
+        
+        token_id = sample_token(probs, top_k, top_p, temperature)
+        generated_ids = torch.cat([generated_ids, token_id.unsqueeze(0)], dim=-1)
+        
+        token_log.append({
+            "token_id": token_id.item(),
+            "entropy": entropy,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p
+        })
+        
+        # Check for end-of-sequence token
+        if token_id.item() in tokenizer.all_special_ids:
+            break
 
+    # Log token-level details for debugging
+    for log in token_log:
+        logger.info(f"Token: {log['token_id']}, Entropy: {log['entropy']:.2f}, Temperature: {log['temperature']:.2f}, top_k: {log['top_k']}, top_p: {log['top_p']}")
+
+    response = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    response = response.split("AI:")[-1].strip()
+    response = remove_memory_recall(response)
+
+    return response
+
+def remove_memory_recall(response):
+    # Remove memory recall tags from the response
+    response = re.sub(r"\[Memory\]:.*\nAI:", "", response, flags=re.DOTALL)
+    return response.strip()
+
+def improved_generate_response(input_text, model, tokenizer, history, quality_manager):
+    sanitized_input = sanitize_input(input_text)
+    prompt, updated_history = improved_dynamic_context(history, sanitized_input, tokenizer, model)
+    
+    response = generate_macroprocessed_response(prompt, model, tokenizer)
+    
     # Validate response
     is_valid = quality_manager.validate_response(sanitized_input, response)
-
+    
     if not is_valid:
         logger.warning(f"Failed response. Regenerating...")
-        outputs = model.generate(
-            inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_new_tokens=max_tokens,
-            do_sample=True,
-            temperature=0.9,  # Increase temperature for more variety
-            top_k=60,
-            top_p=0.95,
-            repetition_penalty=1.2,
-            pad_token_id=tokenizer.pad_token_id,
-            num_beams=5,  # More beams for diverse generation
-            early_stopping=True
-        )
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-        response = response.split("Model:")[-1].strip()
-        response = quality_manager.remove_eot_tokens(response)
-
-        # Re-validate the regenerated response
+        # Regenerate with adjusted parameters
+        response = generate_macroprocessed_response(prompt, model, tokenizer)
         is_valid = quality_manager.validate_response(sanitized_input, response)
         if not is_valid:
             logger.error("Regenerated response also failed quality checks. Displaying for debugging.")
-            logger.warning(f"Regenerated Failed Response Metrics: Relevance: {quality_manager._calculate_relevance(sanitized_input, response):.2f}, Mean Entropy: {quality_manager._calculate_windowed_entropy(response)[0]:.2f}")
+            mean_entropy, _ = quality_manager._calculate_windowed_entropy(response)
+            relevance = quality_manager._calculate_relevance(sanitized_input, response)
+            logger.warning(f"Regenerated Failed Response Metrics: Relevance: {relevance:.2f}, Mean Entropy: {mean_entropy:.2f}")
             print(f"Regenerated Failed Response (for debugging): {response}")
-            # Optionally, keep the failed response or handle it differently
         else:
             logger.info("Regenerated response passed quality checks.")
-
+    
     # Update the last history entry with the response
     updated_history[-1]["model"] = response
-
+    
     return response, updated_history
 
 # --------------------------- Interactive Loop --------------------------- #
