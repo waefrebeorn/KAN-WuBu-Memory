@@ -77,7 +77,7 @@ def load_tokenizer_with_model_config(source_dir, model_json_path):
         bos_token=special_tokens['bos_token'],
         eos_token=special_tokens['eos_token'],
         pad_token=special_tokens['pad_token'],
-        model_max_length=model_config['max_position_embeddings']
+        model_max_length=model_config['max_position_embeddings'],
         vocab_size=128256
     )
 
