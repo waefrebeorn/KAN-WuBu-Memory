@@ -574,7 +574,9 @@ if __name__ == "__main__":
 
         # Load tokenizer and add special tokens
         logging.info("Loading and adding special tokens to tokenizer...")
-        tokenizer = load_tokenizer_with_special_tokens(TOKENIZER_JSON_PATH, SPECIAL_TOKENS_MAP_PATH, config)
+        # Correct function call with all required arguments
+        tokenizer = load_tokenizer_with_special_tokens(SOURCE_DIR, TOKENIZER_JSON_PATH, SPECIAL_TOKENS_MAP_PATH, config)
+
 
         # Initialize the optimized model
         logging.info("Initializing the optimized Stacked LLaMA Network.")
