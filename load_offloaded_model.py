@@ -5,7 +5,13 @@ import logging
 import re
 import numpy as np
 from math import log2
-from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
+from transformers import (
+    LlamaForCausalLM,
+    AutoTokenizer,
+    LlamaConfig,
+    LogitsProcessorList,
+    RepetitionPenaltyLogitsProcessor,
+)
 
 # --------------------------- Configuration --------------------------- #
 
@@ -68,7 +74,7 @@ def load_offloaded_weights(model, weights_dir):
                 torch.float32: np.float32,
                 torch.int64: np.int64,
                 torch.int32: np.int32,
-                torch.bfloat16: np.float32,  # Note: Loading bfloat16 as float32 first
+                torch.bfloat16: np.float32,  # Loading bfloat16 as float32 first
             }
             expected_dtype = dtype_map.get(param.dtype, np.float32)
             logger.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
@@ -189,41 +195,39 @@ def adjust_sampling_parameters(entropy, low_k=50, high_k=5, low_p=0.95, high_p=0
     logger.debug(f"Intermediate entropy ({entropy:.2f}). Setting top_k to {adjusted_k} and top_p to {adjusted_p}.")
     return adjusted_k, adjusted_p
 
-def sample_token(probs, top_k, top_p, temperature):
+def sample_token(probs, top_k, top_p, temperature, special_tokens_set):
+    """
+    Samples the next token from the probability distribution with top-k and top-p filtering.
+    Additionally, checks for special tokens and prioritizes them if their probability exceeds a threshold.
+    """
     # Apply temperature scaling
-    probs = probs / temperature
+    if temperature != 1.0:
+        probs = probs / temperature
 
-    # Apply top_p (nucleus) filtering
-    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-
-    # Remove tokens with cumulative probability above the threshold
-    sorted_indices_to_remove = cumulative_probs > top_p
-    # Shift the mask right to keep the first token above the threshold
-    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-    sorted_indices_to_remove[..., 0] = False
-
-    indices_to_remove = sorted_indices_to_remove.scatter(
-        dim=1, index=sorted_indices, src=sorted_indices_to_remove
-    )
-    probs[indices_to_remove] = 0.0
-
-    # Handle the case where all probabilities are zero after filtering
-    probs_sum = probs.sum(dim=-1, keepdim=True)
-    probs = torch.where(probs_sum == 0, torch.full_like(probs, 1.0 / probs.size(-1)), probs)
-    probs = probs / probs.sum(dim=-1, keepdim=True)
-
-    # Apply top_k filtering
+    # Apply top-k filtering
     if top_k > 0:
-        topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
-        # Sample from top_k
-        sampled_indices = torch.multinomial(topk_probs, num_samples=1)
-        token_id = topk_indices.gather(1, sampled_indices)
-    else:
-        # If no top_k, sample directly
-        token_id = torch.multinomial(probs, num_samples=1)
-
-    return token_id  # Shape: (batch_size, 1)
+        topk_probs, topk_indices = torch.topk(probs, top_k)
+        probs = torch.zeros_like(probs).scatter_(1, topk_indices, topk_probs)
+    
+    # Apply top-p (nucleus) filtering
+    if top_p > 0.0:
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_probs[cumulative_probs > top_p] = 0
+        probs = torch.zeros_like(probs).scatter_(1, sorted_indices, sorted_probs)
+    
+    # Normalize the probabilities
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    
+    # Prioritize special tokens if their probability exceeds the threshold
+    for token_id in special_tokens_set:
+        if probs[0, token_id] > 0.1:  # Threshold can be adjusted
+            logger.info(f"Prioritizing special token: {SPECIAL_TOKEN_MAP.get(token_id, 'UNKNOWN')}")
+            return torch.tensor([[token_id]]).to(probs.device)
+    
+    # Sample from the distribution
+    token_id = torch.multinomial(probs, num_samples=1)
+    return token_id
 
 # --------------------------- Context Management --------------------------- #
 
@@ -329,7 +333,7 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
         top_k, top_p = adjust_sampling_parameters(entropy)  # Adjust sampling parameters dynamically
 
         # Sample a single token based on adjusted parameters
-        token_id = sample_token(probs, top_k, top_p, temperature)  # Shape: (batch_size, 1)
+        token_id = sample_token(probs, top_k, top_p, temperature, special_tokens_set={tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|eom_id|>")})
 
         # Check token_id shape
         if token_id.dim() != 2 or token_id.size(1) != 1:
@@ -425,14 +429,19 @@ def check_flash_attention():
 def main():
     global model
 
+    # Load model configuration
     config = load_configuration(MODEL_JSON_PATH)
+
+    # Initialize the model
     model = LlamaForCausalLM(config).to(device)
     logger.info("Initialized LLaMA model on GPU.")
 
+    # Load offloaded weights
     load_offloaded_weights(model, WEIGHTS_DIR)
     model.eval()
     logger.info("Model is set to evaluation mode.")
 
+    # Load tokenizer
     tokenizer = load_tokenizer(SOURCE_DIR)
     if tokenizer.pad_token == "<|finetune_right_pad_id|>":
         if tokenizer.pad_token not in tokenizer.get_vocab():
@@ -441,12 +450,14 @@ def main():
         else:
             logger.info("pad_token already exists in the tokenizer's vocabulary. No need to resize embeddings.")
 
+    # Check for Flash Attention
     check_flash_attention()
 
-    global quality_manager
+    # Initialize Response Quality Manager
     quality_manager = ImprovedResponseQualityManager(tokenizer, model)
     logger.info("Model loaded successfully. You can now query the model.")
 
+    # Start interactive query loop
     interactive_query(model, tokenizer, quality_manager)
 
 if __name__ == "__main__":
