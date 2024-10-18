@@ -102,28 +102,6 @@ class ImprovedResponseQualityManager:
         self.model = model
         self.embedding_cache = {}
 
-    def validate_response(self, user_input, model_response):
-        # Remove EOT tokens before further processing
-        clean_response = self.remove_eot_tokens(model_response)
-        
-        relevance = self._calculate_relevance(user_input, clean_response)
-        fluency = self._check_fluency(clean_response)
-        structure = self._check_structure(clean_response)
-        mean_entropy, std_entropy = self._calculate_windowed_entropy(clean_response)
-
-        logger.debug(f"Validation Metrics - Relevance: {relevance:.2f}, Fluency: {fluency}, Structure: {structure}, Mean Entropy: {mean_entropy:.2f}, Std Entropy: {std_entropy:.2f}")
-
-        # Adjust entropy thresholds and ensure relevance compensates for out-of-range entropy
-        if not (self.LOW_ENTROPY_THRESHOLD <= mean_entropy <= self.HIGH_ENTROPY_THRESHOLD):
-            logger.info(f"Response entropy {mean_entropy:.2f} out of range ({self.LOW_ENTROPY_THRESHOLD}, {self.HIGH_ENTROPY_THRESHOLD})")
-            if relevance > 0.5 and fluency:
-                logger.info("High relevance and fluency compensate for entropy out of range.")
-                return True
-            return False
-
-        # Ensure that response is sufficiently relevant or fluent, and has proper structure
-        return (relevance > 0.3 or fluency) and structure
-
     def remove_eot_tokens(self, response):
         for token in self.EOT_TOKENS:
             response = response.rstrip(token)
@@ -215,12 +193,13 @@ def sample_token(probs, top_k, top_p, temperature):
     # Apply temperature scaling
     probs = probs / temperature
 
-    # Apply top_p
+    # Apply top_p (nucleus) filtering
     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
     # Remove tokens with cumulative probability above the threshold
     sorted_indices_to_remove = cumulative_probs > top_p
+    # Shift the mask right to keep the first token above the threshold
     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
     sorted_indices_to_remove[..., 0] = False
 
@@ -234,7 +213,7 @@ def sample_token(probs, top_k, top_p, temperature):
     probs = torch.where(probs_sum == 0, torch.full_like(probs, 1.0 / probs.size(-1)), probs)
     probs = probs / probs.sum(dim=-1, keepdim=True)
 
-    # Top-K
+    # Apply top_k filtering
     if top_k > 0:
         topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
         # Sample from top_k
@@ -338,19 +317,18 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
     generated_ids = input_ids.clone()  # Shape: (batch_size, seq_len)
 
     token_log = []
-    max_regeneration_attempts = 2
-    regeneration_attempts = 0
 
     for _ in range(max_tokens):
         outputs = model(generated_ids)
         logits = outputs.logits[:, -1, :]  # Shape: (batch_size, vocab_size)
         probs = torch.softmax(logits, dim=-1)  # Shape: (batch_size, vocab_size)
 
+        # Calculate token entropy for dynamic adjustment
         entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).mean().item()  # Average entropy across batch
-        temperature = adjust_temperature_based_on_entropy(entropy)
-        top_k, top_p = adjust_sampling_parameters(entropy)
+        temperature = adjust_temperature_based_on_entropy(entropy)  # Adjust temperature dynamically
+        top_k, top_p = adjust_sampling_parameters(entropy)  # Adjust sampling parameters dynamically
 
-        # Sample a single token and ensure correct dimensions
+        # Sample a single token based on adjusted parameters
         token_id = sample_token(probs, top_k, top_p, temperature)  # Shape: (batch_size, 1)
 
         # Check token_id shape
@@ -395,28 +373,6 @@ def improved_generate_response(input_text, model, tokenizer, history, quality_ma
     prompt, updated_history = improved_dynamic_context(history, sanitized_input, tokenizer, model, quality_manager)
 
     response = generate_macroprocessed_response(prompt, model, tokenizer)
-
-    # Validate response
-    is_valid = quality_manager.validate_response(sanitized_input, response)
-
-    regeneration_attempts = 0
-    max_regeneration_attempts = 2
-
-    while not is_valid and regeneration_attempts < max_regeneration_attempts:
-        regeneration_attempts += 1
-        logger.warning(f"Failed response. Regenerating... (Attempt {regeneration_attempts})")
-        response = generate_macroprocessed_response(prompt, model, tokenizer)
-        is_valid = quality_manager.validate_response(sanitized_input, response)
-        if is_valid:
-            logger.info("Regenerated response passed quality checks.")
-            break
-
-    if not is_valid:
-        logger.error("Regenerated response also failed quality checks. Displaying for debugging.")
-        mean_entropy, std_entropy = quality_manager._calculate_windowed_entropy(response)
-        relevance = quality_manager._calculate_relevance(sanitized_input, response)
-        logger.warning(f"Regenerated Failed Response Metrics: Relevance: {relevance:.2f}, Mean Entropy: {mean_entropy:.2f}")
-        print(f"Regenerated Failed Response (for debugging): {response}")
 
     # Update the last history entry with the response
     updated_history[-1]["model"] = response
