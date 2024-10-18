@@ -322,11 +322,17 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
         temperature = adjust_temperature_based_on_entropy(entropy)
         top_k, top_p = adjust_sampling_parameters(entropy)
         
+        # Sample a single token (ensure it's a single token)
         token_id = sample_token(probs, top_k, top_p, temperature)
+
+        # If `token_id` is not scalar, we need to extract the single token
+        if token_id.dim() > 0:
+            token_id = token_id.squeeze(0)  # Ensure single scalar token
+
         generated_ids = torch.cat([generated_ids, token_id.unsqueeze(0)], dim=-1)
         
         token_log.append({
-            "token_id": token_id.item(),
+            "token_id": token_id.item(),  # This should now work correctly
             "entropy": entropy,
             "temperature": temperature,
             "top_k": top_k,
