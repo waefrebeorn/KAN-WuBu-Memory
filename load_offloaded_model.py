@@ -307,28 +307,30 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
         outputs = model(generated_ids)
         logits = outputs.logits[:, -1, :]
         probs = torch.softmax(logits, dim=-1)
-        
+
         entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).item()
         temperature = adjust_temperature_based_on_entropy(entropy)
         top_k, top_p = adjust_sampling_parameters(entropy)
-        
-        # Sample a single token
+
+        # Sample a single token and ensure correct dimensions
         token_id = sample_token(probs, top_k, top_p, temperature)
-        
-        generated_ids = torch.cat([generated_ids, token_id.unsqueeze(0)], dim=-1)
-        
+
+        # Reshape token_id to be 2D (batch_size, 1) so it can be concatenated to generated_ids
+        token_id = token_id.unsqueeze(-1)  # Make it 2D: (batch_size, 1)
+
+        generated_ids = torch.cat([generated_ids, token_id], dim=-1)  # Concatenate along sequence length
+
         token_log.append({
-            "token_id": token_id.item(),  # This will now work correctly
+            "token_id": token_id.item(),  # Log the token
             "entropy": entropy,
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p
         })
-    
+
         # Check for end-of-sequence token
         if token_id.item() in tokenizer.all_special_ids:
             break
-    
 
     # Log token-level details for debugging
     for log in token_log:
