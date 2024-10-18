@@ -13,6 +13,8 @@ from transformers import (
     RepetitionPenaltyLogitsProcessor,
 )
 import torch.nn.functional as F
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # --------------------------- Configuration --------------------------- #
 
@@ -55,7 +57,13 @@ SPECIAL_TOKEN_MAP = {
     128007: "<|end_header_id|>",
     128008: "<|eom_id|>",
     128009: "<|eot_id|>",
-    128010: "<|python_tag|>"
+    128010: "<|python_tag|>",
+    128011: "<|analytical_start|>",
+    128012: "<|analytical_end|>",
+    128013: "<|creative_start|>",
+    128014: "<|creative_end|>",
+    128015: "<|factual_start|>",
+    128016: "<|factual_end|>",
 }
 
 # --------------------------- Model Loading --------------------------- #
@@ -70,11 +78,7 @@ def load_configuration(config_path):
 def load_tokenizer_with_special_tokens(source_dir):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
     special_tokens_dict = {
-        'additional_special_tokens': [
-            "<|begin_of_text|>", "<|end_of_text|>", "<|reserved_special_token_0|>",
-            "<|reserved_special_token_1|>", "<|finetune_right_pad_id|>", "<|reserved_special_token_2|>",
-            "<|start_header_id|>", "<|end_header_id|>", "<|eom_id|>", "<|eot_id|>", "<|python_tag|>"
-        ]
+        'additional_special_tokens': list(SPECIAL_TOKEN_MAP.values())
     }
 
     tokenizer.add_special_tokens(special_tokens_dict)
@@ -119,13 +123,78 @@ def load_offloaded_weights(model, weights_dir):
 
     logger.info("All available weights loaded successfully.")
 
+# --------------------------- Context Management --------------------------- #
+
+class AdvancedContextManager:
+    def __init__(self, model, tokenizer, max_history=10, summary_threshold=5):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.conversation_history = []
+        self.max_history = max_history
+        self.summary_threshold = summary_threshold
+        self.tfidf_vectorizer = TfidfVectorizer()
+        self.persona_snippets = {
+            "formal": "You are a formal and professional AI assistant.",
+            "casual": "You are a friendly and casual AI assistant.",
+            "academic": "You are an academic AI assistant with a focus on scientific accuracy.",
+            "creative": "You are a creative and imaginative AI assistant."
+        }
+
+    def update_context(self, user_input, model_output):
+        self.conversation_history.append((user_input, model_output))
+        if len(self.conversation_history) > self.max_history:
+            self.summarize_older_context()
+
+    def summarize_older_context(self):
+        older_context = self.conversation_history[:-self.summary_threshold]
+        summary_prompt = "Summarize the following conversation concisely, capturing key points and context:\n"
+        for user, ai in older_context:
+            summary_prompt += f"User: {user}\nAI: {ai}\n"
+        
+        summary_input = self.tokenizer(summary_prompt, return_tensors="pt", truncation=True, max_length=1024).to(self.model.device)
+        summary_output = self.model.generate(summary_input.input_ids, max_length=200, num_return_sequences=1, temperature=0.7)
+        summary = self.tokenizer.decode(summary_output[0], skip_special_tokens=True)
+        
+        self.conversation_history = [("SUMMARY", summary)] + self.conversation_history[-self.summary_threshold:]
+
+    def get_relevant_context(self, current_input, top_k=3):
+        if not self.conversation_history:
+            return ""
+
+        context_texts = [f"{user} {ai}" for user, ai in self.conversation_history]
+        tfidf_matrix = self.tfidf_vectorizer.fit_transform(context_texts + [current_input])
+        cosine_similarities = cosine_similarity(tfidf_matrix[-1], tfidf_matrix[:-1]).flatten()
+        most_relevant_indices = cosine_similarities.argsort()[-top_k:][::-1]
+        
+        relevant_context = ""
+        for idx in most_relevant_indices:
+            user, ai = self.conversation_history[idx]
+            relevant_context += f"User: {user}\nAI: {ai}\n\n"
+        
+        return relevant_context.strip()
+
+    def select_persona_context(self, user_input):
+        if any(word in user_input.lower() for word in ["academic", "scientific", "research"]):
+            return self.persona_snippets["academic"]
+        elif any(word in user_input.lower() for word in ["creative", "imagine", "story"]):
+            return self.persona_snippets["creative"]
+        elif any(word in user_input.lower() for word in ["formal", "professional", "business"]):
+            return self.persona_snippets["formal"]
+        else:
+            return self.persona_snippets["casual"]
+
+    def get_dynamic_prompt(self, user_input):
+        relevant_context = self.get_relevant_context(user_input)
+        persona_context = self.select_persona_context(user_input)
+        return f"{persona_context}\n\nRelevant conversation history:\n{relevant_context}\n\nCurrent user input: {user_input}\n\nAI:"
+
 # --------------------------- Response Quality Management --------------------------- #
 
 class ImprovedResponseQualityManager:
-    LOW_ENTROPY_THRESHOLD = 1.5  # Loosened from 2.0
-    HIGH_ENTROPY_THRESHOLD = 25.0  # Reduced from 35.0
+    LOW_ENTROPY_THRESHOLD = 1.5
+    HIGH_ENTROPY_THRESHOLD = 25.0
     WINDOW_SIZE = 50
-    EOT_TOKENS = ['�', '\ufffd']  # Add more EOT tokens as needed
+    EOT_TOKENS = ['�', '\ufffd']
 
     def __init__(self, tokenizer, model):
         self.tokenizer = tokenizer
@@ -220,119 +289,32 @@ def adjust_sampling_parameters(entropy, low_k=50, high_k=5, low_p=0.95, high_p=0
     return adjusted_k, adjusted_p
 
 def sample_token(probs, top_k, top_p, temperature, special_tokens_set):
-    """
-    Samples the next token from the probability distribution with top-k and top-p filtering.
-    Additionally, checks for special tokens and prioritizes them if their probability exceeds a threshold.
-    """
-    # Apply temperature scaling
     if temperature != 1.0:
         probs = probs / temperature
 
-    # Apply top-k filtering
     if top_k > 0:
         topk_probs, topk_indices = torch.topk(probs, top_k)
         probs = torch.zeros_like(probs).scatter_(1, topk_indices, topk_probs)
     
-    # Apply top-p (nucleus) filtering
     if top_p > 0.0:
         sorted_probs, sorted_indices = torch.sort(probs, descending=True)
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
         sorted_probs[cumulative_probs > top_p] = 0
         probs = torch.zeros_like(probs).scatter_(1, sorted_indices, sorted_probs)
     
-    # Normalize the probabilities
     probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-10)
     
-    # Prioritize special tokens if their probability exceeds the threshold
     for token_id in special_tokens_set:
         if probs[0, token_id] > 0.1:  # Threshold can be adjusted
             logger.info(f"Prioritizing special token: {SPECIAL_TOKEN_MAP.get(token_id, 'UNKNOWN')}")
             return torch.tensor([[token_id]]).to(probs.device)
     
-    # Sample from the distribution
     token_id = torch.multinomial(probs, num_samples=1)
     return token_id
 
-# --------------------------- Context Management --------------------------- #
-
-def calculate_cosine_similarity(text1, text2, tokenizer, model, embedding_cache):
-    key = (text1, text2)
-    if key in embedding_cache:
-        embedding1, embedding2 = embedding_cache[key]
-    else:
-        tokens1 = tokenizer.encode(text1, return_tensors='pt').to(device)
-        tokens2 = tokenizer.encode(text2, return_tensors='pt').to(device)
-
-        with torch.no_grad():
-            embeddings1 = model.model.embed_tokens(tokens1).mean(dim=1)
-            embeddings2 = model.model.embed_tokens(tokens2).mean(dim=1)
-
-        embedding1 = embeddings1
-        embedding2 = embeddings2
-        embedding_cache[key] = (embedding1, embedding2)
-
-    cosine_sim = torch.nn.functional.cosine_similarity(embedding1, embedding2).item()
-    return cosine_sim
-
-def sanitize_input(user_input):
-    sanitized = re.sub(r'[^\w\s.,!?]', '', user_input)
-    return sanitized[:500]
-
-def summarize_memories(relevant_memories, tokenizer, max_length=512):
-    # Simple summarization: concatenate and truncate
-    summary = " ".join([f"User said: {entry['user']} Model replied: {entry['model']}" for entry in relevant_memories])
-    if len(summary) > max_length:
-        summary = summary[:max_length]
-    return summary
-
-def recall_important_memories(history, user_input, tokenizer, model, quality_manager):
-    # Identify key moments in the history that are relevant to the current input
-    relevance_scores = []
-    for exchange in history:
-        user_part = exchange["user"]
-        relevance = calculate_cosine_similarity(user_input, user_part, tokenizer, model, embedding_cache=quality_manager.embedding_cache)
-        relevance_scores.append(relevance)
-    
-    # Select top 3 most relevant exchanges
-    top_indices = np.argsort(relevance_scores)[-3:]
-    selected_history = [history[i] for i in reversed(top_indices) if i < len(history)]
-    
-    # Summarize the selected history
-    memory = summarize_memories(selected_history, tokenizer)
-    return memory
-
-def create_base_prompt(user_input, memory):
-    BASE_PROMPT = "This is a conversation between a user and an AI model. The AI maintains a friendly and helpful demeanor without referencing past conversations unless necessary."
-    base_prompt = f"{BASE_PROMPT}\nUser: {user_input}\nAI:"
-    if memory:
-        # Implicitly add memory as context but not part of the system response
-        base_prompt += f"\n[Memory]: {memory}\nAI:"
-    return base_prompt
-
-def improved_dynamic_context(history, user_input, tokenizer, model, quality_manager, max_context=MAX_CONTEXT_LENGTH):
-    if not history:
-        prompt = create_base_prompt(user_input, "")
-        return prompt, [{"user": user_input, "model": ""}]
-    
-    # Recall important memories
-    memory = recall_important_memories(history, user_input, tokenizer, model, quality_manager)
-    
-    # Create the base prompt with memory
-    prompt = create_base_prompt(user_input, memory)
-    
-    # Tokenize and truncate if necessary, prioritize recent exchanges
-    tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_context)
-    truncated_prompt = tokenizer.decode(tokenized["input_ids"][0], skip_special_tokens=True)
-    
-    # Update history
-    new_history_entry = {"user": user_input, "model": ""}
-    updated_history = history + [new_history_entry]
-    
-    return truncated_prompt, updated_history
-
 # --------------------------- Response Generation --------------------------- #
 
-def generate_macroprocessed_response(prompt, model, tokenizer):
+def generate_macroprocessed_response(prompt, model, tokenizer, quality_manager):
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
@@ -341,51 +323,44 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
     ).to(device)
     input_ids = inputs["input_ids"]
 
-    max_tokens = 200  # Adjust as needed
-    generated_ids = input_ids.clone()  # Shape: (batch_size, seq_len)
+    max_tokens = 2048  # Adjust as needed
+    generated_ids = input_ids.clone()
 
     token_log = []
 
     for _ in range(max_tokens):
         outputs = model(generated_ids)
-        logits = outputs.logits[:, -1, :]  # Shape: (batch_size, vocab_size)
-        probs = torch.softmax(logits, dim=-1)  # Shape: (batch_size, vocab_size)
+        logits = outputs.logits[:, -1, :]
+        probs = torch.softmax(logits, dim=-1)
 
-        # Calculate token entropy for dynamic adjustment
-        entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).mean().item()  # Average entropy across batch
-        temperature = adjust_temperature_based_on_entropy(entropy)  # Adjust temperature dynamically
-        top_k, top_p = adjust_sampling_parameters(entropy)  # Adjust sampling parameters dynamically
+        entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).mean().item()
+        temperature = adjust_temperature_based_on_entropy(entropy)
+        top_k, top_p = adjust_sampling_parameters(entropy)
 
-        # Sample a single token based on adjusted parameters
         token_id = sample_token(probs, top_k, top_p, temperature, special_tokens_set={
             tokenizer.eos_token_id, 
             tokenizer.convert_tokens_to_ids("<|eom_id|>"),
             tokenizer.convert_tokens_to_ids("<|eot_id|>")
         })
 
-        # Check token_id shape
         if token_id.dim() != 2 or token_id.size(1) != 1:
             logger.error(f"Unexpected token_id shape: {token_id.shape}")
             raise ValueError(f"token_id has incorrect shape: {token_id.shape}")
 
-        # Concatenate the generated token to the sequence
-        generated_ids = torch.cat([generated_ids, token_id], dim=1)  # Shape: (batch_size, seq_len +1)
+        generated_ids = torch.cat([generated_ids, token_id], dim=1)
 
-        # Log the token and related info
         token_log.append({
-            "token_id": token_id.item(),  # Assuming batch_size=1
+            "token_id": token_id.item(),
             "entropy": entropy,
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p
         })
 
-        # Check for end-of-sequence tokens
         if token_id.item() in tokenizer.all_special_ids:
             logger.info(f"End-of-sequence token detected: {SPECIAL_TOKEN_MAP.get(token_id.item(), 'UNKNOWN')}")
             break
 
-    # Log token-level details for debugging
     for log_entry in token_log:
         logger.info(f"Token: {log_entry['token_id']}, Entropy: {log_entry['entropy']:.2f}, "
                     f"Temperature: {log_entry['temperature']:.2f}, top_k: {log_entry['top_k']}, top_p: {log_entry['top_p']}")
@@ -397,27 +372,28 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
     return response
 
 def remove_memory_recall(response):
-    # Remove memory recall tags from the response
     response = re.sub(r"\[Memory\]:.*\nAI:", "", response, flags=re.DOTALL)
     return response.strip()
 
-def improved_generate_response(input_text, model, tokenizer, history, quality_manager):
+def improved_generate_response(input_text, model, tokenizer, history, quality_manager, context_manager):
     sanitized_input = sanitize_input(input_text)
-    prompt, updated_history = improved_dynamic_context(history, sanitized_input, tokenizer, model, quality_manager)
+    prompt = context_manager.get_dynamic_prompt(sanitized_input)
 
-    response = generate_macroprocessed_response(prompt, model, tokenizer)
+    response = generate_macroprocessed_response(prompt, model, tokenizer, quality_manager)
 
-    # Update the last history entry with the response
-    updated_history[-1]["model"] = response
+    context_manager.update_context(sanitized_input, response)
 
-    return response, updated_history
+    return response, context_manager.conversation_history
+
+def sanitize_input(user_input):
+    sanitized = re.sub(r'[^\w\s.,!?]', '', user_input)
+    return sanitized[:500]
 
 # --------------------------- Interactive Loop --------------------------- #
 
-def interactive_query(model, tokenizer, quality_manager):
+def interactive_query(model, tokenizer, quality_manager, context_manager):
     print("\n--- LLaMA Instruct Model Interactive Query ---")
     print("Type 'exit' to quit.\n")
-    history = []
 
     while True:
         try:
@@ -434,12 +410,13 @@ def interactive_query(model, tokenizer, quality_manager):
             print("Please enter a valid query.")
             continue
 
-        response, history = improved_generate_response(
+        response, _ = improved_generate_response(
             user_input,
             model,
             tokenizer,
-            history,
-            quality_manager
+            context_manager.conversation_history,
+            quality_manager,
+            context_manager
         )
 
         print(f"Model Response: {response}\n")
@@ -485,10 +462,14 @@ def main():
 
     # Initialize Response Quality Manager
     quality_manager = ImprovedResponseQualityManager(tokenizer, model)
+    
+    # Initialize Context Manager
+    context_manager = AdvancedContextManager(model, tokenizer)
+    
     logger.info("Model loaded successfully. You can now query the model.")
 
     # Start interactive query loop
-    interactive_query(model, tokenizer, quality_manager)
+    interactive_query(model, tokenizer, quality_manager, context_manager)
 
 if __name__ == "__main__":
     main()
