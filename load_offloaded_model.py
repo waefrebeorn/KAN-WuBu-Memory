@@ -310,8 +310,11 @@ def generate_response(input_text, model, tokenizer, history, quality_manager, ma
     logger.info(f"Response time: {response_time:.2f}s, Valid: {is_valid}")
 
     if not is_valid:
-        logger.warning("Response failed quality checks. Regenerating...")
-        # Attempt regeneration once
+        logger.warning("Response failed quality checks. Showing failed response for debugging:")
+        logger.warning(f"Failed Response: {response}")
+        print(f"Failed Response: {response}")
+
+        # Attempt regeneration once for debugging purposes
         outputs = model.generate(
             inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
@@ -333,12 +336,10 @@ def generate_response(input_text, model, tokenizer, history, quality_manager, ma
         # Re-validate the regenerated response
         is_valid = quality_manager.validate_response(sanitized_input, response)
         if not is_valid:
-            logger.error("Regenerated response also failed quality checks.")
-            response = "I'm sorry, but I couldn't provide a satisfactory response to that."
-            history[-1] = f"User: {sanitized_input}\nModel: {response}"
+            logger.error("Regenerated response also failed quality checks. Displaying for debugging.")
+            print(f"Regenerated Failed Response: {response}")
         else:
             response = adjust_tone(sanitized_input, response)
-
     else:
         response = adjust_tone(sanitized_input, response)
 
