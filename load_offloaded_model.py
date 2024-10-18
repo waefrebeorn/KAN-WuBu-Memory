@@ -343,8 +343,7 @@ def load_tokenizer_with_special_tokens(source_dir, tokenizer_json_path, special_
     tokenizer.add_special_tokens({'additional_special_tokens': additional_special_tokens})
     logging.info(f"Added {len(additional_special_tokens)} additional special tokens.")
     
-    # Update vocab_size
-    tokenizer.vocab_size = 128256
+    
     logging.info(f"Tokenizer vocab_size set to: {tokenizer.vocab_size}")
     
     # Verify special tokens
