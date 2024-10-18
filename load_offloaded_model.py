@@ -32,7 +32,20 @@ def load_configuration(model_json_path):
 
 # Use AutoTokenizer instead of LlamaTokenizer to resolve class conflicts
 def load_tokenizer(source_dir):
-    return AutoTokenizer.from_pretrained(source_dir)
+    tokenizer = AutoTokenizer.from_pretrained(source_dir)
+    
+    # **Key Modification Start**
+    # Assign '<|finetune_right_pad_id|>' as pad_token
+    finetune_pad_token = "<|finetune_right_pad_id|>"
+    if finetune_pad_token in tokenizer.get_vocab():
+        tokenizer.pad_token = finetune_pad_token
+        logger.info(f"Assigned '{finetune_pad_token}' as pad_token.")
+    else:
+        # If the finetune_pad_token is not in the vocab, add it
+        tokenizer.add_special_tokens({'pad_token': finetune_pad_token})
+        logger.info(f"Added new pad_token '{finetune_pad_token}'.")
+    
+    return tokenizer
 
 # Load the model configuration
 logger.info(f"Loading model configuration from: {MODEL_JSON_PATH}")
@@ -90,6 +103,22 @@ logger.info("Model weights loaded successfully and moved to GPU.")
 logger.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
 tokenizer = load_tokenizer(SOURCE_DIR)
 
+# **Key Modification End**
+
+# **Set pad_token_id based on the tokenizer's pad_token**
+pad_token_id = tokenizer.pad_token_id
+logger.info(f"pad_token_id set to: {pad_token_id}")
+
+# **Optional: Resize Model Embeddings if a New Pad Token was Added**
+# This step is necessary only if you added a new pad_token.
+# If pad_token was set to an existing token, this step can be skipped.
+if tokenizer.pad_token == "<|finetune_right_pad_id|>":
+    if tokenizer.pad_token not in tokenizer.get_vocab():
+        model.resize_token_embeddings(len(tokenizer))
+        logger.info("Resized model token embeddings to accommodate the new pad_token.")
+    else:
+        logger.info("pad_token already exists in the tokenizer's vocabulary. No need to resize embeddings.")
+
 # Implement the ResponseQualityManager with metrics and corrective strategies
 class ResponseQualityManager:
     def __init__(self, kan_model, tokenizer):
@@ -132,7 +161,7 @@ class ResponseQualityManager:
 quality_manager = ResponseQualityManager(model, tokenizer)
 
 # Updated generation logic to handle context better and avoid repetitive responses
-def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
+def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128004, history=[], context_limit=512):
     # Clean the history to avoid redundant prompts
     history = [line for line in history if line.strip()]  # Remove empty lines
 
@@ -140,7 +169,13 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
 
     # Prepare inputs for the model
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to(device)
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        padding=True,            # Padding is now supported
+        truncation=True,
+        max_length=context_limit
+    ).to(device)
 
     # Generate the response
     with torch.no_grad():
@@ -193,12 +228,24 @@ def user_input_loop(model, tokenizer):
             print("Please enter a valid query.")
             continue
 
-        response, history = generate_response(user_input, model, tokenizer, history=history)
+        response, history = generate_response(
+            user_input,
+            model,
+            tokenizer,
+            pad_token_id=pad_token_id,
+            history=history
+        )
 
         # Evaluate response quality
         if not quality_manager.evaluate_response(user_input, response):
             logger.warning("Generated response failed quality checks. Regenerating...")
-            response, history = generate_response(user_input, model, tokenizer, history=history)
+            response, history = generate_response(
+                user_input,
+                model,
+                tokenizer,
+                pad_token_id=pad_token_id,
+                history=history
+            )
 
         print(f"Model Response: {response}")
 
