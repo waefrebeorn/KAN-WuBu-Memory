@@ -12,6 +12,7 @@ from transformers import (
     LogitsProcessorList,
     RepetitionPenaltyLogitsProcessor,
 )
+import torch.nn.functional as F
 
 # --------------------------- Configuration --------------------------- #
 
@@ -41,6 +42,22 @@ if device.type != "cuda":
 
 logger.info(f"Using device: {device}")
 
+# --------------------------- Token Definitions --------------------------- #
+
+SPECIAL_TOKEN_MAP = {
+    128000: "<|begin_of_text|>",
+    128001: "<|end_of_text|>",
+    128002: "<|reserved_special_token_0|>",
+    128003: "<|reserved_special_token_1|>",
+    128004: "<|finetune_right_pad_id|>",
+    128005: "<|reserved_special_token_2|>",
+    128006: "<|start_header_id|>",
+    128007: "<|end_header_id|>",
+    128008: "<|eom_id|>",
+    128009: "<|eot_id|>",
+    128010: "<|python_tag|>"
+}
+
 # --------------------------- Model Loading --------------------------- #
 
 def load_configuration(config_path):
@@ -50,17 +67,23 @@ def load_configuration(config_path):
     logger.info(f"Model configuration loaded from {config_path}")
     return config
 
-def load_tokenizer(source_dir):
+def load_tokenizer_with_special_tokens(source_dir):
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
-    finetune_pad_token = "<|finetune_right_pad_id|>"
+    special_tokens_dict = {
+        'additional_special_tokens': [
+            "<|begin_of_text|>", "<|end_of_text|>", "<|reserved_special_token_0|>",
+            "<|reserved_special_token_1|>", "<|finetune_right_pad_id|>", "<|reserved_special_token_2|>",
+            "<|start_header_id|>", "<|end_header_id|>", "<|eom_id|>", "<|eot_id|>", "<|python_tag|>"
+        ]
+    }
 
-    if finetune_pad_token not in tokenizer.get_vocab():
-        tokenizer.add_special_tokens({'pad_token': finetune_pad_token})
-        logger.info(f"Added pad_token: '{finetune_pad_token}' to tokenizer.")
+    tokenizer.add_special_tokens(special_tokens_dict)
+    if "<|finetune_right_pad_id|>" in tokenizer.get_vocab():
+        tokenizer.pad_token = "<|finetune_right_pad_id|>"
+        logger.info(f"Assigned '<|finetune_right_pad_id|>' as pad_token.")
     else:
-        tokenizer.pad_token = finetune_pad_token
-        logger.info(f"Assigned existing '{finetune_pad_token}' as pad_token.")
-
+        logger.warning(f"'<|finetune_right_pad_id|>' not found in tokenizer vocabulary.")
+    
     return tokenizer
 
 def load_offloaded_weights(model, weights_dir):
@@ -88,6 +111,7 @@ def load_offloaded_weights(model, weights_dir):
 
                 with torch.no_grad():
                     param.data.copy_(loaded_tensor.view_as(param))
+                logger.debug(f"Successfully loaded {file_name} into {name}")
             except Exception as e:
                 logger.error(f"Error loading {file_name} into {name}: {e}")
         else:
@@ -217,7 +241,7 @@ def sample_token(probs, top_k, top_p, temperature, special_tokens_set):
         probs = torch.zeros_like(probs).scatter_(1, sorted_indices, sorted_probs)
     
     # Normalize the probabilities
-    probs = probs / probs.sum(dim=-1, keepdim=True)
+    probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-10)
     
     # Prioritize special tokens if their probability exceeds the threshold
     for token_id in special_tokens_set:
@@ -333,7 +357,11 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
         top_k, top_p = adjust_sampling_parameters(entropy)  # Adjust sampling parameters dynamically
 
         # Sample a single token based on adjusted parameters
-        token_id = sample_token(probs, top_k, top_p, temperature, special_tokens_set={tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|eom_id|>")})
+        token_id = sample_token(probs, top_k, top_p, temperature, special_tokens_set={
+            tokenizer.eos_token_id, 
+            tokenizer.convert_tokens_to_ids("<|eom_id|>"),
+            tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        })
 
         # Check token_id shape
         if token_id.dim() != 2 or token_id.size(1) != 1:
@@ -352,8 +380,9 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
             "top_p": top_p
         })
 
-        # Check for end-of-sequence token
+        # Check for end-of-sequence tokens
         if token_id.item() in tokenizer.all_special_ids:
+            logger.info(f"End-of-sequence token detected: {SPECIAL_TOKEN_MAP.get(token_id.item(), 'UNKNOWN')}")
             break
 
     # Log token-level details for debugging
@@ -441,14 +470,15 @@ def main():
     model.eval()
     logger.info("Model is set to evaluation mode.")
 
-    # Load tokenizer
-    tokenizer = load_tokenizer(SOURCE_DIR)
-    if tokenizer.pad_token == "<|finetune_right_pad_id|>":
-        if tokenizer.pad_token not in tokenizer.get_vocab():
-            model.resize_token_embeddings(len(tokenizer))
-            logger.info("Resized model token embeddings to accommodate the new pad_token.")
-        else:
-            logger.info("pad_token already exists in the tokenizer's vocabulary. No need to resize embeddings.")
+    # Load tokenizer with special tokens
+    tokenizer = load_tokenizer_with_special_tokens(SOURCE_DIR)
+
+    # Resize token embeddings if special tokens were added
+    if tokenizer.pad_token and tokenizer.pad_token not in tokenizer.get_vocab():
+        model.resize_token_embeddings(len(tokenizer))
+        logger.info("Resized model token embeddings to accommodate the new pad_token.")
+    else:
+        logger.info("pad_token already exists in the tokenizer's vocabulary. No need to resize embeddings.")
 
     # Check for Flash Attention
     check_flash_attention()
