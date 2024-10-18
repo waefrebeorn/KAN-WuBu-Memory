@@ -15,6 +15,13 @@ MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Set device to GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if device.type != "cuda":
+    logger.error("CUDA-enabled GPU not found. Please ensure a compatible GPU is available.")
+    raise SystemExit("CUDA-enabled GPU not found.")
 
 # Load the configuration from the JSON file
 def load_configuration(model_json_path):
@@ -28,19 +35,19 @@ def load_tokenizer(source_dir):
     return AutoTokenizer.from_pretrained(source_dir)
 
 # Load the model configuration
-logging.info(f"Loading model configuration from: {MODEL_JSON_PATH}")
+logger.info(f"Loading model configuration from: {MODEL_JSON_PATH}")
 config = load_configuration(MODEL_JSON_PATH)
 
-# Initialize an empty model based on the configuration
-model = LlamaForCausalLM(config)
-logging.info("Initialized empty LLaMA model.")
+# Initialize an empty model based on the configuration and move it to GPU
+model = LlamaForCausalLM(config).to(device)
+logger.info("Initialized empty LLaMA model on GPU.")
 
-# Load the offloaded weights from the `.dat` files
+# Load the offloaded weights from the `.dat` files directly to GPU
 def load_dat_file(file_path, dtype):
     with open(file_path, 'rb') as f:
         tensor_data = np.fromfile(f, dtype=dtype)
-    loaded_tensor = torch.tensor(tensor_data)
-    
+    loaded_tensor = torch.from_numpy(tensor_data).to(device)
+
     # If dtype was mapped to float32 for bfloat16 compatibility, convert back
     if dtype == np.float32 and "bfloat16" in file_path:
         loaded_tensor = loaded_tensor.to(torch.bfloat16)
@@ -60,25 +67,27 @@ def load_offloaded_weights(model, weights_dir):
                 torch.bfloat16: np.float32,
             }
             expected_dtype = dtype_map.get(param.dtype, np.float32)
-            logging.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
+            logger.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
             loaded_tensor = load_dat_file(file_path, expected_dtype).view_as(param)
 
             if param.dtype == torch.bfloat16:
                 loaded_tensor = loaded_tensor.to(torch.bfloat16)
 
-            param.data.copy_(loaded_tensor.to("cuda"))
+            with torch.no_grad():
+                param.data.copy_(loaded_tensor)
         else:
-            logging.warning(f"Warning: {file_name} not found in offloaded directory.")
+            logger.warning(f"Warning: {file_name} not found in offloaded directory.")
 
 # Load the weights into the model
 load_offloaded_weights(model, WEIGHTS_DIR)
 
-# Move the model to GPU for inference
-model.to('cuda')
+# Ensure the model is in evaluation mode and on GPU
 model.eval()
+model.to(device)
+logger.info("Model weights loaded successfully and moved to GPU.")
 
-# Use AutoTokenizer to handle any tokenizer class discrepancies
-logging.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
+# Load tokenizer
+logger.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
 tokenizer = load_tokenizer(SOURCE_DIR)
 
 # Implement the ResponseQualityManager with metrics and corrective strategies
@@ -111,7 +120,7 @@ class ResponseQualityManager:
             return True
         if len(response.split()) < 3:
             return True
-        if response.count('.') / len(response.split()) > 0.5:
+        if response.count('.') / max(len(response.split()), 1) > 0.5:
             return True
         return False
 
@@ -122,18 +131,17 @@ class ResponseQualityManager:
 # Quality Manager instance for response evaluation
 quality_manager = ResponseQualityManager(model, tokenizer)
 
-
 # Updated generation logic to handle context better and avoid repetitive responses
 def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128001, history=[], context_limit=512):
     # Clean the history to avoid redundant prompts
     history = [line for line in history if line.strip()]  # Remove empty lines
-    
+
     # Create a simplified context prompt from the last few exchanges
     prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
-    
+
     # Prepare inputs for the model
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to("cuda")
-    
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=context_limit).to(device)
+
     # Generate the response
     with torch.no_grad():
         outputs = model.generate(
@@ -151,34 +159,49 @@ def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_toke
 
     # Decode the response and format it properly
     response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    
+
     # Ensure clean history management and context length control
     cleaned_response = response.split("User:")[-1].strip()  # Remove any overlap
     cleaned_response = re.sub(r'\s+', ' ', cleaned_response)  # Clean excess whitespace
-    
+
     # Append the cleaned response to history
     history.append(f"User: {input_text}\nModel: {cleaned_response}")
-    
+
     # Trim history to prevent excessive accumulation
     if len(history) > 6:
         history = history[-6:]
 
     return cleaned_response, history
-    
+
 # Updated user input loop to handle context better
 def user_input_loop(model, tokenizer):
     print("\n--- LLaMA Instruct Model Interactive Query ---")
     print("Type 'exit' to quit.")
     history = []  # Initialize a history buffer to keep track of conversation
     while True:
-        user_input = input("\nEnter your query: ")
+        try:
+            user_input = input("\nEnter your query: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting...")
+            break
+
         if user_input.lower() == 'exit':
             print("Exiting...")
             break
+
+        if not user_input.strip():
+            print("Please enter a valid query.")
+            continue
+
         response, history = generate_response(user_input, model, tokenizer, history=history)
+
+        # Evaluate response quality
+        if not quality_manager.evaluate_response(user_input, response):
+            logger.warning("Generated response failed quality checks. Regenerating...")
+            response, history = generate_response(user_input, model, tokenizer, history=history)
+
         print(f"Model Response: {response}")
 
 # Start the interactive query loop with the refined response generation
-logging.info("Model loaded successfully. You can now query the model.")
+logger.info("Model loaded successfully. You can now query the model.")
 user_input_loop(model, tokenizer)
-
