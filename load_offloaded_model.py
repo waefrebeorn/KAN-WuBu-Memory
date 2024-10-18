@@ -3,7 +3,6 @@ import torch
 import json
 import logging
 import re
-import time
 import numpy as np
 from math import log2
 from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
@@ -201,19 +200,36 @@ def sample_token(probs, top_k, top_p, temperature):
     # Apply temperature scaling
     probs = probs / temperature
 
-    # Apply top_k sampling (if top_k > 0)
+    # Apply top_k and top_p
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # Remove tokens with cumulative probability above the threshold
+    sorted_indices_to_remove = cumulative_probs > top_p
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = False
+
+    indices_to_remove = sorted_indices_to_remove.scatter(
+        dim=1, index=sorted_indices, src=sorted_indices_to_remove
+    )
+    probs[indices_to_remove] = 0.0
+
+    # Handle the case where all probabilities are zero after filtering
+    probs_sum = probs.sum(dim=-1, keepdim=True)
+    probs = torch.where(probs_sum == 0, torch.full_like(probs, 1.0 / probs.size(-1)), probs)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+
+    # Top-K
     if top_k > 0:
         topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
-        cumulative_probs = torch.cumsum(topk_probs, dim=-1)
-        topk_indices_to_remove = cumulative_probs > top_p
-        topk_probs[topk_indices_to_remove] = 0.0
-        topk_probs /= topk_probs.sum()
-        indices = torch.multinomial(topk_probs, num_samples=1)
-        return topk_indices[indices]  # Return the index (token) from the top_k sampling
+        # Sample from top_k
+        sampled_indices = torch.multinomial(topk_probs, num_samples=1)
+        token_id = topk_indices.gather(1, sampled_indices)
     else:
-        # If no top_k, do multinomial sampling directly from probabilities
-        return torch.multinomial(probs, num_samples=1).squeeze(0)  # Return single token
+        # If no top_k, sample directly
+        token_id = torch.multinomial(probs, num_samples=1)
 
+    return token_id  # Shape: (batch_size, 1)
 
 # --------------------------- Context Management --------------------------- #
 
@@ -299,33 +315,33 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
     input_ids = inputs["input_ids"]
 
     max_tokens = 200  # Adjust as needed
-    generated_ids = input_ids
+    generated_ids = input_ids.clone()  # Shape: (batch_size, seq_len)
 
     token_log = []
 
     for _ in range(max_tokens):
         outputs = model(generated_ids)
-        logits = outputs.logits[:, -1, :]  # Get logits for the last generated token
-        probs = torch.softmax(logits, dim=-1)
+        logits = outputs.logits[:, -1, :]  # Shape: (batch_size, vocab_size)
+        probs = torch.softmax(logits, dim=-1)  # Shape: (batch_size, vocab_size)
 
-        entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).item()
+        entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).mean().item()  # Average entropy across batch
         temperature = adjust_temperature_based_on_entropy(entropy)
         top_k, top_p = adjust_sampling_parameters(entropy)
 
         # Sample a single token and ensure correct dimensions
-        token_id = sample_token(probs, top_k, top_p, temperature)
+        token_id = sample_token(probs, top_k, top_p, temperature)  # Shape: (batch_size, 1)
 
-        # Ensure token_id is a scalar tensor (1D) with shape (batch_size, 1)
-        token_id = token_id.unsqueeze(0) if token_id.dim() == 1 else token_id
-
-        # Ensure token_id has the shape (batch_size, 1) for concatenation
-        token_id = token_id.unsqueeze(-1)
+        # Check token_id shape
+        if token_id.dim() != 2 or token_id.size(1) != 1:
+            logger.error(f"Unexpected token_id shape: {token_id.shape}")
+            raise ValueError(f"token_id has incorrect shape: {token_id.shape}")
 
         # Concatenate the generated token to the sequence
-        generated_ids = torch.cat([generated_ids, token_id], dim=1)
+        generated_ids = torch.cat([generated_ids, token_id], dim=1)  # Shape: (batch_size, seq_len +1)
 
+        # Log the token and related info
         token_log.append({
-            "token_id": token_id.item(),  # Log the token
+            "token_id": token_id.item(),  # Assuming batch_size=1
             "entropy": entropy,
             "temperature": temperature,
             "top_k": top_k,
@@ -338,7 +354,8 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
 
     # Log token-level details for debugging
     for log in token_log:
-        logger.info(f"Token: {log['token_id']}, Entropy: {log['entropy']:.2f}, Temperature: {log['temperature']:.2f}, top_k: {log['top_k']}, top_p: {log['top_p']}")
+        logger.info(f"Token: {log['token_id']}, Entropy: {log['entropy']:.2f}, "
+                    f"Temperature: {log['temperature']:.2f}, top_k: {log['top_k']}, top_p: {log['top_p']}")
 
     response = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     response = response.split("AI:")[-1].strip()
@@ -354,12 +371,12 @@ def remove_memory_recall(response):
 def improved_generate_response(input_text, model, tokenizer, history, quality_manager):
     sanitized_input = sanitize_input(input_text)
     prompt, updated_history = improved_dynamic_context(history, sanitized_input, tokenizer, model)
-    
+
     response = generate_macroprocessed_response(prompt, model, tokenizer)
-    
+
     # Validate response
     is_valid = quality_manager.validate_response(sanitized_input, response)
-    
+
     if not is_valid:
         logger.warning(f"Failed response. Regenerating...")
         # Regenerate with adjusted parameters
@@ -367,16 +384,16 @@ def improved_generate_response(input_text, model, tokenizer, history, quality_ma
         is_valid = quality_manager.validate_response(sanitized_input, response)
         if not is_valid:
             logger.error("Regenerated response also failed quality checks. Displaying for debugging.")
-            mean_entropy, _ = quality_manager._calculate_windowed_entropy(response)
+            mean_entropy, std_entropy = quality_manager._calculate_windowed_entropy(response)
             relevance = quality_manager._calculate_relevance(sanitized_input, response)
             logger.warning(f"Regenerated Failed Response Metrics: Relevance: {relevance:.2f}, Mean Entropy: {mean_entropy:.2f}")
             print(f"Regenerated Failed Response (for debugging): {response}")
         else:
             logger.info("Regenerated response passed quality checks.")
-    
+
     # Update the last history entry with the response
     updated_history[-1]["model"] = response
-    
+
     return response, updated_history
 
 # --------------------------- Interactive Loop --------------------------- #
