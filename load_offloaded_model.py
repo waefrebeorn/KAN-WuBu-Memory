@@ -89,23 +89,28 @@ def load_offloaded_weights(model, weights_dir):
 
 # --------------------------- Response Quality Management --------------------------- #
 
-class EnhancedResponseQualityManager:
+class ImprovedResponseQualityManager:
     LOW_ENTROPY_THRESHOLD = 2.0
-    HIGH_ENTROPY_THRESHOLD = 30.0  # Increased further to allow more variety
+    HIGH_ENTROPY_THRESHOLD = 35.0  # Increased to allow more variety
     WINDOW_SIZE = 50
+    EOT_TOKENS = ['�', '\ufffd']  # Add more EOT tokens as needed
 
     def __init__(self, tokenizer, model):
         self.tokenizer = tokenizer
         self.model = model
 
     def validate_response(self, user_input, model_response):
-        relevance = self._calculate_relevance(user_input, model_response)
-        fluency = self._check_fluency(model_response)
-        structure = self._check_structure(model_response)
-        mean_entropy, std_entropy = self._calculate_windowed_entropy(model_response)
+        # Remove EOT tokens before further processing
+        clean_response = self.remove_eot_tokens(model_response)
+        
+        relevance = self._calculate_relevance(user_input, clean_response)
+        fluency = self._check_fluency(clean_response)
+        structure = self._check_structure(clean_response)
+        mean_entropy, std_entropy = self._calculate_windowed_entropy(clean_response)
 
         logger.debug(f"Validation Metrics - Relevance: {relevance:.2f}, Fluency: {fluency}, Structure: {structure}, Mean Entropy: {mean_entropy:.2f}, Std Entropy: {std_entropy:.2f}")
 
+        # Adjust entropy thresholds and ensure relevance compensates for out-of-range entropy
         if not (self.LOW_ENTROPY_THRESHOLD <= mean_entropy <= self.HIGH_ENTROPY_THRESHOLD):
             logger.info(f"Response entropy {mean_entropy:.2f} out of range ({self.LOW_ENTROPY_THRESHOLD}, {self.HIGH_ENTROPY_THRESHOLD})")
             if relevance > 0.5 and fluency:
@@ -113,10 +118,12 @@ class EnhancedResponseQualityManager:
                 return True
             return False
 
-        if len(user_input.split()) < 3:
-            return fluency and mean_entropy < self.HIGH_ENTROPY_THRESHOLD
-        else:
-            return (relevance > 0.3 or fluency) and structure and (mean_entropy < self.HIGH_ENTROPY_THRESHOLD)
+        return (relevance > 0.3 or fluency) and structure
+
+    def remove_eot_tokens(self, response):
+        for token in self.EOT_TOKENS:
+            response = response.rstrip(token)
+        return response.strip()
 
     def _calculate_relevance(self, user_input, response):
         tokens_input = set(self.tokenizer.tokenize(user_input.lower()))
@@ -176,30 +183,6 @@ class EnhancedResponseQualityManager:
 
 # --------------------------- Context Management --------------------------- #
 
-def dynamic_context(history, user_input, tokenizer, max_context=MAX_CONTEXT_LENGTH):
-    if not history:
-        prompt = f"User: {user_input}\nModel:"
-        return prompt
-
-    relevance_scores = []
-    for exchange in history:
-        try:
-            user_part, model_part = exchange.split("\nModel: ")
-            relevance = calculate_cosine_similarity(user_input, user_part, tokenizer)
-            relevance_scores.append(relevance)
-        except ValueError:
-            relevance_scores.append(0.0)
-
-    top_indices = np.argsort(relevance_scores)[-3:]
-    selected_history = [history[i] for i in top_indices if i < len(history)]
-    selected_history = selected_history[::-1]
-
-    prompt = "\n".join(selected_history) + f"\nUser: {user_input}\nModel:"
-    tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_context)
-    prompt = tokenizer.decode(tokenized["input_ids"][0], skip_special_tokens=True)
-
-    return prompt
-
 def calculate_cosine_similarity(text1, text2, tokenizer):
     tokens1 = tokenizer.encode(text1, return_tensors='pt').to(device)
     tokens2 = tokenizer.encode(text2, return_tensors='pt').to(device)
@@ -218,11 +201,45 @@ def sanitize_input(user_input):
     sanitized = re.sub(r'[^\w\s.,!?]', '', user_input)
     return sanitized[:500]
 
+def improved_dynamic_context(history, user_input, tokenizer, max_context=MAX_CONTEXT_LENGTH):
+    if not history:
+        prompt = f"User: {user_input}\nModel:"
+        return prompt, [{"user": user_input, "model": ""}]
+
+    # Calculate relevance for each user part in history
+    relevance_scores = []
+    for exchange in history:
+        user_part = exchange["user"]
+        relevance = calculate_cosine_similarity(user_input, user_part, tokenizer)
+        relevance_scores.append(relevance)
+
+    # Select top 3 most relevant exchanges
+    top_indices = np.argsort(relevance_scores)[-3:]
+    selected_history = [history[i] for i in reversed(top_indices) if i < len(history)]
+
+    # Construct the prompt
+    prompt = ""
+    for entry in selected_history:
+        prompt += f"User: {entry['user']}\nModel: {entry['model']}\n"
+    
+    # Add the current user input
+    prompt += f"User: {user_input}\nModel:"
+
+    # Tokenize and truncate if necessary
+    tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_context)
+    truncated_prompt = tokenizer.decode(tokenized["input_ids"][0], skip_special_tokens=True)
+
+    # Update history
+    new_history_entry = {"user": user_input, "model": ""}
+    updated_history = selected_history + [new_history_entry]
+
+    return truncated_prompt, updated_history
+
 # --------------------------- Response Generation --------------------------- #
 
-def generate_response(input_text, model, tokenizer, history, quality_manager):
+def improved_generate_response(input_text, model, tokenizer, history, quality_manager):
     sanitized_input = sanitize_input(input_text)
-    prompt = dynamic_context(history, sanitized_input, tokenizer)
+    prompt, updated_history = improved_dynamic_context(history, sanitized_input, tokenizer)
 
     inputs = tokenizer(
         prompt,
@@ -251,53 +268,44 @@ def generate_response(input_text, model, tokenizer, history, quality_manager):
 
     response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
     response = response.split("Model:")[-1].strip()
-    response = re.sub(r'\s+', ' ', response)
+    response = quality_manager.remove_eot_tokens(response)
 
-    history.append(f"User: {sanitized_input}\nModel: {response}")
-    if len(history) > 6:
-        history = history[-6:]
-
-    start_time = time.time()
+    # Validate response
     is_valid = quality_manager.validate_response(sanitized_input, response)
-    response_time = time.time() - start_time
-    logger.info(f"Response time: {response_time:.2f}s, Valid: {is_valid}")
 
     if not is_valid:
-        mean_entropy, _ = quality_manager._calculate_windowed_entropy(response)
-        logger.warning(f"Failed response due to metrics. Showing for debugging: Relevance: {quality_manager._calculate_relevance(sanitized_input, response):.2f}, Mean Entropy: {mean_entropy:.2f}")
-        print(f"Failed Response (for debugging): {response}")
-
+        logger.warning(f"Failed response. Regenerating...")
         outputs = model.generate(
             inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             max_new_tokens=max_tokens,
             do_sample=True,
-            temperature=0.8,
-            top_k=50,
-            top_p=0.9,
-            repetition_penalty=1.5,
+            temperature=0.9,  # Increase temperature for more variety
+            top_k=60,
+            top_p=0.95,
+            repetition_penalty=1.2,
             pad_token_id=tokenizer.pad_token_id,
-            num_beams=3,
+            num_beams=5,  # More beams for diverse generation
             early_stopping=True
         )
-        regenerated_response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-        regenerated_response = regenerated_response.split("Model:")[-1].strip()
-        regenerated_response = re.sub(r'\s+', ' ', regenerated_response)
-        history[-1] = f"User: {sanitized_input}\nModel: {regenerated_response}"
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        response = response.split("Model:")[-1].strip()
+        response = quality_manager.remove_eot_tokens(response)
 
-        is_valid = quality_manager.validate_response(sanitized_input, regenerated_response)
+        # Re-validate the regenerated response
+        is_valid = quality_manager.validate_response(sanitized_input, response)
         if not is_valid:
-            mean_entropy, _ = quality_manager._calculate_windowed_entropy(regenerated_response)
             logger.error("Regenerated response also failed quality checks. Displaying for debugging.")
-            logger.warning(f"Regenerated Failed Response Metrics: Relevance: {quality_manager._calculate_relevance(sanitized_input, regenerated_response):.2f}, Mean Entropy: {mean_entropy:.2f}")
-            print(f"Regenerated Failed Response (for debugging): {regenerated_response}")
-            response = regenerated_response
+            logger.warning(f"Regenerated Failed Response Metrics: Relevance: {quality_manager._calculate_relevance(sanitized_input, response):.2f}, Mean Entropy: {quality_manager._calculate_windowed_entropy(response)[0]:.2f}")
+            print(f"Regenerated Failed Response (for debugging): {response}")
+            # Optionally, keep the failed response or handle it differently
         else:
-            response = regenerated_response
-    else:
-        response = response
+            logger.info("Regenerated response passed quality checks.")
 
-    return response, history
+    # Update the last history entry with the response
+    updated_history[-1]["model"] = response
+
+    return response, updated_history
 
 # --------------------------- Interactive Loop --------------------------- #
 
@@ -321,7 +329,7 @@ def interactive_query(model, tokenizer, quality_manager):
             print("Please enter a valid query.")
             continue
 
-        response, history = generate_response(
+        response, history = improved_generate_response(
             user_input,
             model,
             tokenizer,
@@ -352,7 +360,7 @@ def main():
         else:
             logger.info("pad_token already exists in the tokenizer's vocabulary. No need to resize embeddings.")
 
-    quality_manager = EnhancedResponseQualityManager(tokenizer, model)
+    quality_manager = ImprovedResponseQualityManager(tokenizer, model)
     logger.info("Model loaded successfully. You can now query the model.")
     interactive_query(model, tokenizer, quality_manager)
 
