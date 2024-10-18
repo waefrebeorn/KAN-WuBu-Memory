@@ -7,7 +7,7 @@ import re
 import logging
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
+from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig, PreTrainedTokenizerFast
 
 import copy
 from torch.utils.checkpoint import checkpoint
@@ -20,6 +20,9 @@ SOURCE_DIR = r"C:\Projects\KAN-WuBu-Memory\models\Llama_32_1B"
 WEIGHTS_DIR = os.path.join(SOURCE_DIR, "offload")
 MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")
 TOKENIZER_CONFIG_PATH = os.path.join(SOURCE_DIR, "tokenizer_config.json")
+SPECIAL_TOKENS_MAP_PATH = os.path.join(SOURCE_DIR, "special_tokens_map.json")
+GENERATION_CONFIG_PATH = os.path.join(SOURCE_DIR, "generation_config.json")
+TOKENIZER_JSON_PATH = os.path.join(SOURCE_DIR, "tokenizer.json")
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
@@ -56,42 +59,78 @@ def update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size):
 def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
     update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size)
 
+# Function to merge tokens from tokenizer.json and tokenizer_config.json
+def merge_tokenizers(tokenizer_json_path, tokenizer_config_path):
+    # Load tokenizer.json
+    with open(tokenizer_json_path, "r", encoding='utf-8') as f:
+        tokenizer_data = json.load(f)
+    
+    # Load tokenizer_config.json
+    with open(tokenizer_config_path, "r", encoding='utf-8') as f:
+        tokenizer_config_data = json.load(f)
+    
+    # Extract added tokens from tokenizer_config.json
+    added_tokens = tokenizer_config_data.get("added_tokens_decoder", {})
+    
+    # Assuming tokenizer_data has a 'tokens' key which is a list of token entries
+    # Each token entry is a dictionary with 'id' and 'content'
+    existing_token_ids = set()
+    if "tokens" in tokenizer_data:
+        for token in tokenizer_data["tokens"]:
+            existing_token_ids.add(token["id"])
+    else:
+        tokenizer_data["tokens"] = []
+    
+    # Add new tokens from added_tokens
+    for token_id_str, token_info in added_tokens.items():
+        token_id = int(token_id_str)
+        content = token_info["content"]
+        if token_id not in existing_token_ids:
+            tokenizer_data["tokens"].append({"id": token_id, "content": content})
+            existing_token_ids.add(token_id)
+            logging.info(f"Added new token: ID={token_id}, Content='{content}'")
+        else:
+            logging.info(f"Token ID={token_id} already exists. Skipping.")
+    
+    # Verify total number of tokens
+    total_tokens = len(tokenizer_data["tokens"])
+    logging.info(f"Total number of tokens after merging: {total_tokens}")
+    
+    return tokenizer_data
 
-from transformers import PreTrainedTokenizerFast
-
-def load_tokenizer_with_model_config(source_dir, model_json_path):
-    # Load the correct model configuration from config.json
-    with open(model_json_path, "r") as f:
-        model_config = json.load(f)
-
-    # Manually define special tokens from the model config
-    special_tokens = {
-        'bos_token': "<|begin_of_text|>",
-        'eos_token': "<|end_of_text|>",
-        'pad_token': "<|finetune_right_pad_id|>",  # Use pad token from your config if needed
-    }
-
-    # Load tokenizer while bypassing tokenizer_config.json's influence
+# Function to load tokenizer with merged tokens and correct vocab size
+def load_tokenizer_with_merged_tokens(source_dir, tokenizer_json_path, tokenizer_config_path, model_config):
+    # Merge tokens
+    merged_tokenizer_data = merge_tokenizers(tokenizer_json_path, tokenizer_config_path)
+    
+    # Load special tokens from special_tokens_map.json
+    with open(SPECIAL_TOKENS_MAP_PATH, "r", encoding='utf-8') as f:
+        special_tokens_map = json.load(f)
+    
+    # Extract special tokens
+    bos_token = special_tokens_map.get("bos_token", "<|begin_of_text|>")
+    eos_token = special_tokens_map.get("eos_token", "<|end_of_text|>")
+    pad_token = special_tokens_map.get("pad_token", "<|finetune_right_pad_id|>")
+    
+    # Initialize the tokenizer with merged tokens
     tokenizer = PreTrainedTokenizerFast(
-        tokenizer_file=os.path.join(source_dir, "tokenizer.json"),
-        bos_token=special_tokens['bos_token'],
-        eos_token=special_tokens['eos_token'],
-        pad_token=special_tokens['pad_token'],
-        model_max_length=model_config['max_position_embeddings'],
-        vocab_size=128256
+        tokenizer_object=merged_tokenizer_data,
+        bos_token=bos_token,
+        eos_token=eos_token,
+        pad_token=pad_token,
+        model_max_length=model_config.max_position_embeddings,
     )
-
-    logging.info("Custom tokenizer rebuilt successfully.")
-
-
+    
+    # Manually enforce vocab_size
+    tokenizer.vocab_size = 128256
+    logging.info(f"Tokenizer vocab_size set to: {tokenizer.vocab_size}")
+    
+    # Verify special tokens
     logging.info(f"BOS token ID: {tokenizer.bos_token_id}")
-    logging.info(f"EOS token IDs: {tokenizer.eos_token_id}")
-    logging.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
-
+    logging.info(f"EOS token ID: {tokenizer.eos_token_id}")
+    logging.info(f"PAD token ID: {tokenizer.pad_token_id}")
+    
     return tokenizer
-
-
-
 
 # SharedLayer class remains unchanged
 class SharedLayer(nn.Module):
@@ -307,13 +346,13 @@ def user_input_loop(model, tokenizer, config):
 # Main execution flow
 if __name__ == "__main__":
     try:
-        # Load and prepare tokenizer configuration
+        # Load and prepare model configuration
         config = load_configuration(MODEL_JSON_PATH)
         prepare_tokenizer_config(TOKENIZER_CONFIG_PATH, config.vocab_size)
 
-        # Load tokenizer
-        logging.info("Loading tokenizer...")
-        tokenizer = load_tokenizer_with_model_config(SOURCE_DIR, MODEL_JSON_PATH)
+        # Merge tokens and load tokenizer
+        logging.info("Loading and merging tokenizer tokens...")
+        tokenizer = load_tokenizer_with_merged_tokens(SOURCE_DIR, TOKENIZER_JSON_PATH, TOKENIZER_CONFIG_PATH, config)
 
         # Initialize the optimized model
         logging.info("Initializing the optimized Stacked LLaMA Network.")
