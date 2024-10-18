@@ -114,23 +114,26 @@ class EnhancedResponseQualityManager:
         self.tokenizer = tokenizer
         self.model = model
 
-    def validate_response(self, user_input, model_response, entropy_threshold=5.0):
+    def validate_response(self, user_input, model_response, entropy_threshold=8.0):
         """
         Validate the generated response based on relevance, fluency, structure, and entropy.
+        Adjusted to be more lenient while logging specific metrics.
         """
         relevance = self._calculate_relevance(user_input, model_response)
         fluency = self._check_fluency(model_response)
         structure = self._check_structure(model_response)
         entropy = self._calculate_entropy(model_response)
 
-        logger.debug(f"Validation Metrics - Relevance: {relevance}, Fluency: {fluency}, Structure: {structure}, Entropy: {entropy}")
+        # Log metrics for debugging
+        logger.debug(f"Validation Metrics - Relevance: {relevance:.2f}, Fluency: {fluency}, Structure: {structure}, Entropy: {entropy:.2f}")
 
-        # Adjust thresholds as needed
+        # More lenient validation logic
         if len(user_input.split()) < 3:
-            # For simple queries, relax relevance threshold
-            return fluency and structure and entropy < entropy_threshold
+            # For short queries, relax the relevance and structure
+            return fluency and entropy < entropy_threshold
         else:
-            return relevance > 0.5 and fluency and structure and entropy < entropy_threshold
+            # Allow responses that are either fluent or relevant and have acceptable entropy
+            return (relevance > 0.3 or fluency) and structure and entropy < entropy_threshold
 
     def _calculate_relevance(self, user_input, response):
         """
@@ -172,13 +175,13 @@ class EnhancedResponseQualityManager:
         with torch.no_grad():
             outputs = self.model(tokens, labels=tokens)
             logits = outputs.logits  # Shape: (1, sequence_length, vocab_size)
-        
+
         # Calculate probabilities
         probabilities = torch.softmax(logits, dim=-1)  # Shape: (1, sequence_length, vocab_size)
-        
+
         # Gather the probabilities of the actual tokens
         token_probs = probabilities.gather(2, tokens.unsqueeze(-1)).squeeze(-1)  # Shape: (1, sequence_length)
-        
+
         # Calculate entropy
         entropy = -torch.log2(token_probs + 1e-10).sum().item()
         avg_entropy = entropy / tokens.size(1)
@@ -197,13 +200,17 @@ def dynamic_context(history, user_input, tokenizer, max_context=MAX_CONTEXT_LENG
     # Calculate relevance scores for each historical exchange
     relevance_scores = []
     for exchange in history:
-        user_part, model_part = exchange.split("\nModel: ")
-        relevance = calculate_cosine_similarity(user_input, user_part, tokenizer)
-        relevance_scores.append(relevance)
+        try:
+            user_part, model_part = exchange.split("\nModel: ")
+            relevance = calculate_cosine_similarity(user_input, user_part, tokenizer)
+            relevance_scores.append(relevance)
+        except ValueError:
+            relevance_scores.append(0.0)  # If split fails, assign zero relevance
 
     # Select top 3 most relevant exchanges
     top_indices = np.argsort(relevance_scores)[-3:]
-    selected_history = [history[i] for i in top_indices]
+    selected_history = [history[i] for i in top_indices if i < len(history)]
+    selected_history = selected_history[::-1]  # Reverse to maintain chronological order
 
     # Construct the prompt
     prompt = "\n".join(selected_history) + f"\nUser: {user_input}\nModel:"
@@ -310,9 +317,8 @@ def generate_response(input_text, model, tokenizer, history, quality_manager, ma
     logger.info(f"Response time: {response_time:.2f}s, Valid: {is_valid}")
 
     if not is_valid:
-        logger.warning("Response failed quality checks. Showing failed response for debugging:")
-        logger.warning(f"Failed Response: {response}")
-        print(f"Failed Response: {response}")
+        logger.warning(f"Failed response due to metrics. Showing for debugging: Relevance: {quality_manager._calculate_relevance(sanitized_input, response):.2f}, Entropy: {quality_manager._calculate_entropy(response):.2f}")
+        print(f"Failed Response (for debugging): {response}")
 
         # Attempt regeneration once for debugging purposes
         outputs = model.generate(
@@ -328,18 +334,19 @@ def generate_response(input_text, model, tokenizer, history, quality_manager, ma
             num_beams=3,
             early_stopping=True
         )
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-        response = response.split("Model:")[-1].strip()
-        response = re.sub(r'\s+', ' ', response)
-        history[-1] = f"User: {sanitized_input}\nModel: {response}"
+        regenerated_response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        regenerated_response = regenerated_response.split("Model:")[-1].strip()
+        regenerated_response = re.sub(r'\s+', ' ', regenerated_response)
+        history[-1] = f"User: {sanitized_input}\nModel: {regenerated_response}"
 
         # Re-validate the regenerated response
-        is_valid = quality_manager.validate_response(sanitized_input, response)
+        is_valid = quality_manager.validate_response(sanitized_input, regenerated_response)
         if not is_valid:
             logger.error("Regenerated response also failed quality checks. Displaying for debugging.")
-            print(f"Regenerated Failed Response: {response}")
+            print(f"Regenerated Failed Response (for debugging): {regenerated_response}")
+            response = regenerated_response  # Keep the failed regenerated response for debugging
         else:
-            response = adjust_tone(sanitized_input, response)
+            response = adjust_tone(sanitized_input, regenerated_response)
     else:
         response = adjust_tone(sanitized_input, response)
 
