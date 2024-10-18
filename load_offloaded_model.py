@@ -16,7 +16,7 @@ WEIGHTS_DIR = os.path.join(SOURCE_DIR, "offload")
 MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")
 
 # Define maximum context length
-MAX_CONTEXT_LENGTH = 512
+MAX_CONTEXT_LENGTH = 2048  # Increased to allow for longer contexts
 
 # Define logging configuration
 LOG_FORMAT = "%(asctime)s:%(levelname)s:%(name)s: %(message)s"
@@ -110,30 +110,40 @@ class EnhancedResponseQualityManager:
     """
     Manages the quality of responses by evaluating relevance, fluency, structure, and entropy.
     """
+    # Define entropy thresholds
+    LOW_ENTROPY_THRESHOLD = 2.0  # Too predictable
+    HIGH_ENTROPY_THRESHOLD = 10.0  # Too chaotic
+    WINDOW_SIZE = 50  # Window size for windowed entropy
+
     def __init__(self, tokenizer, model):
         self.tokenizer = tokenizer
         self.model = model
 
-    def validate_response(self, user_input, model_response, entropy_threshold=8.0):
+    def validate_response(self, user_input, model_response):
         """
         Validate the generated response based on relevance, fluency, structure, and entropy.
-        Adjusted to be more lenient while logging specific metrics.
+        Uses windowed entropy and defines an acceptable entropy range.
         """
         relevance = self._calculate_relevance(user_input, model_response)
         fluency = self._check_fluency(model_response)
         structure = self._check_structure(model_response)
-        entropy = self._calculate_entropy(model_response)
+        mean_entropy, std_entropy = self._calculate_windowed_entropy(model_response)
 
         # Log metrics for debugging
-        logger.debug(f"Validation Metrics - Relevance: {relevance:.2f}, Fluency: {fluency}, Structure: {structure}, Entropy: {entropy:.2f}")
+        logger.debug(f"Validation Metrics - Relevance: {relevance:.2f}, Fluency: {fluency}, Structure: {structure}, Mean Entropy: {mean_entropy:.2f}, Std Entropy: {std_entropy:.2f}")
 
-        # More lenient validation logic
+        # Determine validity based on entropy range
+        if not (self.LOW_ENTROPY_THRESHOLD <= mean_entropy <= self.HIGH_ENTROPY_THRESHOLD):
+            logger.info(f"Response entropy {mean_entropy:.2f} out of range ({self.LOW_ENTROPY_THRESHOLD}, {self.HIGH_ENTROPY_THRESHOLD})")
+            return False
+
+        # Adjust validation logic based on input length
         if len(user_input.split()) < 3:
             # For short queries, relax the relevance and structure
-            return fluency and entropy < entropy_threshold
+            return fluency and mean_entropy < self.HIGH_ENTROPY_THRESHOLD
         else:
-            # Allow responses that are either fluent or relevant and have acceptable entropy
-            return (relevance > 0.3 or fluency) and structure and entropy < entropy_threshold
+            # For longer queries, require fluency and acceptable entropy
+            return (relevance > 0.3 or fluency) and structure and (mean_entropy < self.HIGH_ENTROPY_THRESHOLD)
 
     def _calculate_relevance(self, user_input, response):
         """
@@ -167,9 +177,9 @@ class EnhancedResponseQualityManager:
             return False
         return True
 
-    def _calculate_entropy(self, response):
+    def _calculate_windowed_entropy(self, response):
         """
-        Calculate the entropy of the response to assess confidence.
+        Calculate the mean and standard deviation of entropy over windows of tokens.
         """
         tokens = self.tokenizer.encode(response, return_tensors='pt').to(device)
         with torch.no_grad():
@@ -182,10 +192,32 @@ class EnhancedResponseQualityManager:
         # Gather the probabilities of the actual tokens
         token_probs = probabilities.gather(2, tokens.unsqueeze(-1)).squeeze(-1)  # Shape: (1, sequence_length)
 
-        # Calculate entropy
-        entropy = -torch.log2(token_probs + 1e-10).sum().item()
-        avg_entropy = entropy / tokens.size(1)
-        return avg_entropy
+        # Calculate entropy for each token
+        token_entropy = -torch.log2(token_probs + 1e-10)  # Avoid log(0)
+        token_entropy = token_entropy.squeeze(0).cpu().numpy()  # Shape: (sequence_length,)
+
+        # Calculate windowed entropy
+        window_size = self.WINDOW_SIZE
+        num_windows = max(1, len(token_entropy) // window_size)
+        entropy_values = []
+
+        for i in range(num_windows):
+            start = i * window_size
+            end = start + window_size
+            window = token_entropy[start:end]
+            if len(window) == 0:
+                continue
+            window_entropy = np.mean(window)
+            entropy_values.append(window_entropy)
+
+        if not entropy_values:
+            mean_entropy = 0.0
+            std_entropy = 0.0
+        else:
+            mean_entropy = np.mean(entropy_values)
+            std_entropy = np.std(entropy_values)
+
+        return mean_entropy, std_entropy
 
 # --------------------------- Context Management --------------------------- #
 
@@ -265,9 +297,10 @@ def adjust_tone(user_input, base_response):
 
 # --------------------------- Response Generation --------------------------- #
 
-def generate_response(input_text, model, tokenizer, history, quality_manager, max_tokens=200):
+def generate_response(input_text, model, tokenizer, history, quality_manager):
     """
     Generate a response from the model based on the input_text and conversation history.
+    Dynamically adjusts max_new_tokens based on input length.
     """
     # Sanitize input
     sanitized_input = sanitize_input(input_text)
@@ -283,11 +316,16 @@ def generate_response(input_text, model, tokenizer, history, quality_manager, ma
         max_length=MAX_CONTEXT_LENGTH
     ).to(device)
 
+    # Determine dynamic max_new_tokens based on input length
+    input_length = len(sanitized_input.split())
+    default_max_tokens = 200
+    max_tokens = min(1024, max(default_max_tokens, input_length * 10))  # Adjust multiplier as needed
+
     # Generate the response using beam search and sampling
     outputs = model.generate(
         inputs["input_ids"],
         attention_mask=inputs["attention_mask"],
-        max_new_tokens=max_tokens,
+        max_new_tokens=max_tokens,  # Dynamic max tokens
         do_sample=True,  # Enable sampling
         temperature=0.8,
         top_k=50,
@@ -317,14 +355,14 @@ def generate_response(input_text, model, tokenizer, history, quality_manager, ma
     logger.info(f"Response time: {response_time:.2f}s, Valid: {is_valid}")
 
     if not is_valid:
-        logger.warning(f"Failed response due to metrics. Showing for debugging: Relevance: {quality_manager._calculate_relevance(sanitized_input, response):.2f}, Entropy: {quality_manager._calculate_entropy(response):.2f}")
+        logger.warning(f"Failed response due to metrics. Showing for debugging: Relevance: {quality_manager._calculate_relevance(sanitized_input, response):.2f}, Mean Entropy: {quality_manager._calculate_windowed_entropy(response)[0]:.2f}")
         print(f"Failed Response (for debugging): {response}")
 
         # Attempt regeneration once for debugging purposes
         outputs = model.generate(
             inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
-            max_new_tokens=max_tokens,
+            max_new_tokens=max_tokens,  # Same max tokens
             do_sample=True,
             temperature=0.8,
             top_k=50,
