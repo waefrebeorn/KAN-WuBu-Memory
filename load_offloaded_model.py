@@ -3,9 +3,9 @@ import torch
 import json
 import logging
 import re
+import time
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from math import log2
 from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
 
 # --------------------------- Configuration --------------------------- #
@@ -15,22 +15,34 @@ SOURCE_DIR = "models/Llama_32_1B/"
 WEIGHTS_DIR = os.path.join(SOURCE_DIR, "offload")
 MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")
 
-# Set device to GPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if device.type != "cuda":
-    raise SystemExit("CUDA-enabled GPU not found. Please ensure a compatible GPU is available.")
+# Define maximum context length
+MAX_CONTEXT_LENGTH = 512
+
+# Define logging configuration
+LOG_FORMAT = "%(asctime)s:%(levelname)s:%(name)s: %(message)s"
+LOG_LEVEL = logging.INFO
 
 # --------------------------- Logging Setup --------------------------- #
 
 # Initialize logging
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s:%(levelname)s:%(name)s: %(message)s",
+    level=LOG_LEVEL,
+    format=LOG_FORMAT,
     handlers=[
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
+
+# --------------------------- Device Configuration --------------------------- #
+
+# Set device to GPU if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if device.type != "cuda":
+    logger.error("CUDA-enabled GPU not found. Please ensure a compatible GPU is available.")
+    raise SystemExit("CUDA-enabled GPU not found.")
+
+logger.info(f"Using device: {device}")
 
 # --------------------------- Model Loading --------------------------- #
 
@@ -50,14 +62,14 @@ def load_tokenizer(source_dir):
     """
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
     finetune_pad_token = "<|finetune_right_pad_id|>"
-    
+
     if finetune_pad_token not in tokenizer.get_vocab():
         tokenizer.add_special_tokens({'pad_token': finetune_pad_token})
         logger.info(f"Added pad_token: '{finetune_pad_token}' to tokenizer.")
     else:
         tokenizer.pad_token = finetune_pad_token
         logger.info(f"Assigned existing '{finetune_pad_token}' as pad_token.")
-    
+
     return tokenizer
 
 def load_offloaded_weights(model, weights_dir):
@@ -78,7 +90,7 @@ def load_offloaded_weights(model, weights_dir):
             }
             expected_dtype = dtype_map.get(param.dtype, np.float32)
             logger.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
-            
+
             tensor_data = np.fromfile(file_path, dtype=expected_dtype)
             loaded_tensor = torch.from_numpy(tensor_data).to(device)
 
@@ -96,38 +108,40 @@ def load_offloaded_weights(model, weights_dir):
 
 class EnhancedResponseQualityManager:
     """
-    Manages the quality of responses by evaluating relevance, fluency, and structure.
+    Manages the quality of responses by evaluating relevance, fluency, structure, and entropy.
     """
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, model):
         self.tokenizer = tokenizer
-        self.tfidf_vectorizer = TfidfVectorizer()
-    
-    def validate_response(self, user_input, model_response):
+        self.model = model
+
+    def validate_response(self, user_input, model_response, entropy_threshold=5.0):
         """
-        Validate the generated response based on relevance, fluency, and structure.
+        Validate the generated response based on relevance, fluency, structure, and entropy.
         """
         relevance = self._calculate_relevance(user_input, model_response)
         fluency = self._check_fluency(model_response)
         structure = self._check_structure(model_response)
-        
-        logger.debug(f"Validation Metrics - Relevance: {relevance}, Fluency: {fluency}, Structure: {structure}")
-        
-        return relevance > 0.5 and fluency and structure
-    
+        entropy = self._calculate_entropy(model_response)
+
+        logger.debug(f"Validation Metrics - Relevance: {relevance}, Fluency: {fluency}, Structure: {structure}, Entropy: {entropy}")
+
+        # Adjust thresholds as needed
+        if len(user_input.split()) < 3:
+            # For simple queries, relax relevance threshold
+            return fluency and structure and entropy < entropy_threshold
+        else:
+            return relevance > 0.5 and fluency and structure and entropy < entropy_threshold
+
     def _calculate_relevance(self, user_input, response):
         """
-        Calculate the relevance of the response to the user input.
+        Calculate the relevance of the response to the user input using token overlap.
         """
-        tokens_input = set(self.tokenizer.tokenize(user_input))
-        tokens_response = set(self.tokenizer.tokenize(response))
+        tokens_input = set(self.tokenizer.tokenize(user_input.lower()))
+        tokens_response = set(self.tokenizer.tokenize(response.lower()))
         overlap = len(tokens_input & tokens_response)
-        
-        tfidf_matrix = self.tfidf_vectorizer.fit_transform([user_input, response])
-        cosine_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
-        
-        relevance_score = (0.5 * overlap / max(len(tokens_input), 1)) + (0.5 * cosine_sim)
+        relevance_score = overlap / max(len(tokens_input), 1)
         return relevance_score
-    
+
     def _check_fluency(self, response):
         """
         Check the fluency of the response to ensure it is coherent.
@@ -137,7 +151,7 @@ class EnhancedResponseQualityManager:
         if re.search(r'[^\x00-\x7F]+', response):
             return False
         return True
-    
+
     def _check_structure(self, response):
         """
         Ensure the response has proper sentence structure.
@@ -150,31 +164,97 @@ class EnhancedResponseQualityManager:
             return False
         return True
 
+    def _calculate_entropy(self, response):
+        """
+        Calculate the entropy of the response to assess confidence.
+        """
+        tokens = self.tokenizer.encode(response, return_tensors='pt').to(device)
+        with torch.no_grad():
+            outputs = self.model(tokens, labels=tokens)
+            logits = outputs.logits  # Shape: (1, sequence_length, vocab_size)
+        
+        # Calculate probabilities
+        probabilities = torch.softmax(logits, dim=-1)  # Shape: (1, sequence_length, vocab_size)
+        
+        # Gather the probabilities of the actual tokens
+        token_probs = probabilities.gather(2, tokens.unsqueeze(-1)).squeeze(-1)  # Shape: (1, sequence_length)
+        
+        # Calculate entropy
+        entropy = -torch.log2(token_probs + 1e-10).sum().item()
+        avg_entropy = entropy / tokens.size(1)
+        return avg_entropy
+
 # --------------------------- Context Management --------------------------- #
 
-def manage_context(history, input_text, tokenizer, max_context_length=512):
+def dynamic_context(history, user_input, tokenizer, max_context=MAX_CONTEXT_LENGTH):
     """
-    Manage and prepare the context for the model by maintaining relevant history.
+    Dynamically manage and prepare the context for the model by selecting the most relevant history.
     """
-    # Clean empty lines
-    history = [line for line in history if line.strip()]
-    
-    # Limit history to the last 3 exchanges
-    recent_history = history[-3:]
-    
-    # Create the prompt
-    if recent_history:
-        prompt = "\n".join(recent_history) + f"\nUser: {input_text}\nModel:"
-    else:
-        prompt = f"User: {input_text}\nModel:"
-    
-    # Tokenize to ensure it doesn't exceed max_context_length
-    tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_context_length)
-    
-    # Decode back to string
+    if not history:
+        prompt = f"User: {user_input}\nModel:"
+        return prompt
+
+    # Calculate relevance scores for each historical exchange
+    relevance_scores = []
+    for exchange in history:
+        user_part, model_part = exchange.split("\nModel: ")
+        relevance = calculate_cosine_similarity(user_input, user_part, tokenizer)
+        relevance_scores.append(relevance)
+
+    # Select top 3 most relevant exchanges
+    top_indices = np.argsort(relevance_scores)[-3:]
+    selected_history = [history[i] for i in top_indices]
+
+    # Construct the prompt
+    prompt = "\n".join(selected_history) + f"\nUser: {user_input}\nModel:"
+
+    # Ensure the prompt does not exceed max_context
+    tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_context)
     prompt = tokenizer.decode(tokenized["input_ids"][0], skip_special_tokens=True)
-    
+
     return prompt
+
+def calculate_cosine_similarity(text1, text2, tokenizer):
+    """
+    Calculate cosine similarity between two texts using their token embeddings.
+    """
+    tokens1 = tokenizer.encode(text1, return_tensors='pt').to(device)
+    tokens2 = tokenizer.encode(text2, return_tensors='pt').to(device)
+
+    with torch.no_grad():
+        embeddings1 = model.transformer.wte(tokens1)
+        embeddings2 = model.transformer.wte(tokens2)
+
+    # Average embeddings
+    embedding1 = embeddings1.mean(dim=1)
+    embedding2 = embeddings2.mean(dim=1)
+
+    # Calculate cosine similarity
+    cosine_sim = torch.nn.functional.cosine_similarity(embedding1, embedding2).item()
+    return cosine_sim
+
+def sanitize_input(user_input):
+    """
+    Sanitize user input to prevent injection attacks and ensure safety.
+    """
+    sanitized = re.sub(r'[^\w\s.,!?]', '', user_input)  # Remove unwanted characters
+    return sanitized[:500]  # Limit input length
+
+# --------------------------- Persona and Tone Management --------------------------- #
+
+def adjust_tone(user_input, base_response):
+    """
+    Adjust the tone of the response based on user input.
+    """
+    if any(word in user_input.lower() for word in ["thank you", "thanks"]):
+        return f"You're welcome! {base_response}"
+    elif any(word in user_input.lower() for word in ["please", "kindly", "could you"]):
+        return f"Certainly! {base_response}"
+    elif "persona:formal" in user_input.lower():
+        return f"Certainly. {base_response}"
+    elif "persona:casual" in user_input.lower():
+        return f"Sure thing! {base_response}"
+    return base_response  # Default to neutral tone
 
 # --------------------------- Response Generation --------------------------- #
 
@@ -182,63 +262,86 @@ def generate_response(input_text, model, tokenizer, history, quality_manager, ma
     """
     Generate a response from the model based on the input_text and conversation history.
     """
-    prompt = manage_context(history, input_text, tokenizer)
-    
+    # Sanitize input
+    sanitized_input = sanitize_input(input_text)
+
+    # Manage context
+    prompt = dynamic_context(history, sanitized_input, tokenizer)
+
+    # Tokenize input
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
         truncation=True,
-        max_length=512
+        max_length=MAX_CONTEXT_LENGTH
     ).to(device)
-    
-    # Generate the response using beam search for better quality
+
+    # Generate the response using beam search and sampling
     outputs = model.generate(
         inputs["input_ids"],
         attention_mask=inputs["attention_mask"],
         max_new_tokens=max_tokens,
+        do_sample=True,  # Enable sampling
         temperature=0.8,
         top_k=50,
         top_p=0.9,
         repetition_penalty=1.5,
-        num_beams=3,  # Beam search with 3 beams
+        pad_token_id=tokenizer.pad_token_id,  # Correct pad_token_id
+        num_beams=3,  # Beam search for structured responses
         early_stopping=True
     )
-    
+
     # Decode the response
     response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    
+
     # Extract the model's response portion
     response = response.split("Model:")[-1].strip()
     response = re.sub(r'\s+', ' ', response)
-    
+
     # Append to history
-    history.append(f"User: {input_text}\nModel: {response}")
+    history.append(f"User: {sanitized_input}\nModel: {response}")
     if len(history) > 6:
         history = history[-6:]
-    
+
     # Validate the response
-    if not quality_manager.validate_response(input_text, response):
+    start_time = time.time()
+    is_valid = quality_manager.validate_response(sanitized_input, response)
+    response_time = time.time() - start_time
+    logger.info(f"Response time: {response_time:.2f}s, Valid: {is_valid}")
+
+    if not is_valid:
         logger.warning("Response failed quality checks. Regenerating...")
         # Attempt regeneration once
         outputs = model.generate(
             inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             max_new_tokens=max_tokens,
+            do_sample=True,
             temperature=0.8,
             top_k=50,
             top_p=0.9,
             repetition_penalty=1.5,
+            pad_token_id=tokenizer.pad_token_id,
             num_beams=3,
             early_stopping=True
         )
         response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
         response = response.split("Model:")[-1].strip()
         response = re.sub(r'\s+', ' ', response)
-        history[-1] = f"User: {input_text}\nModel: {response}"
-        if not quality_manager.validate_response(input_text, response):
+        history[-1] = f"User: {sanitized_input}\nModel: {response}"
+
+        # Re-validate the regenerated response
+        is_valid = quality_manager.validate_response(sanitized_input, response)
+        if not is_valid:
             logger.error("Regenerated response also failed quality checks.")
             response = "I'm sorry, but I couldn't provide a satisfactory response to that."
-    
+            history[-1] = f"User: {sanitized_input}\nModel: {response}"
+        else:
+            response = adjust_tone(sanitized_input, response)
+
+    else:
+        response = adjust_tone(sanitized_input, response)
+
     return response, history
 
 # --------------------------- Interactive Loop --------------------------- #
@@ -250,7 +353,7 @@ def interactive_query(model, tokenizer, quality_manager):
     print("\n--- LLaMA Instruct Model Interactive Query ---")
     print("Type 'exit' to quit.\n")
     history = []
-    
+
     while True:
         try:
             user_input = input("Enter your query: ").strip()
@@ -279,23 +382,25 @@ def interactive_query(model, tokenizer, quality_manager):
 # --------------------------- Main Execution --------------------------- #
 
 def main():
+    global model  # Needed for cosine similarity calculation
+
     # Load model configuration
     config = load_configuration(MODEL_JSON_PATH)
-    
+
     # Initialize the model and move it to GPU
     model = LlamaForCausalLM(config).to(device)
     logger.info("Initialized LLaMA model on GPU.")
-    
+
     # Load model weights
     load_offloaded_weights(model, WEIGHTS_DIR)
-    
+
     # Ensure the model is in evaluation mode
     model.eval()
     logger.info("Model is set to evaluation mode.")
-    
+
     # Load tokenizer
     tokenizer = load_tokenizer(SOURCE_DIR)
-    
+
     # Resize token embeddings if a new pad token was added
     if tokenizer.pad_token == "<|finetune_right_pad_id|>":
         if tokenizer.pad_token not in tokenizer.get_vocab():
@@ -303,10 +408,10 @@ def main():
             logger.info("Resized model token embeddings to accommodate the new pad_token.")
         else:
             logger.info("pad_token already exists in the tokenizer's vocabulary. No need to resize embeddings.")
-    
+
     # Initialize the Response Quality Manager
-    quality_manager = EnhancedResponseQualityManager(tokenizer)
-    
+    quality_manager = EnhancedResponseQualityManager(tokenizer, model)
+
     # Start the interactive query loop
     logger.info("Model loaded successfully. You can now query the model.")
     interactive_query(model, tokenizer, quality_manager)
