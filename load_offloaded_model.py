@@ -1,74 +1,71 @@
 import os
 import torch
 import json
-import numpy as np
-import re
 import logging
+import re
+import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import LlamaForCausalLM, AutoTokenizer, LlamaConfig
+
+# --------------------------- Configuration --------------------------- #
 
 # Define paths to the directories and files
 SOURCE_DIR = "models/Llama_32_1B/"
 WEIGHTS_DIR = os.path.join(SOURCE_DIR, "offload")
 MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")
 
-# Initialize logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # Set device to GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type != "cuda":
-    logger.error("CUDA-enabled GPU not found. Please ensure a compatible GPU is available.")
-    raise SystemExit("CUDA-enabled GPU not found.")
+    raise SystemExit("CUDA-enabled GPU not found. Please ensure a compatible GPU is available.")
 
-# Load the configuration from the JSON file
-def load_configuration(model_json_path):
-    with open(model_json_path, "r") as f:
+# --------------------------- Logging Setup --------------------------- #
+
+# Initialize logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s:%(levelname)s:%(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# --------------------------- Model Loading --------------------------- #
+
+def load_configuration(config_path):
+    """
+    Load model configuration from a JSON file.
+    """
+    with open(config_path, "r") as f:
         config_data = json.load(f)
     config = LlamaConfig(**config_data)
+    logger.info(f"Model configuration loaded from {config_path}")
     return config
 
-# Use AutoTokenizer instead of LlamaTokenizer to resolve class conflicts
 def load_tokenizer(source_dir):
+    """
+    Load and configure the tokenizer, adding a custom pad token if necessary.
+    """
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
-    
-    # **Key Modification Start**
-    # Assign '<|finetune_right_pad_id|>' as pad_token
     finetune_pad_token = "<|finetune_right_pad_id|>"
-    if finetune_pad_token in tokenizer.get_vocab():
-        tokenizer.pad_token = finetune_pad_token
-        logger.info(f"Assigned '{finetune_pad_token}' as pad_token.")
-    else:
-        # If the finetune_pad_token is not in the vocab, add it
+    
+    if finetune_pad_token not in tokenizer.get_vocab():
         tokenizer.add_special_tokens({'pad_token': finetune_pad_token})
-        logger.info(f"Added new pad_token '{finetune_pad_token}'.")
+        logger.info(f"Added pad_token: '{finetune_pad_token}' to tokenizer.")
+    else:
+        tokenizer.pad_token = finetune_pad_token
+        logger.info(f"Assigned existing '{finetune_pad_token}' as pad_token.")
     
     return tokenizer
 
-# Load the model configuration
-logger.info(f"Loading model configuration from: {MODEL_JSON_PATH}")
-config = load_configuration(MODEL_JSON_PATH)
-
-# Initialize an empty model based on the configuration and move it to GPU
-model = LlamaForCausalLM(config).to(device)
-logger.info("Initialized empty LLaMA model on GPU.")
-
-# Load the offloaded weights from the `.dat` files directly to GPU
-def load_dat_file(file_path, dtype):
-    with open(file_path, 'rb') as f:
-        tensor_data = np.fromfile(f, dtype=dtype)
-    loaded_tensor = torch.from_numpy(tensor_data).to(device)
-
-    # If dtype was mapped to float32 for bfloat16 compatibility, convert back
-    if dtype == np.float32 and "bfloat16" in file_path:
-        loaded_tensor = loaded_tensor.to(torch.bfloat16)
-    return loaded_tensor
-
 def load_offloaded_weights(model, weights_dir):
+    """
+    Load model weights from .dat files and assign them to the model's parameters.
+    """
     for name, param in model.named_parameters():
-        file_name = name.replace('.', '_') + ".dat"
+        file_name = f"{name.replace('.', '_')}.dat"
         file_path = os.path.join(weights_dir, file_name)
 
         if os.path.exists(file_path):
@@ -81,141 +78,182 @@ def load_offloaded_weights(model, weights_dir):
             }
             expected_dtype = dtype_map.get(param.dtype, np.float32)
             logger.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
-            loaded_tensor = load_dat_file(file_path, expected_dtype).view_as(param)
+            
+            tensor_data = np.fromfile(file_path, dtype=expected_dtype)
+            loaded_tensor = torch.from_numpy(tensor_data).to(device)
 
             if param.dtype == torch.bfloat16:
                 loaded_tensor = loaded_tensor.to(torch.bfloat16)
 
             with torch.no_grad():
-                param.data.copy_(loaded_tensor)
+                param.data.copy_(loaded_tensor.view_as(param))
         else:
-            logger.warning(f"Warning: {file_name} not found in offloaded directory.")
+            logger.warning(f"Weight file {file_path} not found.")
 
-# Load the weights into the model
-load_offloaded_weights(model, WEIGHTS_DIR)
+    logger.info("All available weights loaded successfully.")
 
-# Ensure the model is in evaluation mode and on GPU
-model.eval()
-model.to(device)
-logger.info("Model weights loaded successfully and moved to GPU.")
+# --------------------------- Response Quality Management --------------------------- #
 
-# Load tokenizer
-logger.info(f"Loading tokenizer from directory: {SOURCE_DIR}")
-tokenizer = load_tokenizer(SOURCE_DIR)
-
-# **Key Modification End**
-
-# **Set pad_token_id based on the tokenizer's pad_token**
-pad_token_id = tokenizer.pad_token_id
-logger.info(f"pad_token_id set to: {pad_token_id}")
-
-# **Optional: Resize Model Embeddings if a New Pad Token was Added**
-# This step is necessary only if you added a new pad_token.
-# If pad_token was set to an existing token, this step can be skipped.
-if tokenizer.pad_token == "<|finetune_right_pad_id|>":
-    if tokenizer.pad_token not in tokenizer.get_vocab():
-        model.resize_token_embeddings(len(tokenizer))
-        logger.info("Resized model token embeddings to accommodate the new pad_token.")
-    else:
-        logger.info("pad_token already exists in the tokenizer's vocabulary. No need to resize embeddings.")
-
-# Implement the ResponseQualityManager with metrics and corrective strategies
-class ResponseQualityManager:
-    def __init__(self, kan_model, tokenizer):
-        self.kan_model = kan_model
+class EnhancedResponseQualityManager:
+    """
+    Manages the quality of responses by evaluating relevance, fluency, and structure.
+    """
+    def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.tfidf_vectorizer = TfidfVectorizer()
-
-    def evaluate_response(self, user_input, response):
-        relevance_score = self.calculate_relevance(user_input, response)
-        structure_valid = self.has_proper_structure(response)
-        is_garbled = self.detect_garbled_output(response)
-        return relevance_score > 0.3 and structure_valid and not is_garbled
-
-    def calculate_relevance(self, user_input, response):
-        user_tokens = set(self.tokenizer.tokenize(user_input))
-        response_tokens = set(self.tokenizer.tokenize(response))
-        overlap = len(user_tokens.intersection(response_tokens))
-        overlap_score = overlap / max(len(user_tokens), 1)
-
-        combined_texts = [user_input, response]
-        tfidf_matrix = self.tfidf_vectorizer.fit_transform(combined_texts)
+    
+    def validate_response(self, user_input, model_response):
+        """
+        Validate the generated response based on relevance, fluency, and structure.
+        """
+        relevance = self._calculate_relevance(user_input, model_response)
+        fluency = self._check_fluency(model_response)
+        structure = self._check_structure(model_response)
+        
+        logger.debug(f"Validation Metrics - Relevance: {relevance}, Fluency: {fluency}, Structure: {structure}")
+        
+        return relevance > 0.5 and fluency and structure
+    
+    def _calculate_relevance(self, user_input, response):
+        """
+        Calculate the relevance of the response to the user input.
+        """
+        tokens_input = set(self.tokenizer.tokenize(user_input))
+        tokens_response = set(self.tokenizer.tokenize(response))
+        overlap = len(tokens_input & tokens_response)
+        
+        tfidf_matrix = self.tfidf_vectorizer.fit_transform([user_input, response])
         cosine_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
-
-        return 0.5 * overlap_score + 0.5 * cosine_sim
-
-    def detect_garbled_output(self, response):
-        if re.search(r'[^\x00-\x7F]+', response):
-            return True
+        
+        relevance_score = (0.5 * overlap / max(len(tokens_input), 1)) + (0.5 * cosine_sim)
+        return relevance_score
+    
+    def _check_fluency(self, response):
+        """
+        Check the fluency of the response to ensure it is coherent.
+        """
         if len(response.split()) < 3:
-            return True
-        if response.count('.') / max(len(response.split()), 1) > 0.5:
-            return True
-        return False
+            return False
+        if re.search(r'[^\x00-\x7F]+', response):
+            return False
+        return True
+    
+    def _check_structure(self, response):
+        """
+        Ensure the response has proper sentence structure.
+        """
+        if not response:
+            return False
+        if not response[0].isupper():
+            return False
+        if response[-1] not in '.!?':
+            return False
+        return True
 
-    def has_proper_structure(self, response):
-        sentences = re.split(r'(?<=[.!?])\s+', response.strip())
-        return len(sentences) > 0 and sentences[0][0].isupper() and sentences[-1][-1] in '.!?'
+# --------------------------- Context Management --------------------------- #
 
-# Quality Manager instance for response evaluation
-quality_manager = ResponseQualityManager(model, tokenizer)
+def manage_context(history, input_text, tokenizer, max_context_length=512):
+    """
+    Manage and prepare the context for the model by maintaining relevant history.
+    """
+    # Clean empty lines
+    history = [line for line in history if line.strip()]
+    
+    # Limit history to the last 3 exchanges
+    recent_history = history[-3:]
+    
+    # Create the prompt
+    if recent_history:
+        prompt = "\n".join(recent_history) + f"\nUser: {input_text}\nModel:"
+    else:
+        prompt = f"User: {input_text}\nModel:"
+    
+    # Tokenize to ensure it doesn't exceed max_context_length
+    tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_context_length)
+    
+    # Decode back to string
+    prompt = tokenizer.decode(tokenized["input_ids"][0], skip_special_tokens=True)
+    
+    return prompt
 
-# Updated generation logic to handle context better and avoid repetitive responses
-def generate_response(input_text, model, tokenizer, max_new_tokens=150, pad_token_id=128004, history=[], context_limit=512):
-    # Clean the history to avoid redundant prompts
-    history = [line for line in history if line.strip()]  # Remove empty lines
+# --------------------------- Response Generation --------------------------- #
 
-    # Create a simplified context prompt from the last few exchanges
-    prompt = f"{' '.join(history[-3:])}\nUser: {input_text}\n" if history else f"User: {input_text}\n"
-
-    # Prepare inputs for the model
+def generate_response(input_text, model, tokenizer, history, quality_manager, max_tokens=200):
+    """
+    Generate a response from the model based on the input_text and conversation history.
+    """
+    prompt = manage_context(history, input_text, tokenizer)
+    
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
-        padding=True,            # Padding is now supported
         truncation=True,
-        max_length=context_limit
+        max_length=512
     ).to(device)
-
-    # Generate the response
-    with torch.no_grad():
+    
+    # Generate the response using beam search for better quality
+    outputs = model.generate(
+        inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        max_new_tokens=max_tokens,
+        temperature=0.8,
+        top_k=50,
+        top_p=0.9,
+        repetition_penalty=1.5,
+        num_beams=3,  # Beam search with 3 beams
+        early_stopping=True
+    )
+    
+    # Decode the response
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    
+    # Extract the model's response portion
+    response = response.split("Model:")[-1].strip()
+    response = re.sub(r'\s+', ' ', response)
+    
+    # Append to history
+    history.append(f"User: {input_text}\nModel: {response}")
+    if len(history) > 6:
+        history = history[-6:]
+    
+    # Validate the response
+    if not quality_manager.validate_response(input_text, response):
+        logger.warning("Response failed quality checks. Regenerating...")
+        # Attempt regeneration once
         outputs = model.generate(
             inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
-            max_new_tokens=max_new_tokens,  # Control new tokens
-            do_sample=True,
-            temperature=0.7,
+            max_new_tokens=max_tokens,
+            temperature=0.8,
             top_k=50,
             top_p=0.9,
-            repetition_penalty=1.2,
-            pad_token_id=pad_token_id,
+            repetition_penalty=1.5,
+            num_beams=3,
             early_stopping=True
         )
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        response = response.split("Model:")[-1].strip()
+        response = re.sub(r'\s+', ' ', response)
+        history[-1] = f"User: {input_text}\nModel: {response}"
+        if not quality_manager.validate_response(input_text, response):
+            logger.error("Regenerated response also failed quality checks.")
+            response = "I'm sorry, but I couldn't provide a satisfactory response to that."
+    
+    return response, history
 
-    # Decode the response and format it properly
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+# --------------------------- Interactive Loop --------------------------- #
 
-    # Ensure clean history management and context length control
-    cleaned_response = response.split("User:")[-1].strip()  # Remove any overlap
-    cleaned_response = re.sub(r'\s+', ' ', cleaned_response)  # Clean excess whitespace
-
-    # Append the cleaned response to history
-    history.append(f"User: {input_text}\nModel: {cleaned_response}")
-
-    # Trim history to prevent excessive accumulation
-    if len(history) > 6:
-        history = history[-6:]
-
-    return cleaned_response, history
-
-# Updated user input loop to handle context better
-def user_input_loop(model, tokenizer):
+def interactive_query(model, tokenizer, quality_manager):
+    """
+    Start an interactive loop to accept user queries and generate model responses.
+    """
     print("\n--- LLaMA Instruct Model Interactive Query ---")
-    print("Type 'exit' to quit.")
-    history = []  # Initialize a history buffer to keep track of conversation
+    print("Type 'exit' to quit.\n")
+    history = []
+    
     while True:
         try:
-            user_input = input("\nEnter your query: ")
+            user_input = input("Enter your query: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting...")
             break
@@ -224,7 +262,7 @@ def user_input_loop(model, tokenizer):
             print("Exiting...")
             break
 
-        if not user_input.strip():
+        if not user_input:
             print("Please enter a valid query.")
             continue
 
@@ -232,23 +270,46 @@ def user_input_loop(model, tokenizer):
             user_input,
             model,
             tokenizer,
-            pad_token_id=pad_token_id,
-            history=history
+            history,
+            quality_manager
         )
 
-        # Evaluate response quality
-        if not quality_manager.evaluate_response(user_input, response):
-            logger.warning("Generated response failed quality checks. Regenerating...")
-            response, history = generate_response(
-                user_input,
-                model,
-                tokenizer,
-                pad_token_id=pad_token_id,
-                history=history
-            )
+        print(f"Model Response: {response}\n")
 
-        print(f"Model Response: {response}")
+# --------------------------- Main Execution --------------------------- #
 
-# Start the interactive query loop with the refined response generation
-logger.info("Model loaded successfully. You can now query the model.")
-user_input_loop(model, tokenizer)
+def main():
+    # Load model configuration
+    config = load_configuration(MODEL_JSON_PATH)
+    
+    # Initialize the model and move it to GPU
+    model = LlamaForCausalLM(config).to(device)
+    logger.info("Initialized LLaMA model on GPU.")
+    
+    # Load model weights
+    load_offloaded_weights(model, WEIGHTS_DIR)
+    
+    # Ensure the model is in evaluation mode
+    model.eval()
+    logger.info("Model is set to evaluation mode.")
+    
+    # Load tokenizer
+    tokenizer = load_tokenizer(SOURCE_DIR)
+    
+    # Resize token embeddings if a new pad token was added
+    if tokenizer.pad_token == "<|finetune_right_pad_id|>":
+        if tokenizer.pad_token not in tokenizer.get_vocab():
+            model.resize_token_embeddings(len(tokenizer))
+            logger.info("Resized model token embeddings to accommodate the new pad_token.")
+        else:
+            logger.info("pad_token already exists in the tokenizer's vocabulary. No need to resize embeddings.")
+    
+    # Initialize the Response Quality Manager
+    quality_manager = EnhancedResponseQualityManager(tokenizer)
+    
+    # Start the interactive query loop
+    logger.info("Model loaded successfully. You can now query the model.")
+    interactive_query(model, tokenizer, quality_manager)
+
+if __name__ == "__main__":
+    main()
