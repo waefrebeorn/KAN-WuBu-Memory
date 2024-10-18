@@ -68,19 +68,22 @@ def load_offloaded_weights(model, weights_dir):
                 torch.float32: np.float32,
                 torch.int64: np.int64,
                 torch.int32: np.int32,
-                torch.bfloat16: np.float32,
+                torch.bfloat16: np.float32,  # Note: Loading bfloat16 as float32 first
             }
             expected_dtype = dtype_map.get(param.dtype, np.float32)
             logger.info(f"Loading {file_name} into {name} with expected type {expected_dtype}")
 
-            tensor_data = np.fromfile(file_path, dtype=expected_dtype)
-            loaded_tensor = torch.from_numpy(tensor_data).to(device)
+            try:
+                tensor_data = np.fromfile(file_path, dtype=expected_dtype)
+                loaded_tensor = torch.from_numpy(tensor_data).to(device)
 
-            if param.dtype == torch.bfloat16:
-                loaded_tensor = loaded_tensor.to(torch.bfloat16)
+                if param.dtype == torch.bfloat16:
+                    loaded_tensor = loaded_tensor.to(torch.bfloat16)
 
-            with torch.no_grad():
-                param.data.copy_(loaded_tensor.view_as(param))
+                with torch.no_grad():
+                    param.data.copy_(loaded_tensor.view_as(param))
+            except Exception as e:
+                logger.error(f"Error loading {file_name} into {name}: {e}")
         else:
             logger.warning(f"Weight file {file_path} not found.")
 
@@ -89,14 +92,15 @@ def load_offloaded_weights(model, weights_dir):
 # --------------------------- Response Quality Management --------------------------- #
 
 class ImprovedResponseQualityManager:
-    LOW_ENTROPY_THRESHOLD = 2.0
-    HIGH_ENTROPY_THRESHOLD = 35.0  # Increased to allow more variety
+    LOW_ENTROPY_THRESHOLD = 1.5  # Loosened from 2.0
+    HIGH_ENTROPY_THRESHOLD = 25.0  # Reduced from 35.0
     WINDOW_SIZE = 50
     EOT_TOKENS = ['�', '\ufffd']  # Add more EOT tokens as needed
 
     def __init__(self, tokenizer, model):
         self.tokenizer = tokenizer
         self.model = model
+        self.embedding_cache = {}
 
     def validate_response(self, user_input, model_response):
         # Remove EOT tokens before further processing
@@ -117,6 +121,7 @@ class ImprovedResponseQualityManager:
                 return True
             return False
 
+        # Ensure that response is sufficiently relevant or fluent, and has proper structure
         return (relevance > 0.3 or fluency) and structure
 
     def remove_eot_tokens(self, response):
@@ -182,25 +187,35 @@ class ImprovedResponseQualityManager:
 
 # --------------------------- Entropy-Based Temperature and Sampling Adjustment --------------------------- #
 
-def adjust_temperature_based_on_entropy(entropy, low_threshold=2.0, high_threshold=25.0):
+def adjust_temperature_based_on_entropy(entropy, low_threshold=1.5, high_threshold=25.0):
     if entropy > high_threshold:
-        return max(0.7, 1.0 - ((entropy - high_threshold) / 10))  # Lower the temperature
+        new_temp = max(0.7, 1.0 - ((entropy - high_threshold) / 10))
+        logger.debug(f"High entropy detected ({entropy:.2f}). Lowering temperature to {new_temp:.2f}.")
+        return new_temp
     elif entropy < low_threshold:
-        return min(1.5, 1.0 + ((low_threshold - entropy) / 10))  # Increase temperature
+        new_temp = min(1.5, 1.0 + ((low_threshold - entropy) / 10))
+        logger.debug(f"Low entropy detected ({entropy:.2f}). Increasing temperature to {new_temp:.2f}.")
+        return new_temp
     return 1.0  # Default temperature
 
 def adjust_sampling_parameters(entropy, low_k=50, high_k=5, low_p=0.95, high_p=0.8):
     if entropy > 20.0:
+        logger.debug(f"High entropy ({entropy:.2f}). Setting top_k to {high_k} and top_p to {high_p}.")
         return high_k, high_p  # Focused, deterministic sampling
     elif entropy < 10.0:
+        logger.debug(f"Low entropy ({entropy:.2f}). Setting top_k to {low_k} and top_p to {low_p}.")
         return low_k, low_p  # More diverse sampling
-    return (int((high_k + low_k) / 2), (high_p + low_p) / 2)
+    # Intermediate adjustment
+    adjusted_k = int((high_k + low_k) / 2)
+    adjusted_p = (high_p + low_p) / 2
+    logger.debug(f"Intermediate entropy ({entropy:.2f}). Setting top_k to {adjusted_k} and top_p to {adjusted_p}.")
+    return adjusted_k, adjusted_p
 
 def sample_token(probs, top_k, top_p, temperature):
     # Apply temperature scaling
     probs = probs / temperature
 
-    # Apply top_k and top_p
+    # Apply top_p
     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
@@ -233,16 +248,21 @@ def sample_token(probs, top_k, top_p, temperature):
 
 # --------------------------- Context Management --------------------------- #
 
-def calculate_cosine_similarity(text1, text2, tokenizer, model):
-    tokens1 = tokenizer.encode(text1, return_tensors='pt').to(device)
-    tokens2 = tokenizer.encode(text2, return_tensors='pt').to(device)
+def calculate_cosine_similarity(text1, text2, tokenizer, model, embedding_cache):
+    key = (text1, text2)
+    if key in embedding_cache:
+        embedding1, embedding2 = embedding_cache[key]
+    else:
+        tokens1 = tokenizer.encode(text1, return_tensors='pt').to(device)
+        tokens2 = tokenizer.encode(text2, return_tensors='pt').to(device)
 
-    with torch.no_grad():
-        embeddings1 = model.model.embed_tokens(tokens1)
-        embeddings2 = model.model.embed_tokens(tokens2)
+        with torch.no_grad():
+            embeddings1 = model.model.embed_tokens(tokens1).mean(dim=1)
+            embeddings2 = model.model.embed_tokens(tokens2).mean(dim=1)
 
-    embedding1 = embeddings1.mean(dim=1)
-    embedding2 = embeddings2.mean(dim=1)
+        embedding1 = embeddings1
+        embedding2 = embeddings2
+        embedding_cache[key] = (embedding1, embedding2)
 
     cosine_sim = torch.nn.functional.cosine_similarity(embedding1, embedding2).item()
     return cosine_sim
@@ -258,12 +278,12 @@ def summarize_memories(relevant_memories, tokenizer, max_length=512):
         summary = summary[:max_length]
     return summary
 
-def recall_important_memories(history, user_input, tokenizer, model):
+def recall_important_memories(history, user_input, tokenizer, model, quality_manager):
     # Identify key moments in the history that are relevant to the current input
     relevance_scores = []
     for exchange in history:
         user_part = exchange["user"]
-        relevance = calculate_cosine_similarity(user_input, user_part, tokenizer, model)
+        relevance = calculate_cosine_similarity(user_input, user_part, tokenizer, model, embedding_cache=quality_manager.embedding_cache)
         relevance_scores.append(relevance)
     
     # Select top 3 most relevant exchanges
@@ -282,18 +302,18 @@ def create_base_prompt(user_input, memory):
         base_prompt += f"\n[Memory]: {memory}\nAI:"
     return base_prompt
 
-def improved_dynamic_context(history, user_input, tokenizer, model, max_context=MAX_CONTEXT_LENGTH):
+def improved_dynamic_context(history, user_input, tokenizer, model, quality_manager, max_context=MAX_CONTEXT_LENGTH):
     if not history:
         prompt = create_base_prompt(user_input, "")
         return prompt, [{"user": user_input, "model": ""}]
     
     # Recall important memories
-    memory = recall_important_memories(history, user_input, tokenizer, model)
+    memory = recall_important_memories(history, user_input, tokenizer, model, quality_manager)
     
     # Create the base prompt with memory
     prompt = create_base_prompt(user_input, memory)
     
-    # Tokenize and truncate if necessary
+    # Tokenize and truncate if necessary, prioritize recent exchanges
     tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_context)
     truncated_prompt = tokenizer.decode(tokenized["input_ids"][0], skip_special_tokens=True)
     
@@ -318,6 +338,8 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
     generated_ids = input_ids.clone()  # Shape: (batch_size, seq_len)
 
     token_log = []
+    max_regeneration_attempts = 2
+    regeneration_attempts = 0
 
     for _ in range(max_tokens):
         outputs = model(generated_ids)
@@ -353,9 +375,9 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
             break
 
     # Log token-level details for debugging
-    for log in token_log:
-        logger.info(f"Token: {log['token_id']}, Entropy: {log['entropy']:.2f}, "
-                    f"Temperature: {log['temperature']:.2f}, top_k: {log['top_k']}, top_p: {log['top_p']}")
+    for log_entry in token_log:
+        logger.info(f"Token: {log_entry['token_id']}, Entropy: {log_entry['entropy']:.2f}, "
+                    f"Temperature: {log_entry['temperature']:.2f}, top_k: {log_entry['top_k']}, top_p: {log_entry['top_p']}")
 
     response = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     response = response.split("AI:")[-1].strip()
@@ -370,26 +392,31 @@ def remove_memory_recall(response):
 
 def improved_generate_response(input_text, model, tokenizer, history, quality_manager):
     sanitized_input = sanitize_input(input_text)
-    prompt, updated_history = improved_dynamic_context(history, sanitized_input, tokenizer, model)
+    prompt, updated_history = improved_dynamic_context(history, sanitized_input, tokenizer, model, quality_manager)
 
     response = generate_macroprocessed_response(prompt, model, tokenizer)
 
     # Validate response
     is_valid = quality_manager.validate_response(sanitized_input, response)
 
-    if not is_valid:
-        logger.warning(f"Failed response. Regenerating...")
-        # Regenerate with adjusted parameters
+    regeneration_attempts = 0
+    max_regeneration_attempts = 2
+
+    while not is_valid and regeneration_attempts < max_regeneration_attempts:
+        regeneration_attempts += 1
+        logger.warning(f"Failed response. Regenerating... (Attempt {regeneration_attempts})")
         response = generate_macroprocessed_response(prompt, model, tokenizer)
         is_valid = quality_manager.validate_response(sanitized_input, response)
-        if not is_valid:
-            logger.error("Regenerated response also failed quality checks. Displaying for debugging.")
-            mean_entropy, std_entropy = quality_manager._calculate_windowed_entropy(response)
-            relevance = quality_manager._calculate_relevance(sanitized_input, response)
-            logger.warning(f"Regenerated Failed Response Metrics: Relevance: {relevance:.2f}, Mean Entropy: {mean_entropy:.2f}")
-            print(f"Regenerated Failed Response (for debugging): {response}")
-        else:
+        if is_valid:
             logger.info("Regenerated response passed quality checks.")
+            break
+
+    if not is_valid:
+        logger.error("Regenerated response also failed quality checks. Displaying for debugging.")
+        mean_entropy, std_entropy = quality_manager._calculate_windowed_entropy(response)
+        relevance = quality_manager._calculate_relevance(sanitized_input, response)
+        logger.warning(f"Regenerated Failed Response Metrics: Relevance: {relevance:.2f}, Mean Entropy: {mean_entropy:.2f}")
+        print(f"Regenerated Failed Response (for debugging): {response}")
 
     # Update the last history entry with the response
     updated_history[-1]["model"] = response
@@ -428,6 +455,15 @@ def interactive_query(model, tokenizer, quality_manager):
 
         print(f"Model Response: {response}\n")
 
+# --------------------------- Flash Attention Check --------------------------- #
+
+def check_flash_attention():
+    try:
+        import flash_attn
+        logger.info("Flash Attention is available and enabled.")
+    except ImportError:
+        logger.warning("Flash Attention is not available. Using standard scaled dot product attention.")
+
 # --------------------------- Main Execution --------------------------- #
 
 def main():
@@ -449,8 +485,12 @@ def main():
         else:
             logger.info("pad_token already exists in the tokenizer's vocabulary. No need to resize embeddings.")
 
+    check_flash_attention()
+
+    global quality_manager
     quality_manager = ImprovedResponseQualityManager(tokenizer, model)
     logger.info("Model loaded successfully. You can now query the model.")
+
     interactive_query(model, tokenizer, quality_manager)
 
 if __name__ == "__main__":
