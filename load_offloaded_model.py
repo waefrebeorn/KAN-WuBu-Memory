@@ -198,32 +198,22 @@ def adjust_sampling_parameters(entropy, low_k=50, high_k=5, low_p=0.95, high_p=0
     return (int((high_k + low_k) / 2), (high_p + low_p) / 2)
 
 def sample_token(probs, top_k, top_p, temperature):
-    # Apply temperature
+    # Apply temperature scaling
     probs = probs / temperature
-    # Apply top_k and top_p
-    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-    # Remove tokens with cumulative probability above the threshold
-    sorted_indices_to_remove = cumulative_probs > top_p
-    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-    sorted_indices_to_remove[..., 0] = False
-
-    indices_to_remove = sorted_indices_to_remove.scatter(
-        dim=1, index=sorted_indices, src=sorted_indices_to_remove
-    )
-    probs[indices_to_remove] = 0.0
-    probs = probs / probs.sum()
-
-    # Top-K
+    # Apply top_k sampling (if top_k > 0)
     if top_k > 0:
         topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
-        probs = topk_probs
-        indices = topk_indices
+        cumulative_probs = torch.cumsum(topk_probs, dim=-1)
+        topk_indices_to_remove = cumulative_probs > top_p
+        topk_probs[topk_indices_to_remove] = 0.0
+        topk_probs /= topk_probs.sum()
+        indices = torch.multinomial(topk_probs, num_samples=1)
+        return topk_indices[indices]  # Return the index (token) from the top_k sampling
     else:
-        indices = torch.multinomial(probs, num_samples=1)
+        # If no top_k, do multinomial sampling directly from probabilities
+        return torch.multinomial(probs, num_samples=1).squeeze(0)  # Return single token
 
-    return indices.squeeze(0)
 
 # --------------------------- Context Management --------------------------- #
 
@@ -322,26 +312,23 @@ def generate_macroprocessed_response(prompt, model, tokenizer):
         temperature = adjust_temperature_based_on_entropy(entropy)
         top_k, top_p = adjust_sampling_parameters(entropy)
         
-        # Sample a single token (ensure it's a single token)
+        # Sample a single token
         token_id = sample_token(probs, top_k, top_p, temperature)
-
-        # If `token_id` is not scalar, we need to extract the single token
-        if token_id.dim() > 0:
-            token_id = token_id.squeeze(0)  # Ensure single scalar token
-
+        
         generated_ids = torch.cat([generated_ids, token_id.unsqueeze(0)], dim=-1)
         
         token_log.append({
-            "token_id": token_id.item(),  # This should now work correctly
+            "token_id": token_id.item(),  # This will now work correctly
             "entropy": entropy,
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p
         })
-        
+    
         # Check for end-of-sequence token
         if token_id.item() in tokenizer.all_special_ids:
             break
+    
 
     # Log token-level details for debugging
     for log in token_log:
