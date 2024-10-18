@@ -59,69 +59,291 @@ def update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size):
 def prepare_tokenizer_config(tokenizer_config_path, correct_vocab_size):
     update_tokenizer_vocab_size(tokenizer_config_path, correct_vocab_size)
 
-# Function to merge tokens from tokenizer.json and tokenizer_config.json
-def merge_tokenizers(tokenizer_json_path, tokenizer_config_path):
-    # Load tokenizer.json
-    with open(tokenizer_json_path, "r", encoding='utf-8') as f:
-        tokenizer_data = json.load(f)
-    
-    # Load tokenizer_config.json
-    with open(tokenizer_config_path, "r", encoding='utf-8') as f:
-        tokenizer_config_data = json.load(f)
-    
-    # Extract added tokens from tokenizer_config.json
-    added_tokens = tokenizer_config_data.get("added_tokens_decoder", {})
-    
-    # Assuming tokenizer_data has a 'tokens' key which is a list of token entries
-    # Each token entry is a dictionary with 'id' and 'content'
-    existing_token_ids = set()
-    if "tokens" in tokenizer_data:
-        for token in tokenizer_data["tokens"]:
-            existing_token_ids.add(token["id"])
-    else:
-        tokenizer_data["tokens"] = []
-    
-    # Add new tokens from added_tokens
-    for token_id_str, token_info in added_tokens.items():
-        token_id = int(token_id_str)
-        content = token_info["content"]
-        if token_id not in existing_token_ids:
-            tokenizer_data["tokens"].append({"id": token_id, "content": content})
-            existing_token_ids.add(token_id)
-            logging.info(f"Added new token: ID={token_id}, Content='{content}'")
-        else:
-            logging.info(f"Token ID={token_id} already exists. Skipping.")
-    
-    # Verify total number of tokens
-    total_tokens = len(tokenizer_data["tokens"])
-    logging.info(f"Total number of tokens after merging: {total_tokens}")
-    
-    return tokenizer_data
-
-# Function to load tokenizer with merged tokens and correct vocab size
-def load_tokenizer_with_merged_tokens(source_dir, tokenizer_json_path, tokenizer_config_path, model_config):
-    # Merge tokens
-    merged_tokenizer_data = merge_tokenizers(tokenizer_json_path, tokenizer_config_path)
-    
-    # Load special tokens from special_tokens_map.json
-    with open(SPECIAL_TOKENS_MAP_PATH, "r", encoding='utf-8') as f:
+# Function to load special tokens from special_tokens_map.json
+def load_special_tokens(special_tokens_map_path):
+    with open(special_tokens_map_path, "r", encoding='utf-8') as f:
         special_tokens_map = json.load(f)
     
     # Extract special tokens
-    bos_token = special_tokens_map.get("bos_token", "<|begin_of_text|>")
-    eos_token = special_tokens_map.get("eos_token", "<|end_of_text|>")
-    pad_token = special_tokens_map.get("pad_token", "<|finetune_right_pad_id|>")
+    special_tokens = {
+        'bos_token': special_tokens_map.get("bos_token", "<|begin_of_text|>"),
+        'eos_token': special_tokens_map.get("eos_token", "<|end_of_text|>"),
+        'pad_token': special_tokens_map.get("pad_token", "<|finetune_right_pad_id|>"),
+    }
     
-    # Initialize the tokenizer with merged tokens
-    tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=merged_tokenizer_data,
-        bos_token=bos_token,
-        eos_token=eos_token,
-        pad_token=pad_token,
-        model_max_length=model_config.max_position_embeddings,
+    return special_tokens
+
+# Function to load tokenizer and add special tokens
+def load_tokenizer_with_special_tokens(source_dir, tokenizer_json_path, special_tokens_map_path, model_config):
+    # Load tokenizer using from_pretrained
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(
+        source_dir,
+        tokenizer_file=tokenizer_json_path,
+        bos_token="<|begin_of_text|>",
+        eos_token="<|end_of_text|>",
+        pad_token="<|finetune_right_pad_id|>",
     )
     
-    # Manually enforce vocab_size
+    # Load special tokens
+    special_tokens = load_special_tokens(special_tokens_map_path)
+    
+    # Define additional special tokens
+    additional_special_tokens = [
+        "<|reserved_special_token_0|>",
+        "<|reserved_special_token_1|>",
+        "<|reserved_special_token_2|>",
+        "<|reserved_special_token_3|>",
+        "<|reserved_special_token_4|>",
+        "<|reserved_special_token_5|>",
+        "<|reserved_special_token_6|>",
+        "<|reserved_special_token_7|>",
+        "<|reserved_special_token_8|>",
+        "<|reserved_special_token_9|>",
+        "<|reserved_special_token_10|>",
+        "<|reserved_special_token_11|>",
+        "<|reserved_special_token_12|>",
+        "<|reserved_special_token_13|>",
+        "<|reserved_special_token_14|>",
+        "<|reserved_special_token_15|>",
+        "<|reserved_special_token_16|>",
+        "<|reserved_special_token_17|>",
+        "<|reserved_special_token_18|>",
+        "<|reserved_special_token_19|>",
+        "<|reserved_special_token_20|>",
+        "<|reserved_special_token_21|>",
+        "<|reserved_special_token_22|>",
+        "<|reserved_special_token_23|>",
+        "<|reserved_special_token_24|>",
+        "<|reserved_special_token_25|>",
+        "<|reserved_special_token_26|>",
+        "<|reserved_special_token_27|>",
+        "<|reserved_special_token_28|>",
+        "<|reserved_special_token_29|>",
+        "<|reserved_special_token_30|>",
+        "<|reserved_special_token_31|>",
+        "<|reserved_special_token_32|>",
+        "<|reserved_special_token_33|>",
+        "<|reserved_special_token_34|>",
+        "<|reserved_special_token_35|>",
+        "<|reserved_special_token_36|>",
+        "<|reserved_special_token_37|>",
+        "<|reserved_special_token_38|>",
+        "<|reserved_special_token_39|>",
+        "<|reserved_special_token_40|>",
+        "<|reserved_special_token_41|>",
+        "<|reserved_special_token_42|>",
+        "<|reserved_special_token_43|>",
+        "<|reserved_special_token_44|>",
+        "<|reserved_special_token_45|>",
+        "<|reserved_special_token_46|>",
+        "<|reserved_special_token_47|>",
+        "<|reserved_special_token_48|>",
+        "<|reserved_special_token_49|>",
+        "<|reserved_special_token_50|>",
+        "<|reserved_special_token_51|>",
+        "<|reserved_special_token_52|>",
+        "<|reserved_special_token_53|>",
+        "<|reserved_special_token_54|>",
+        "<|reserved_special_token_55|>",
+        "<|reserved_special_token_56|>",
+        "<|reserved_special_token_57|>",
+        "<|reserved_special_token_58|>",
+        "<|reserved_special_token_59|>",
+        "<|reserved_special_token_60|>",
+        "<|reserved_special_token_61|>",
+        "<|reserved_special_token_62|>",
+        "<|reserved_special_token_63|>",
+        "<|reserved_special_token_64|>",
+        "<|reserved_special_token_65|>",
+        "<|reserved_special_token_66|>",
+        "<|reserved_special_token_67|>",
+        "<|reserved_special_token_68|>",
+        "<|reserved_special_token_69|>",
+        "<|reserved_special_token_70|>",
+        "<|reserved_special_token_71|>",
+        "<|reserved_special_token_72|>",
+        "<|reserved_special_token_73|>",
+        "<|reserved_special_token_74|>",
+        "<|reserved_special_token_75|>",
+        "<|reserved_special_token_76|>",
+        "<|reserved_special_token_77|>",
+        "<|reserved_special_token_78|>",
+        "<|reserved_special_token_79|>",
+        "<|reserved_special_token_80|>",
+        "<|reserved_special_token_81|>",
+        "<|reserved_special_token_82|>",
+        "<|reserved_special_token_83|>",
+        "<|reserved_special_token_84|>",
+        "<|reserved_special_token_85|>",
+        "<|reserved_special_token_86|>",
+        "<|reserved_special_token_87|>",
+        "<|reserved_special_token_88|>",
+        "<|reserved_special_token_89|>",
+        "<|reserved_special_token_90|>",
+        "<|reserved_special_token_91|>",
+        "<|reserved_special_token_92|>",
+        "<|reserved_special_token_93|>",
+        "<|reserved_special_token_94|>",
+        "<|reserved_special_token_95|>",
+        "<|reserved_special_token_96|>",
+        "<|reserved_special_token_97|>",
+        "<|reserved_special_token_98|>",
+        "<|reserved_special_token_99|>",
+        "<|reserved_special_token_100|>",
+        "<|reserved_special_token_101|>",
+        "<|reserved_special_token_102|>",
+        "<|reserved_special_token_103|>",
+        "<|reserved_special_token_104|>",
+        "<|reserved_special_token_105|>",
+        "<|reserved_special_token_106|>",
+        "<|reserved_special_token_107|>",
+        "<|reserved_special_token_108|>",
+        "<|reserved_special_token_109|>",
+        "<|reserved_special_token_110|>",
+        "<|reserved_special_token_111|>",
+        "<|reserved_special_token_112|>",
+        "<|reserved_special_token_113|>",
+        "<|reserved_special_token_114|>",
+        "<|reserved_special_token_115|>",
+        "<|reserved_special_token_116|>",
+        "<|reserved_special_token_117|>",
+        "<|reserved_special_token_118|>",
+        "<|reserved_special_token_119|>",
+        "<|reserved_special_token_120|>",
+        "<|reserved_special_token_121|>",
+        "<|reserved_special_token_122|>",
+        "<|reserved_special_token_123|>",
+        "<|reserved_special_token_124|>",
+        "<|reserved_special_token_125|>",
+        "<|reserved_special_token_126|>",
+        "<|reserved_special_token_127|>",
+        "<|reserved_special_token_128|>",
+        "<|reserved_special_token_129|>",
+        "<|reserved_special_token_130|>",
+        "<|reserved_special_token_131|>",
+        "<|reserved_special_token_132|>",
+        "<|reserved_special_token_133|>",
+        "<|reserved_special_token_134|>",
+        "<|reserved_special_token_135|>",
+        "<|reserved_special_token_136|>",
+        "<|reserved_special_token_137|>",
+        "<|reserved_special_token_138|>",
+        "<|reserved_special_token_139|>",
+        "<|reserved_special_token_140|>",
+        "<|reserved_special_token_141|>",
+        "<|reserved_special_token_142|>",
+        "<|reserved_special_token_143|>",
+        "<|reserved_special_token_144|>",
+        "<|reserved_special_token_145|>",
+        "<|reserved_special_token_146|>",
+        "<|reserved_special_token_147|>",
+        "<|reserved_special_token_148|>",
+        "<|reserved_special_token_149|>",
+        "<|reserved_special_token_150|>",
+        "<|reserved_special_token_151|>",
+        "<|reserved_special_token_152|>",
+        "<|reserved_special_token_153|>",
+        "<|reserved_special_token_154|>",
+        "<|reserved_special_token_155|>",
+        "<|reserved_special_token_156|>",
+        "<|reserved_special_token_157|>",
+        "<|reserved_special_token_158|>",
+        "<|reserved_special_token_159|>",
+        "<|reserved_special_token_160|>",
+        "<|reserved_special_token_161|>",
+        "<|reserved_special_token_162|>",
+        "<|reserved_special_token_163|>",
+        "<|reserved_special_token_164|>",
+        "<|reserved_special_token_165|>",
+        "<|reserved_special_token_166|>",
+        "<|reserved_special_token_167|>",
+        "<|reserved_special_token_168|>",
+        "<|reserved_special_token_169|>",
+        "<|reserved_special_token_170|>",
+        "<|reserved_special_token_171|>",
+        "<|reserved_special_token_172|>",
+        "<|reserved_special_token_173|>",
+        "<|reserved_special_token_174|>",
+        "<|reserved_special_token_175|>",
+        "<|reserved_special_token_176|>",
+        "<|reserved_special_token_177|>",
+        "<|reserved_special_token_178|>",
+        "<|reserved_special_token_179|>",
+        "<|reserved_special_token_180|>",
+        "<|reserved_special_token_181|>",
+        "<|reserved_special_token_182|>",
+        "<|reserved_special_token_183|>",
+        "<|reserved_special_token_184|>",
+        "<|reserved_special_token_185|>",
+        "<|reserved_special_token_186|>",
+        "<|reserved_special_token_187|>",
+        "<|reserved_special_token_188|>",
+        "<|reserved_special_token_189|>",
+        "<|reserved_special_token_190|>",
+        "<|reserved_special_token_191|>",
+        "<|reserved_special_token_192|>",
+        "<|reserved_special_token_193|>",
+        "<|reserved_special_token_194|>",
+        "<|reserved_special_token_195|>",
+        "<|reserved_special_token_196|>",
+        "<|reserved_special_token_197|>",
+        "<|reserved_special_token_198|>",
+        "<|reserved_special_token_199|>",
+        "<|reserved_special_token_200|>",
+        "<|reserved_special_token_201|>",
+        "<|reserved_special_token_202|>",
+        "<|reserved_special_token_203|>",
+        "<|reserved_special_token_204|>",
+        "<|reserved_special_token_205|>",
+        "<|reserved_special_token_206|>",
+        "<|reserved_special_token_207|>",
+        "<|reserved_special_token_208|>",
+        "<|reserved_special_token_209|>",
+        "<|reserved_special_token_210|>",
+        "<|reserved_special_token_211|>",
+        "<|reserved_special_token_212|>",
+        "<|reserved_special_token_213|>",
+        "<|reserved_special_token_214|>",
+        "<|reserved_special_token_215|>",
+        "<|reserved_special_token_216|>",
+        "<|reserved_special_token_217|>",
+        "<|reserved_special_token_218|>",
+        "<|reserved_special_token_219|>",
+        "<|reserved_special_token_220|>",
+        "<|reserved_special_token_221|>",
+        "<|reserved_special_token_222|>",
+        "<|reserved_special_token_223|>",
+        "<|reserved_special_token_224|>",
+        "<|reserved_special_token_225|>",
+        "<|reserved_special_token_226|>",
+        "<|reserved_special_token_227|>",
+        "<|reserved_special_token_228|>",
+        "<|reserved_special_token_229|>",
+        "<|reserved_special_token_230|>",
+        "<|reserved_special_token_231|>",
+        "<|reserved_special_token_232|>",
+        "<|reserved_special_token_233|>",
+        "<|reserved_special_token_234|>",
+        "<|reserved_special_token_235|>",
+        "<|reserved_special_token_236|>",
+        "<|reserved_special_token_237|>",
+        "<|reserved_special_token_238|>",
+        "<|reserved_special_token_239|>",
+        "<|reserved_special_token_240|>",
+        "<|reserved_special_token_241|>",
+        "<|reserved_special_token_242|>",
+        "<|reserved_special_token_243|>",
+        "<|reserved_special_token_244|>",
+        "<|reserved_special_token_245|>",
+        "<|reserved_special_token_246|>",
+        "<|reserved_special_token_247|>",
+    ]
+    
+    # Add additional special tokens to the tokenizer
+    tokenizer.add_special_tokens({'additional_special_tokens': additional_special_tokens})
+    logging.info(f"Added {len(additional_special_tokens)} additional special tokens.")
+    
+    # Update vocab_size
     tokenizer.vocab_size = 128256
     logging.info(f"Tokenizer vocab_size set to: {tokenizer.vocab_size}")
     
@@ -350,9 +572,9 @@ if __name__ == "__main__":
         config = load_configuration(MODEL_JSON_PATH)
         prepare_tokenizer_config(TOKENIZER_CONFIG_PATH, config.vocab_size)
 
-        # Merge tokens and load tokenizer
-        logging.info("Loading and merging tokenizer tokens...")
-        tokenizer = load_tokenizer_with_merged_tokens(SOURCE_DIR, TOKENIZER_JSON_PATH, TOKENIZER_CONFIG_PATH, config)
+        # Load tokenizer and add special tokens
+        logging.info("Loading and adding special tokens to tokenizer...")
+        tokenizer = load_tokenizer_with_special_tokens(TOKENIZER_JSON_PATH, SPECIAL_TOKENS_MAP_PATH, config)
 
         # Initialize the optimized model
         logging.info("Initializing the optimized Stacked LLaMA Network.")
