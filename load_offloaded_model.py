@@ -112,7 +112,7 @@ class EnhancedResponseQualityManager:
     """
     # Define entropy thresholds
     LOW_ENTROPY_THRESHOLD = 2.0  # Too predictable
-    HIGH_ENTROPY_THRESHOLD = 10.0  # Too chaotic
+    HIGH_ENTROPY_THRESHOLD = 25.0  # Increased to allow more diversity
     WINDOW_SIZE = 50  # Window size for windowed entropy
 
     def __init__(self, tokenizer, model):
@@ -135,6 +135,10 @@ class EnhancedResponseQualityManager:
         # Determine validity based on entropy range
         if not (self.LOW_ENTROPY_THRESHOLD <= mean_entropy <= self.HIGH_ENTROPY_THRESHOLD):
             logger.info(f"Response entropy {mean_entropy:.2f} out of range ({self.LOW_ENTROPY_THRESHOLD}, {self.HIGH_ENTROPY_THRESHOLD})")
+            # Implement dynamic thresholding: Allow if relevance and fluency are high
+            if relevance > 0.5 and fluency:
+                logger.info("High relevance and fluency compensate for entropy out of range.")
+                return True
             return False
 
         # Adjust validation logic based on input length
@@ -355,7 +359,8 @@ def generate_response(input_text, model, tokenizer, history, quality_manager):
     logger.info(f"Response time: {response_time:.2f}s, Valid: {is_valid}")
 
     if not is_valid:
-        logger.warning(f"Failed response due to metrics. Showing for debugging: Relevance: {quality_manager._calculate_relevance(sanitized_input, response):.2f}, Mean Entropy: {quality_manager._calculate_windowed_entropy(response)[0]:.2f}")
+        mean_entropy, _ = quality_manager._calculate_windowed_entropy(response)
+        logger.warning(f"Failed response due to metrics. Showing for debugging: Relevance: {quality_manager._calculate_relevance(sanitized_input, response):.2f}, Mean Entropy: {mean_entropy:.2f}")
         print(f"Failed Response (for debugging): {response}")
 
         # Attempt regeneration once for debugging purposes
@@ -380,7 +385,9 @@ def generate_response(input_text, model, tokenizer, history, quality_manager):
         # Re-validate the regenerated response
         is_valid = quality_manager.validate_response(sanitized_input, regenerated_response)
         if not is_valid:
+            mean_entropy, _ = quality_manager._calculate_windowed_entropy(regenerated_response)
             logger.error("Regenerated response also failed quality checks. Displaying for debugging.")
+            logger.warning(f"Regenerated Failed Response Metrics: Relevance: {quality_manager._calculate_relevance(sanitized_input, regenerated_response):.2f}, Mean Entropy: {mean_entropy:.2f}")
             print(f"Regenerated Failed Response (for debugging): {regenerated_response}")
             response = regenerated_response  # Keep the failed regenerated response for debugging
         else:
