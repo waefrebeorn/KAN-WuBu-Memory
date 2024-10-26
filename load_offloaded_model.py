@@ -1,117 +1,88 @@
 import os
-import torch
 import json
-import logging
 import re
+import gc
+import logging
+import torch
+import torch.nn.functional as F
 import numpy as np
-from math import log2
+import matplotlib
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib import cm
+import matplotlib.animation as animation
+from tqdm import tqdm
+from sklearn.decomposition import PCA
 from transformers import (
     LlamaForCausalLM,
-    AutoTokenizer,
     LlamaConfig,
+    AutoTokenizer,
+    set_seed
 )
-import torch.nn.functional as F
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from tqdm import tqdm
-from matplotlib import pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from sklearn.decomposition import PCA
 
 # --------------------------- Configuration --------------------------- #
 
-SOURCE_DIR = "models/Llama_32_1B/"
-WEIGHTS_DIR = os.path.join(SOURCE_DIR, "offload")
-MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")
-MAX_CONTEXT_LENGTH = 2048
+# Define paths (Update these paths according to your environment)
+SOURCE_DIR = "models/Llama_32_1B/"  # Directory containing the tokenizer and config.json
+WEIGHTS_DIR = os.path.join(SOURCE_DIR, "offload")  # Directory containing .dat weight files
+MODEL_JSON_PATH = os.path.join(SOURCE_DIR, "config.json")  # Path to model config
 
-LOG_FORMAT = "%(asctime)s:%(levelname)s:%(name)s: %(message)s"
-LOG_LEVEL = logging.INFO
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --------------------------- Logging Setup --------------------------- #
-
+# Logging configuration
 logging.basicConfig(
-    level=LOG_LEVEL,
-    format=LOG_FORMAT,
-    handlers=[logging.StreamHandler()]
+    level=logging.INFO,
+    format="%(asctime)s:%(levelname)s:%(name)s:%(message)s",
+    handlers=[
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# --------------------------- Device Configuration --------------------------- #
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if device.type != "cuda":
-    logger.error("CUDA-enabled GPU not found. Please ensure a compatible GPU is available.")
-    raise SystemExit("CUDA-enabled GPU not found.")
-
-logger.info(f"Using device: {device}")
-
-# --------------------------- Token Definitions --------------------------- #
-
+# Special tokens map (Update as per your tokenizer's special tokens)
 SPECIAL_TOKEN_MAP = {
-    128000: "<|begin_of_text|>",
-    128001: "<|end_of_text|>",
-    128002: "<|reserved_special_token_0|>",
-    128003: "<|reserved_special_token_1|>",
-    128004: "<|finetune_right_pad_id|>",
-    128005: "<|reserved_special_token_2|>",
-    128006: "<|start_header_id|>",
-    128007: "<|end_header_id|>",
-    128008: "<|eom_id|>",
-    128009: "<|eot_id|>",
-    128010: "<|python_tag|>",
-    128011: "<|analytical_start|>",
-    128012: "<|analytical_end|>",
-    128013: "<|creative_start|>",
-    128014: "<|creative_end|>",
-    128015: "<|factual_start|>",
-    128016: "<|factual_end|>",
+    "<|eot_id|>": 16770,  # Example mapping, replace with actual IDs
+    "<|eom_id|>": 11,
+    "<|finetune_right_pad_id|>": 0,
+    # Add other special tokens if necessary
 }
 
-# --------------------------- User Configuration --------------------------- #
+# Maximum context length
+MAX_CONTEXT_LENGTH = 2048
 
+# User Configuration Class
 class UserConfig:
-    """Interface to set up and customize model configurations and preferences for a macroprocessor-like model."""
-    def __init__(self, config_file=None):
-        self.config = {
-            "max_length": 2048,
-            "initial_weights": {
-                "entropy": 1.0,
-                "varentropy": 0.5,
-                "kl_div": 0.3,
-                "perplexity": 0.2
-            },
-            "visualization_frequency": 5,
-            "logging_level": "INFO",
-            "interactive_visuals": True,
-            "precision": "float16",  # Use float16 or bfloat16 for inference
-            "kv_cache_enabled": True  # Enable smart KV-caching
+    def __init__(self, config_path=None):
+        # Default configurations
+        self.max_length = 2048
+        self.initial_weights = {
+            'entropy': 1.0,
+            'varentropy': 0.5,
+            'kl_div': 0.3,
+            'perplexity': 0.2
         }
-        if config_file:
-            self.load_config(config_file)
+        self.visualization_frequency = 5
+        self.logging_level = "INFO"
+        self.interactive_visuals = True
+        self.precision = "float16"
+        self.kv_cache_enabled = True
 
-    def load_config(self, file_path):
-        """Load configuration from a JSON file."""
-        with open(file_path, 'r') as f:
-            self.config = json.load(f)
-        logger.info(f"Configuration loaded from {file_path}")
+        # Load configurations from a JSON file if provided
+        if config_path and os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config_data = json.load(f)
+                self.max_length = config_data.get("max_length", self.max_length)
+                self.initial_weights = config_data.get("initial_weights", self.initial_weights)
+                self.visualization_frequency = config_data.get("visualization_frequency", self.visualization_frequency)
+                self.logging_level = config_data.get("logging_level", self.logging_level)
+                self.interactive_visuals = config_data.get("interactive_visuals", self.interactive_visuals)
+                self.precision = config_data.get("precision", self.precision)
+                self.kv_cache_enabled = config_data.get("kv_cache_enabled", self.kv_cache_enabled)
 
-    def save_config(self, file_path):
-        """Save the current configuration to a JSON file."""
-        with open(file_path, 'w') as f:
-            json.dump(self.config, f, indent=4)
-        logger.info(f"Configuration saved to {file_path}")
-
-    def update_config(self, key, value):
-        """Update a specific configuration setting."""
-        self.config[key] = value
-        logger.info(f"Configuration updated: {key} = {value}")
-
-    def get_config(self):
-        """Return the current configuration."""
-        return self.config
-
-# --------------------------- Helper Functions for Loss and Metrics --------------------------- #
+# --------------------------- Helper Functions --------------------------- #
 
 def calculate_entropy(logits):
     """Calculate entropy from logits."""
@@ -120,15 +91,17 @@ def calculate_entropy(logits):
     return entropy
 
 def calculate_varentropy(entropy):
-    """Calculate varentropy from entropy values."""
-    return torch.var(entropy)
+    """Calculate variance of entropy."""
+    if entropy.numel() <= 1:
+        return torch.tensor(0.0).to(entropy.device)
+    varentropy = torch.var(entropy, unbiased=False)
+    return varentropy
 
-def calculate_kl_divergence(logits, target_distribution=None):
-    """Calculate KL divergence between logits and a target distribution."""
+def calculate_kl_divergence(logits):
+    """Calculate KL divergence from logits to uniform distribution."""
     probs = F.softmax(logits, dim=-1)
-    if target_distribution is None:
-        target_distribution = torch.ones_like(probs) / probs.size(-1)  # Uniform distribution
-    kl_div = torch.sum(probs * (torch.log(probs + 1e-10) - torch.log(target_distribution + 1e-10)), dim=-1)
+    uniform = torch.full_like(probs, 1.0 / probs.size(-1))
+    kl_div = F.kl_div(probs.log(), uniform, reduction='batchmean')
     return kl_div
 
 def calculate_perplexity(logits):
@@ -137,7 +110,7 @@ def calculate_perplexity(logits):
     perplexity = torch.exp(-torch.sum(probs * torch.log(probs + 1e-10), dim=-1))
     return perplexity
 
-# --------------------------- Adaptive Weighting System for Losses --------------------------- #
+# --------------------------- Adaptive Weighting System --------------------------- #
 
 class AdaptiveWeightingSystem:
     """
@@ -179,76 +152,75 @@ class AdaptiveWeightingSystem:
     def get_weights(self):
         return self.weights
 
-# --------------------------- Token Selection with Adaptive Weighting and Memory Efficiency --------------------------- #
+# --------------------------- 4D Visualization --------------------------- #
 
-def select_token_with_weights(logits, vertex_movements, loss_weighting_system, precision="float16"):
-    """Efficient token selection using entropy, varentropy, and configurable loss weights with precision support."""
-    if precision == "float16":
-        logits = logits.half()  # Switch to float16 for inference speedup
-        logger.debug("Switched logits to float16 precision.")
-    elif precision == "bfloat16":
-        logits = logits.bfloat16()  # Alternatively, use bfloat16
-        logger.debug("Switched logits to bfloat16 precision.")
+class VRAMEfficient4DVisualizer:
+    """VRAM-efficient 4D Visualizer using Matplotlib for interactive 3D plotting with entropy as color."""
+    def __init__(self):
+        # Set Matplotlib backend for Windows
+        matplotlib.use('TkAgg')  # Ensure compatibility with Windows 11
+        self.fig = plt.figure()
+        self.ax = self.fig.add_subplot(111, projection='3d')
+        self.scatter = None
+        self.anim = None
+        self.is_plotting = False  # To prevent multiple plots
 
-    # Compute multiple losses
-    entropy = calculate_entropy(logits)
-    varentropy = calculate_varentropy(entropy)
-    kl_div = calculate_kl_divergence(logits)
-    perplexity = calculate_perplexity(logits)
+    def plot_4d_visualization(self, hidden_states, entropies, time_steps):
+        """Visualizes hidden states along with entropies in 4D space."""
+        if self.is_plotting:
+            # Avoid plotting multiple times simultaneously
+            return
 
-    # Log losses to adjust weights dynamically
-    loss_weighting_system.log_losses(entropy, varentropy, kl_div, perplexity)
+        if len(hidden_states) == 0 or len(entropies) == 0:
+            logger.warning("No data available for visualization.")
+            return
 
-    # Adjust weights based on historical performance
-    loss_weighting_system.adjust_weights()
-    weights = loss_weighting_system.get_weights()
+        if hidden_states.shape[0] < 3:
+            logger.warning("Not enough data points for 3D PCA visualization.")
+            return
 
-    # Adjust logits by the weighted sum of losses and vertex movements
-    adjusted_logits = logits - (
-        weights['entropy'] * entropy +
-        weights['varentropy'] * varentropy +
-        weights['kl_div'] * kl_div +
-        weights['perplexity'] * perplexity
-    ).unsqueeze(-1)
+        self.is_plotting = True
 
-    # Apply vertex movement strategy
-    adjusted_logits += vertex_movements
+        try:
+            # Apply PCA for 3D projection
+            pca = PCA(n_components=3)
+            # Flatten hidden_states if they have more dimensions
+            flattened_states = hidden_states.reshape(hidden_states.shape[0], -1)
+            projected_states = pca.fit_transform(flattened_states)
 
-    # Sample from adjusted probabilities
-    probs = F.softmax(adjusted_logits, dim=-1)
-    selected_token = torch.multinomial(probs, 1)
-    
-    logger.debug(f"Selected token ID: {selected_token.item()}")
+            # Normalize colors for colormap based on entropy
+            colors = np.array(entropies)
+            colors_norm = (colors - np.min(colors)) / (np.max(colors) - np.min(colors) + 1e-10)
 
-    return selected_token, adjusted_logits
+            # Clear previous scatter
+            self.ax.cla()
 
-# --------------------------- Interactive 3D Visualization with Matplotlib --------------------------- #
+            # Initialize scatter plot
+            self.scatter = self.ax.scatter(
+                projected_states[:, 0], projected_states[:, 1], projected_states[:, 2],
+                c=colors_norm, cmap='viridis', marker='o', s=20, alpha=0.6
+            )
+            self.ax.set_xlabel("PCA 1")
+            self.ax.set_ylabel("PCA 2")
+            self.ax.set_zlabel("PCA 3")
+            self.fig.colorbar(self.scatter, ax=self.ax, label="Entropy")
+            self.ax.set_title("4D Visualization of Hidden States (Entropy as Color)")
 
-def plot_interactive_3d_space(hidden_states, entropies, time_steps):
-    """Optimized 3D projection with token-level interactivity using Matplotlib."""
-    pca = PCA(n_components=3)
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    plt.ion()  # Interactive mode on
+            # Animation function to rotate the view
+            def update(frame):
+                self.ax.view_init(elev=10., azim=frame % 360)
+                return self.scatter,
 
-    for hs, entropy, time_step in zip(hidden_states, entropies, time_steps):
-        if hs is None or hs.numel() == 0:
-            continue
-        projected_hs = pca.fit_transform(hs.detach().cpu().numpy())
-        entropy_norm = (entropy.detach().cpu().numpy() - np.min(entropy.detach().cpu().numpy())) / \
-                       (np.max(entropy.detach().cpu().numpy()) - np.min(entropy.detach().cpu().numpy()) + 1e-10)
-        ax.scatter(projected_hs[:, 0], projected_hs[:, 1], projected_hs[:, 2],
-                   c=entropy_norm, cmap='viridis', marker='o', s=5, alpha=0.6, label=f"Step {time_step}")
-        plt.draw()
-        plt.pause(0.001)  # Small pause to update the plot
-
-    ax.set_title("Token-wise 3D Space Travel with Layer Progression")
-    ax.set_xlabel('PCA 1')
-    ax.set_ylabel('PCA 2')
-    ax.set_zlabel('PCA 3')
-    plt.ioff()
-    plt.show()
-    logger.info("Displayed interactive 3D visualization.")
+            # Create animation
+            self.anim = animation.FuncAnimation(
+                self.fig, update, frames=range(0, 360, 2), interval=50, blit=False, repeat=True
+            )
+            plt.show(block=False)  # Non-blocking show
+            logger.info("Displayed interactive 4D visualization.")
+        except Exception as e:
+            logger.error(f"Visualization error: {e}")
+        finally:
+            self.is_plotting = False
 
 # --------------------------- Context Management --------------------------- #
 
@@ -372,12 +344,12 @@ class ImprovedResponseQualityManager:
     def _calculate_windowed_entropy(self, response):
         tokens = self.tokenizer.encode(response, return_tensors='pt').to(device)
         with torch.no_grad():
-            outputs = self.model(tokens, labels=tokens)
+            outputs = self.model(tokens, labels=tokens, output_hidden_states=True)
             logits = outputs.logits
 
         probabilities = torch.softmax(logits, dim=-1)
         token_probs = probabilities.gather(2, tokens.unsqueeze(-1)).squeeze(-1)
-        token_entropy = -torch.log2(token_probs + 1e-10)
+        token_entropy = -torch.log(token_probs + 1e-10)
         token_entropy = token_entropy.squeeze(0).cpu().numpy()
 
         window_size = self.WINDOW_SIZE
@@ -403,7 +375,7 @@ class ImprovedResponseQualityManager:
         logger.debug(f"Calculated windowed entropy: Mean={mean_entropy:.4f}, Std={std_entropy:.4f}")
         return mean_entropy, std_entropy
 
-# --------------------------- Entropy-Based Temperature and Sampling Adjustment --------------------------- #
+# --------------------------- Sampling Adjustments --------------------------- #
 
 def adjust_temperature_based_on_entropy(entropy, low_threshold=1.5, high_threshold=25.0):
     if entropy > high_threshold:
@@ -448,6 +420,7 @@ def sample_token(probs, top_k, top_p, temperature, special_tokens_set):
 
     probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-10)
     
+    # Prioritize special tokens if their probability exceeds a threshold
     for token_id in special_tokens_set:
         if probs[0, token_id] > 0.1:  # Threshold can be adjusted
             logger.info(f"Prioritizing special token: {SPECIAL_TOKEN_MAP.get(token_id, 'UNKNOWN')}")
@@ -455,11 +428,56 @@ def sample_token(probs, top_k, top_p, temperature, special_tokens_set):
 
     token_id = torch.multinomial(probs, num_samples=1)
     logger.debug(f"Sampled token ID: {token_id.item()}")
+
     return token_id
+
+# --------------------------- Token Selection with Adaptive Weighting --------------------------- #
+
+def select_token_with_weights(logits, vertex_movements, loss_weighting_system, precision="float16"):
+    """Efficient token selection using entropy, varentropy, and configurable loss weights with precision support."""
+    if precision == "float16":
+        logits = logits.half()  # Switch to float16 for inference speedup
+        logger.debug("Switched logits to float16 precision.")
+    elif precision == "bfloat16":
+        logits = logits.bfloat16()  # Alternatively, use bfloat16
+        logger.debug("Switched logits to bfloat16 precision.")
+
+    # Compute multiple losses
+    entropy = calculate_entropy(logits)
+    varentropy = calculate_varentropy(entropy)
+    kl_div = calculate_kl_divergence(logits)
+    perplexity = calculate_perplexity(logits)
+
+    # Log losses to adjust weights dynamically
+    loss_weighting_system.log_losses(entropy, varentropy, kl_div, perplexity)
+
+    # Adjust weights based on historical performance
+    loss_weighting_system.adjust_weights()
+    weights = loss_weighting_system.get_weights()
+
+    # Adjust logits by the weighted sum of losses and vertex movements
+    adjusted_logits = logits - (
+        weights['entropy'] * entropy +
+        weights['varentropy'] * varentropy +
+        weights['kl_div'] * kl_div +
+        weights['perplexity'] * perplexity
+    ).unsqueeze(-1)
+
+    # Apply vertex movement strategy (Assuming vertex_movements is a tensor compatible with logits)
+    adjusted_logits += vertex_movements
+
+    # Sample from adjusted probabilities
+    probs = F.softmax(adjusted_logits, dim=-1)
+    selected_token = torch.multinomial(probs, 1)
+    
+    logger.debug(f"Selected token ID: {selected_token.item()}")
+
+    return selected_token, adjusted_logits
 
 # --------------------------- Response Generation --------------------------- #
 
-def generate_macroprocessed_response(prompt, model, tokenizer, quality_manager):
+def generate_macroprocessed_response(prompt, model, tokenizer, quality_manager, loss_weighting_system, visualizer, user_config):
+    """Generates a response from the model based on the prompt."""
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
@@ -477,28 +495,30 @@ def generate_macroprocessed_response(prompt, model, tokenizer, quality_manager):
     kl_divs = []
     perplexities = []
     hidden_states = []
+    time_steps = []
 
     with torch.no_grad():
-        for _ in tqdm(range(max_tokens), desc="Generating Response", unit="token"):
-            outputs = model(generated_ids)
+        for step in tqdm(range(max_tokens), desc="Generating Response", unit="token"):
+            outputs = model(generated_ids, output_hidden_states=True)
             logits = outputs.logits[:, -1, :]
-            probs = torch.softmax(logits, dim=-1)
 
+            # Calculate metrics
             entropy = calculate_entropy(logits)
             varentropy = calculate_varentropy(entropy)
             kl_div = calculate_kl_divergence(logits)
             perplexity = calculate_perplexity(logits)
 
+            # Adjust temperature and sampling parameters
             temperature = adjust_temperature_based_on_entropy(entropy.item())
             top_k, top_p = adjust_sampling_parameters(entropy.item())
 
+            # Sample token
             special_tokens_set = {
                 tokenizer.eos_token_id, 
                 tokenizer.convert_tokens_to_ids("<|eom_id|>"),
                 tokenizer.convert_tokens_to_ids("<|eot_id|>")
             }
-
-            token_id = sample_token(probs, top_k, top_p, temperature, special_tokens_set)
+            token_id = sample_token(F.softmax(logits, dim=-1), top_k, top_p, temperature, special_tokens_set)
 
             if token_id.dim() != 2 or token_id.size(1) != 1:
                 logger.error(f"Unexpected token_id shape: {token_id.shape}")
@@ -506,6 +526,7 @@ def generate_macroprocessed_response(prompt, model, tokenizer, quality_manager):
 
             generated_ids = torch.cat([generated_ids, token_id], dim=1)
 
+            # Log token details
             token_log.append({
                 "token_id": token_id.item(),
                 "entropy": entropy.item(),
@@ -519,53 +540,80 @@ def generate_macroprocessed_response(prompt, model, tokenizer, quality_manager):
                 break
 
             # Collecting metrics for visualization
-            entropies.append(entropy)
-            varentropies.append(varentropy)
-            kl_divs.append(kl_div)
-            perplexities.append(perplexity)
-            hidden_states.append(None)  # Placeholder to avoid accumulating tensors
+            entropies.append(entropy.item())
+            varentropies.append(varentropy.item())
+            kl_divs.append(kl_div.item())
+            perplexities.append(perplexity.item())
+            if outputs.hidden_states:
+                # Take the last layer's hidden state for the last token
+                last_hidden_state = outputs.hidden_states[-1][:, -1, :]  # Shape: [batch_size, hidden_dim]
+                hidden_states.append(last_hidden_state.detach().cpu().numpy())
+            else:
+                hidden_states.append(np.array([]))  # Fallback to empty array if hidden_states is None
+            time_steps.append(step)
 
+            # Optional: Visualize at certain intervals
+            if visualizer and step % user_config.visualization_frequency == 0:
+                hidden_states_cpu = np.concatenate([hs for hs in hidden_states if hs.size > 0], axis=0)
+                visualizer.plot_4d_visualization(hidden_states_cpu, entropies, time_steps)
+
+    # Logging token information
     for log_entry in token_log:
         logger.info(f"Token: {log_entry['token_id']}, Entropy: {log_entry['entropy']:.2f}, "
                     f"Temperature: {log_entry['temperature']:.2f}, top_k: {log_entry['top_k']}, top_p: {log_entry['top_p']}")
 
+    # Decode the generated tokens to get the response
     response = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     response = response.split("AI:")[-1].strip()
     response = quality_manager.remove_eot_tokens(response)
 
-    return response, entropies, varentropies, kl_divs, perplexities, hidden_states, range(len(entropies))
+    # Concatenate hidden states and prepare for visualization
+    hidden_states_cpu = np.concatenate([hs for hs in hidden_states if hs.size > 0], axis=0)
+
+    # Run visualization
+    if hidden_states_cpu.size > 0 and entropies:
+        visualizer.plot_4d_visualization(hidden_states_cpu, entropies, time_steps)
+
+    # Clear cache and collect garbage
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    return response, entropies, varentropies, kl_divs, perplexities, hidden_states_cpu
 
 def remove_memory_recall(response):
     response = re.sub(r"\[Memory\]:.*\nAI:", "", response, flags=re.DOTALL)
     return response.strip()
 
-def improved_generate_response(input_text, model, tokenizer, history, quality_manager, context_manager):
+def improved_generate_response(input_text, model, tokenizer, quality_manager, context_manager, loss_weighting_system, visualizer, user_config):
+    """Generates a response and handles visualization."""
     sanitized_input = sanitize_input(input_text)
     prompt = context_manager.get_dynamic_prompt(sanitized_input)
 
-    response, entropies, varentropies, kl_divs, perplexities, hidden_states, time_steps = generate_macroprocessed_response(
-        prompt, model, tokenizer, quality_manager
+    response, entropies, varentropies, kl_divs, perplexities, hidden_states_cpu = generate_macroprocessed_response(
+        prompt, model, tokenizer, quality_manager, loss_weighting_system, visualizer, user_config
     )
 
     context_manager.update_context(sanitized_input, response)
 
-    # Optionally visualize every 'visualization_frequency' tokens
-    config = history.get_config()
-    visualization_frequency = config.get("visualization_frequency", 5)
-    if len(entropies) % visualization_frequency == 0 and config.get("interactive_visuals", True):
-        plot_interactive_3d_space(hidden_states, entropies, time_steps)
-
     return response, context_manager.conversation_history
 
 def sanitize_input(user_input):
+    """Sanitizes the user input to prevent injection of unwanted tokens or patterns."""
     sanitized = re.sub(r'[^\w\s.,!?]', '', user_input)
     return sanitized[:500]
 
 # --------------------------- Interactive Loop --------------------------- #
 
 def interactive_query(model, tokenizer, quality_manager, context_manager, user_config):
+    """Handles the interactive query loop with the user."""
     print("\n--- LLaMA Instruct Model Interactive Query ---")
     print("Type 'exit' to quit.\n")
+
+    # Initialize Adaptive Weighting System
+    loss_weighting_system = AdaptiveWeightingSystem(initial_weights=user_config.initial_weights)
+
+    # Initialize Visualizer if enabled
+    visualizer = VRAMEfficient4DVisualizer() if user_config.interactive_visuals else None
 
     while True:
         try:
@@ -582,23 +630,26 @@ def interactive_query(model, tokenizer, quality_manager, context_manager, user_c
             print("Please enter a valid query.")
             continue
 
-        response, _ = improved_generate_response(
-            user_input,
-            model,
-            tokenizer,
-            user_config,
-            quality_manager,
-            context_manager
-        )
-
-        print(f"Model Response: {response}\n")
-
-        # Free up unused memory
-        torch.cuda.empty_cache()
+        try:
+            response, _ = improved_generate_response(
+                user_input,
+                model,
+                tokenizer,
+                quality_manager,
+                context_manager,
+                loss_weighting_system,
+                visualizer,
+                user_config  # Pass user_config here
+            )
+            print(f"Model Response: {response}\n")
+        except Exception as e:
+            logger.error(f"An error occurred during response generation: {e}")
+            print(f"An error occurred: {e}")
 
 # --------------------------- Flash Attention Check --------------------------- #
 
 def check_flash_attention():
+    """Checks if Flash Attention is available and logs the status."""
     try:
         import flash_attn
         logger.info("Flash Attention is available and enabled.")
@@ -608,6 +659,11 @@ def check_flash_attention():
 # --------------------------- Model Loading --------------------------- #
 
 def load_configuration(config_path):
+    """Loads the model configuration from a JSON file."""
+    if not os.path.exists(config_path):
+        logger.error(f"Configuration file not found at {config_path}")
+        raise FileNotFoundError(f"Configuration file not found at {config_path}")
+    
     with open(config_path, "r") as f:
         config_data = json.load(f)
     config = LlamaConfig(**config_data)
@@ -615,9 +671,10 @@ def load_configuration(config_path):
     return config
 
 def load_tokenizer_with_special_tokens(source_dir):
+    """Loads the tokenizer and adds special tokens."""
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
     special_tokens_dict = {
-        'additional_special_tokens': list(SPECIAL_TOKEN_MAP.values())
+        'additional_special_tokens': list(SPECIAL_TOKEN_MAP.keys())
     }
     tokenizer.add_special_tokens(special_tokens_dict)
     if "<|finetune_right_pad_id|>" in tokenizer.get_vocab():
@@ -628,6 +685,11 @@ def load_tokenizer_with_special_tokens(source_dir):
     return tokenizer
 
 def load_offloaded_weights(model, weights_dir):
+    """Loads the model weights from the offload directory."""
+    if not os.path.exists(weights_dir):
+        logger.error(f"Weights directory not found at {weights_dir}")
+        raise FileNotFoundError(f"Weights directory not found at {weights_dir}")
+
     logger.info("Loading model weights from disk.")
     for name, param in model.named_parameters():
         file_name = f"{name.replace('.', '_')}.dat"
@@ -651,8 +713,10 @@ def load_offloaded_weights(model, weights_dir):
                 if param.dtype == torch.bfloat16:
                     loaded_tensor = loaded_tensor.to(torch.bfloat16)
 
+                # Reshape the loaded tensor to match the parameter's shape
+                loaded_tensor = loaded_tensor.view_as(param)
                 with torch.no_grad():
-                    param.data.copy_(loaded_tensor.view_as(param))
+                    param.data.copy_(loaded_tensor)
                 logger.debug(f"Successfully loaded {file_name} into {name}")
             except Exception as e:
                 logger.error(f"Error loading {file_name} into {name}: {e}")
@@ -664,8 +728,17 @@ def load_offloaded_weights(model, weights_dir):
 # --------------------------- Main Execution --------------------------- #
 
 def main():
+    """Main function to load the model, tokenizer, and start the interactive query loop."""
     # Load user configuration
     user_config = UserConfig()
+
+    # Set logging level
+    numeric_level = getattr(logging, user_config.logging_level.upper(), None)
+    if isinstance(numeric_level, int):
+        logger.setLevel(numeric_level)
+    else:
+        logger.setLevel(logging.INFO)
+        logger.warning(f'Invalid log level: {user_config.logging_level}. Using INFO level.')
 
     # Load model configuration
     config = load_configuration(MODEL_JSON_PATH)
