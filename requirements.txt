@@ -5,6 +5,7 @@ numpy
 matplotlib
 scikit-learn
 tqdm
+plotly
 
 # GUI
 tk
