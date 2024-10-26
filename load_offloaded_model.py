@@ -46,12 +46,24 @@ logger = logging.getLogger(__name__)
 
 # Special tokens map (Update as per your tokenizer's special tokens)
 SPECIAL_TOKEN_MAP = {
-    "<|eot_id|>": 16770,  # Example mapping, replace with actual IDs
-    "<|eom_id|>": 11,
-    "<|finetune_right_pad_id|>": 0,
-    # Add other special tokens if necessary
+    128000: "<|begin_of_text|>",
+    128001: "<|end_of_text|>",
+    128002: "<|reserved_special_token_0|>",
+    128003: "<|reserved_special_token_1|>",
+    128004: "<|finetune_right_pad_id|>",
+    128005: "<|reserved_special_token_2|>",
+    128006: "<|start_header_id|>",
+    128007: "<|end_header_id|>",
+    128008: "<|eom_id|>",
+    128009: "<|eot_id|>",
+    128010: "<|python_tag|>",
+    128011: "<|analytical_start|>",
+    128012: "<|analytical_end|>",
+    128013: "<|creative_start|>",
+    128014: "<|creative_end|>",
+    128015: "<|factual_start|>",
+    128016: "<|factual_end|>",
 }
-
 # Maximum context length
 MAX_CONTEXT_LENGTH = 2048
 
@@ -157,7 +169,7 @@ class AdaptiveWeightingSystem:
 # --------------------------- Enhanced 4D Visualizer --------------------------- #
 
 class Enhanced4DVisualizer:
-    """Enhanced 4D Visualizer with vector traces, token info, and smooth animations."""
+    """Enhanced 4D Visualizer with vector path animation and temporal controls."""
 
     def __init__(self):
         matplotlib.use('TkAgg')
@@ -167,68 +179,96 @@ class Enhanced4DVisualizer:
         self.scatter = None
         self.line_collection = None
         self.annotation = None
-        self.anim = None
-        self.pause = False
-        self.speed = 1.0
+        self.current_frame = 0
+        self.total_frames = 0
         self.pca = None
         self.cached_data = {}
+        self.animation_speed = 1.0
+        self.is_playing = False
+        self.time_slider = None
+        self.play_pause_btn = None
 
     def setup_gui(self):
-        """Set up the GUI window with enhanced controls and info panel."""
         if self.root is None:
             self.root = tk.Tk()
-            self.root.title("4D Token Generation Visualization")
+            self.root.title("Token Generation Visualization")
 
             # Create main container
             main_container = tk.Frame(self.root)
             main_container.pack(fill=tk.BOTH, expand=True)
 
-            # Create left panel for PCA information
-            info_panel = tk.Frame(main_container, width=200)
+            # Left panel for metrics and information
+            info_panel = tk.Frame(main_container, width=250)
             info_panel.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
 
-            # PCA Information Display
-            tk.Label(info_panel, text="PCA Components Info", font=('Arial', 10, 'bold')).pack(pady=5)
-            self.pca_info = tk.Text(info_panel, height=10, width=30, wrap=tk.WORD)
+            # Token Information Display
+            tk.Label(info_panel, text="Token Information", font=('Arial', 10, 'bold')).pack(pady=5)
+            self.token_info = tk.Text(info_panel, height=8, width=30, wrap=tk.WORD)
+            self.token_info.pack(pady=5)
+
+            # PCA Components Information
+            tk.Label(info_panel, text="PCA Components", font=('Arial', 10, 'bold')).pack(pady=5)
+            self.pca_info = tk.Text(info_panel, height=8, width=30, wrap=tk.WORD)
             self.pca_info.pack(pady=5)
+
+            # Temporal Metrics
+            tk.Label(info_panel, text="Temporal Metrics", font=('Arial', 10, 'bold')).pack(pady=5)
+            self.temporal_info = tk.Text(info_panel, height=8, width=30, wrap=tk.WORD)
+            self.temporal_info.pack(pady=5)
 
             # Visualization panel
             viz_panel = tk.Frame(main_container)
             viz_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-            # Create figure with higher DPI
+            # Create figure
             self.fig = plt.figure(figsize=(10, 8), dpi=120)
             self.ax = self.fig.add_subplot(111, projection='3d')
 
-            # Create canvas and add to viz panel
+            # Create canvas
             canvas = FigureCanvasTkAgg(self.fig, master=viz_panel)
             canvas.draw()
             canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-            # Enhanced navigation toolbar
-            toolbar_frame = tk.Frame(viz_panel)
-            toolbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
-            toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
-            toolbar.update()
 
             # Control panel
             control_frame = tk.Frame(viz_panel)
             control_frame.pack(side=tk.BOTTOM, fill=tk.X)
 
-            # Play/Pause button
-            self.play_pause_btn = tk.Button(
+            # Timeline slider
+            self.time_slider = tk.Scale(
                 control_frame,
-                text="Pause",
-                command=self.toggle_animation
+                from_=0,
+                to=100,  # Will be updated with actual frame count
+                orient=tk.HORIZONTAL,
+                command=self.update_timeline,
+                length=400
+            )
+            self.time_slider.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+
+            # Playback controls
+            button_frame = tk.Frame(control_frame)
+            button_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+
+            self.play_pause_btn = tk.Button(
+                button_frame,
+                text="Play",
+                command=self.toggle_animation,
+                width=8
             )
             self.play_pause_btn.pack(side=tk.LEFT, padx=5)
 
-            # Speed control with label
-            tk.Label(control_frame, text="Rotation Speed:").pack(side=tk.LEFT, padx=5)
+            tk.Button(
+                button_frame,
+                text="Reset",
+                command=self.reset_visualization,
+                width=8
+            ).pack(side=tk.LEFT, padx=5)
+
+            # Speed control
+            tk.Label(button_frame, text="Animation Speed:").pack(side=tk.LEFT, padx=5)
             speed_scale = tk.Scale(
-                control_frame,
+                button_frame,
                 from_=0.1,
-                to=2.0,
+                to=3.0,
                 resolution=0.1,
                 orient=tk.HORIZONTAL,
                 command=self.update_speed,
@@ -237,208 +277,197 @@ class Enhanced4DVisualizer:
             speed_scale.set(1.0)
             speed_scale.pack(side=tk.LEFT, padx=5)
 
-            # Reset view button
-            tk.Button(
-                control_frame,
-                text="Reset View",
-                command=self.reset_view
-            ).pack(side=tk.LEFT, padx=5)
-
-            # Help button
-            tk.Button(
-                control_frame,
-                text="?",
-                command=self.show_help,
-                width=2
-            ).pack(side=tk.RIGHT, padx=5)
-
             # Mouse events
             self.fig.canvas.mpl_connect('motion_notify_event', self.on_hover)
 
-    def show_help(self):
-        """Show help dialog with visualization explanation."""
-        help_window = tk.Toplevel(self.root)
-        help_window.title("Visualization Help")
-        help_window.geometry("600x400")
+    def update_timeline(self, value):
+        """Update visualization based on timeline position."""
+        frame = int(float(value))
+        if frame != self.current_frame:
+            self.current_frame = frame
+            self.update_visualization(frame)
+            self.update_temporal_info(frame)
 
-        help_text = """
-        Visualization Guide:
+    def update_visualization(self, frame):
+        """Update the visualization state for the given frame."""
+        if not self.cached_data.get('projected_states') is None:
+            current_points = self.cached_data['projected_states'][:frame+1]
+            current_colors = self.cached_data['colors'][:frame+1]
 
-        1. PCA Components:
-           - PCA 1: Primary direction of variation in token embeddings
-           - PCA 2: Secondary direction, orthogonal to PCA 1
-           - PCA 3: Tertiary direction, orthogonal to both PCA 1 & 2
+            # Clear previous plot
+            self.ax.cla()
 
-        2. Colors:
-           - Points are colored by entropy (blue → yellow)
-           - Higher entropy = more uncertainty in token prediction
+            # Plot points up to current frame
+            self.scatter = self.ax.scatter(
+                current_points[:, 0],
+                current_points[:, 1],
+                current_points[:, 2],
+                c=current_colors,
+                cmap='viridis',
+                marker='o',
+                s=30
+            )
 
-        3. Vector Traces:
-           - Lines show the path of token generation
-           - Direction indicates temporal sequence
+            # Draw path up to current frame
+            if len(current_points) > 1:
+                segments = np.array([[current_points[i], current_points[i+1]] 
+                                   for i in range(len(current_points)-1)])
+                self.line_collection = Line3DCollection(
+                    segments,
+                    cmap='coolwarm',
+                    linewidth=2,
+                    alpha=0.7
+                )
+                # Optionally, color the lines based on entropy or another metric
+                self.line_collection.set_array(current_colors[:-1])
+                self.ax.add_collection3d(self.line_collection)
 
-        4. Interactions:
-           - Hover over points to see token details
-           - Use toolbar to zoom, pan, and rotate
-           - Play/Pause button controls rotation
-           - Speed slider adjusts rotation speed
+            # Update labels and view
+            self.update_axis_labels()
+            self.fig.canvas.draw()
 
-        5. Interpretation:
-           - Clustered points = similar token representations
-           - Smooth paths = coherent generation
-           - Jumps = context shifts or topic changes
-        """
+            # Update token information
+            if self.cached_data['tokens'] and frame < len(self.cached_data['tokens']):
+                token = self.cached_data['tokens'][frame]
+                entropy = self.cached_data['colors'][frame]
+                self.token_info.config(state=tk.NORMAL)
+                self.token_info.delete(1.0, tk.END)
+                self.token_info.insert(tk.END, f"Token: {token}\nEntropy: {entropy:.4f}")
+                self.token_info.config(state=tk.DISABLED)
 
-        text_widget = tk.Text(help_window, wrap=tk.WORD, padx=10, pady=10)
-        text_widget.insert(tk.END, help_text)
-        text_widget.config(state=tk.DISABLED)
-        text_widget.pack(fill=tk.BOTH, expand=True)
+    def update_temporal_info(self, frame):
+        """Update temporal information display."""
+        if self.cached_data.get('tokens') is not None and frame < len(self.cached_data['tokens']):
+            current_token = self.cached_data['tokens'][frame]
+            current_entropy = self.cached_data['colors'][frame]
+            progress = (frame / self.total_frames) * 100 if self.total_frames > 0 else 0
 
-    def reset_view(self):
-        """Reset the 3D view to initial position."""
-        self.ax.view_init(elev=20., azim=45)
-        self.fig.canvas.draw()
+            info_text = f"Frame: {frame}/{self.total_frames}\n"
+            info_text += f"Current Token: {current_token}\n"
+            info_text += f"Entropy: {current_entropy:.4f}\n"
+            info_text += f"Progress: {progress:.1f}%"
+
+            self.temporal_info.config(state=tk.NORMAL)
+            self.temporal_info.delete(1.0, tk.END)
+            self.temporal_info.insert(tk.END, info_text)
+            self.temporal_info.config(state=tk.DISABLED)
 
     def toggle_animation(self):
-        """Toggle animation play/pause."""
-        self.pause = not self.pause
-        self.play_pause_btn.config(text="Play" if self.pause else "Pause")
+        """Toggle animation play/pause state."""
+        self.is_playing = not self.is_playing
+        self.play_pause_btn.config(text="Pause" if self.is_playing else "Play")
+        
+        if self.is_playing:
+            self.animate()
+
+    def animate(self):
+        """Handle animation frames."""
+        if self.is_playing and self.current_frame < self.total_frames:
+            self.current_frame += 1
+            self.time_slider.set(self.current_frame)
+            self.root.after(int(50/self.animation_speed), self.animate)
+        elif self.current_frame >= self.total_frames:
+            self.is_playing = False
+            self.play_pause_btn.config(text="Play")
+
+    def reset_visualization(self):
+        """Reset visualization to initial state."""
+        self.current_frame = 0
+        self.time_slider.set(0)
+        self.is_playing = False
+        self.play_pause_btn.config(text="Play")
+        self.update_visualization(0)
+        self.update_temporal_info(0)
 
     def update_speed(self, value):
         """Update animation speed."""
-        self.speed = float(value)
-        if self.anim:
-            self.anim.event_source.interval = 50 / self.speed
-
-    def on_hover(self, event):
-        """Handle mouse hover events to show token information."""
-        if event.inaxes != self.ax or self.cached_data.get('projected_states') is None:
-            return
-        if self.annotation:
-            self.annotation.remove()
-            self.annotation = None
-        if self.scatter:
-            cont, ind = self.scatter.contains(event)
-            if cont:
-                pos = self.cached_data['projected_states'][ind['ind'][0]]
-                token = self.cached_data['tokens'][ind['ind'][0]]
-                entropy = self.cached_data['colors'][ind['ind'][0]]
-                self.annotation = self.ax.annotate(
-                    f'Token: {token}\nEntropy: {entropy:.2f}',
-                    xy=(pos[0], pos[1]),
-                    xytext=(10, 10),
-                    textcoords='offset points',
-                    bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.5),
-                    arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0')
-                )
-                self.fig.canvas.draw_idle()
-
-    def update_pca_info(self):
-        """Update PCA information display."""
-        if self.pca is None:
-            return
-
-        explained_variance_ratio = self.pca.explained_variance_ratio_
-        cumulative_variance = np.cumsum(explained_variance_ratio)
-
-        info_text = "PCA Components Explanation:\n\n"
-        info_text += f"PCA 1: {explained_variance_ratio[0]:.1%} of variance\n"
-        info_text += "Primary direction of embedding space variation\n\n"
-
-        info_text += f"PCA 2: {explained_variance_ratio[1]:.1%} of variance\n"
-        info_text += "Secondary direction (orthogonal to PCA 1)\n\n"
-
-        info_text += f"PCA 3: {explained_variance_ratio[2]:.1%} of variance\n"
-        info_text += "Tertiary direction (orthogonal to PCA 1 & 2)\n\n"
-
-        info_text += f"Total Captured Variance: {cumulative_variance[2]:.1%}\n"
-
-        self.pca_info.config(state=tk.NORMAL)
-        self.pca_info.delete(1.0, tk.END)
-        self.pca_info.insert(tk.END, info_text)
-        self.pca_info.config(state=tk.DISABLED)
+        self.animation_speed = float(value)
 
     def plot_4d_visualization(self, hidden_states, entropies, tokens, time_steps):
-        """Plot the 4D visualization with enhanced PCA explanation."""
+        """Initialize visualization with data."""
         if len(hidden_states) < 3:
-            logger.warning("Insufficient samples for 3D PCA. Skipping visualization.")
+            logger.warning("Insufficient samples for visualization")
             return
 
         self.setup_gui()
-        self.ax.cla()
+        
+        # Prepare data
         self.pca = PCA(n_components=3)
         flattened_states = hidden_states.reshape(hidden_states.shape[0], -1)
-        try:
-            projected_states = self.pca.fit_transform(flattened_states)
-        except ValueError as e:
-            logger.error(f"PCA failed: {e}")
-            return
-
-        # Normalize colors for colormap
-        colors = np.array(entropies)
-        colors_norm = (colors - np.min(colors)) / (np.max(colors) - np.min(colors) + 1e-10)
+        projected_states = self.pca.fit_transform(flattened_states)
+        
+        # Store data for animation
         self.cached_data = {
             'projected_states': projected_states,
-            'colors': colors,
-            'tokens': tokens
+            'colors': np.array(entropies),
+            'tokens': tokens,
+            'time_steps': time_steps
         }
-
-        # Scatter plot
-        self.scatter = self.ax.scatter(
-            projected_states[:, 0],
-            projected_states[:, 1],
-            projected_states[:, 2],
-            c=colors_norm,
-            cmap='viridis',
-            marker='o',
-            s=30,
-            alpha=0.8,
-            edgecolors='white',
-            linewidth=0.5
-        )
-
-        # Vector trace lines setup for 3D
-        segments = np.array([[projected_states[i], projected_states[i + 1]] for i in range(len(projected_states) - 1)])
-        if segments.size > 0:
-            self.line_collection = Line3DCollection(segments, cmap='coolwarm', linewidth=1, alpha=0.5)
-            # Color lines based on entropy or time progression
-            line_colors = colors_norm[:-1]
-            self.line_collection.set_array(line_colors)
-            self.ax.add_collection3d(self.line_collection)
-        else:
-            logger.warning("No segments to plot for vector traces.")
-
-        # Axis labels and colorbar
-        var_ratio = self.pca.explained_variance_ratio_
-        self.ax.set_xlabel(f"PCA 1 ({var_ratio[0]:.1%} var)")
-        self.ax.set_ylabel(f"PCA 2 ({var_ratio[1]:.1%} var)")
-        self.ax.set_zlabel(f"PCA 3 ({var_ratio[2]:.1%} var)")
-        colorbar = self.fig.colorbar(self.scatter, ax=self.ax, label="Token Entropy")
-
-        # Update PCA information display
+        
+        self.total_frames = len(projected_states) - 1
+        self.time_slider.config(to=self.total_frames)
+        
+        # Initial visualization
+        self.reset_visualization()
         self.update_pca_info()
 
-        # Animation update function
-        def update(frame):
-            if not self.pause:
-                self.ax.view_init(elev=20., azim=frame % 360)
-            return self.scatter,
+    def update_axis_labels(self):
+        """Update axis labels with PCA variance ratios."""
+        if self.pca:
+            var_ratio = self.pca.explained_variance_ratio_
+            self.ax.set_xlabel(f"PCA 1 ({var_ratio[0]:.1%} var)")
+            self.ax.set_ylabel(f"PCA 2 ({var_ratio[1]:.1%} var)")
+            self.ax.set_zlabel(f"PCA 3 ({var_ratio[2]:.1%} var)")
 
-        # Create smooth animation
-        self.anim = animation.FuncAnimation(
-            self.fig,
-            update,
-            frames=range(0, 360, 2),
-            interval=50 / self.speed,
-            blit=False,
-            repeat=True
-        )
-        self.fig.canvas.draw()
+    def update_pca_info(self):
+        """Update PCA information display."""
+        if self.pca:
+            var_ratio = self.pca.explained_variance_ratio_
+            cum_var = np.cumsum(var_ratio)
+            
+            info_text = "PCA Components Analysis:\n\n"
+            info_text += f"PCA 1: {var_ratio[0]:.1%}\n"
+            info_text += f"PCA 2: {var_ratio[1]:.1%}\n"
+            info_text += f"PCA 3: {var_ratio[2]:.1%}\n"
+            info_text += f"\nTotal Variance: {cum_var[2]:.1%}"
+            
+            self.pca_info.config(state=tk.NORMAL)
+            self.pca_info.delete(1.0, tk.END)
+            self.pca_info.insert(tk.END, info_text)
+            self.pca_info.config(state=tk.DISABLED)
+
+    def on_hover(self, event):
+        """Handle mouse hover events."""
+        if event.inaxes != self.ax or self.cached_data.get('projected_states') is None:
+            return
+
+        if self.annotation:
+            self.annotation.remove()
+            self.annotation = None
+
+        if self.scatter:
+            cont, ind = self.scatter.contains(event)
+            if cont:
+                point_idx = ind['ind'][0]
+                if point_idx < len(self.cached_data['tokens']):
+                    token = self.cached_data['tokens'][point_idx]
+                    entropy = self.cached_data['colors'][point_idx]
+                    time_step = self.cached_data['time_steps'][point_idx]
+                    
+                    hover_text = f"Token: {token}\n"
+                    hover_text += f"Time Step: {time_step}\n"
+                    hover_text += f"Entropy: {entropy:.4f}"
+                    
+                    pos = self.cached_data['projected_states'][point_idx]
+                    self.annotation = self.ax.text(
+                        pos[0], pos[1], pos[2],
+                        hover_text,
+                        bbox=dict(facecolor='white', alpha=0.7)
+                    )
+                    self.fig.canvas.draw_idle()
 
     def close(self):
         """Clean up resources."""
-        if self.anim:
-            self.anim.event_source.stop()
         if self.root:
             self.root.quit()
             self.root.destroy()
@@ -905,16 +934,20 @@ def load_configuration(config_path):
 def load_tokenizer_with_special_tokens(source_dir):
     """Loads the tokenizer and adds special tokens."""
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
+    
+    # Prepare the special tokens as strings instead of IDs
     special_tokens_dict = {
-        'additional_special_tokens': list(SPECIAL_TOKEN_MAP.keys())
+        'additional_special_tokens': list(SPECIAL_TOKEN_MAP.values())
     }
     tokenizer.add_special_tokens(special_tokens_dict)
+    
     if "<|finetune_right_pad_id|>" in tokenizer.get_vocab():
         tokenizer.pad_token = "<|finetune_right_pad_id|>"
         logger.info(f"Assigned '<|finetune_right_pad_id|>' as pad_token.")
     else:
         logger.warning(f"'<|finetune_right_pad_id|>' not found in tokenizer vocabulary.")
     return tokenizer
+
 
 def load_offloaded_weights(model, weights_dir):
     """Loads the model weights from the offload directory."""
