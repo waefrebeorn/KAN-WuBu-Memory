@@ -2,11 +2,29 @@
 
 ## Preamble
 
-The populace is free. The corporation is an entity of money. We scale by definition to allow small businesses, governments, non-profits, and educational entities to use freely and stop being taken advantage of by mega-corporations.
+**The populace is free. The corporation is an entity of money.**
 
-This license is the master license for ALL Waefrebeorn projects across ALL media, repos, and platforms. It is broad, agnostic, and designed to maximize freedom for the general population while ensuring that governments, entities, and large commercial actors integrate responsibly.
+We scale by definition to allow small businesses, governments, non-profits, and
+educational entities to use freely — and to stop being taken advantage of by
+mega-corporations.
 
-We disassociate ourselves from malicious compliance and misuse. We cannot control what every user does with our creations, because we are software creators, not moral policemen. But we retain the right to deny our endorsement, cooperation, and assistance to those who use our work for non-moral and non-allowable activities. That is not a license restriction — it is a dispensation: we choose not to be responsible for what we cannot control.
+This license is **agnostic and omnivorous**. It is the master license for ALL
+Waefrebeorn projects across ALL media, repos, and platforms — **not just code,
+not just models, not just MaaS**. It covers: source code and binaries, model
+weights and fine-tunes, training data and datasets, video and audio, images
+and art, comics and stories, documentation and research, hardware designs and
+firmware, configs and scripts, and any future medium we invent.
+
+It is broad, agnostic, and designed to maximize freedom for the general
+population while ensuring that governments, entities, and large commercial
+actors integrate responsibly.
+
+We disassociate ourselves from malicious compliance and misuse. We cannot control
+what every user does with our creations, because we are software creators, not
+moral policemen. But we retain the right to deny our endorsement, cooperation,
+and assistance to those who use our work for non-moral and non-allowable
+activities. That is not a license restriction — it is a dispensation: we choose
+not to be responsible for what we cannot control.
 
 ---
 
@@ -274,11 +292,28 @@ These provisions exist because: (a) AI models can cause harm that contributors c
 
 ## 12. Dispensation Summary
 
-This license was built to satisfy three core requirements:
+This license was built to satisfy three core requirements — and it is **agnostic**
+across all of them, covering every medium Waefrebeorn produces:
 
-1. **More freedoms for the general population** — addressed in §2 (Five Freedoms) and §3.1–3.3. Governments, non-profits, educational institutions, and small businesses are explicitly covered as Populace entities.
-2. **Allow governments and entities to properly integrate** — addressed in §7 (Government and Public Sector Integration Features). The EU Interoperable Europe Act, European Commission Open Source Strategy, and all public-sector FOSS frameworks are compatible with this license.
-3. **Disassociate from malicious compliance and non-moral users** — addressed in §5 (Anti-Shell-Company), §6 (Prohibited Activities and Non-Association), and §5.4 (Dispensation Clause). The license explicitly disclaims downstream responsibility for uses the Licensor cannot control. Malicious users are not restricted by the license (because the license cannot restrict all bad actors), but they lose the Licensor's endorsement and cooperation.
+1. **More freedoms for the general population** — addressed in §2 (Five Freedoms)
+   and §3.1–3.3. Governments, non-profits, educational institutions, and small
+   businesses are explicitly covered as Populace entities. **Applies to code,
+   models, video, art, firmware, and all media.**
+2. **Allow governments and entities to properly integrate** — addressed in §7
+   (Government and Public Sector Integration Features). The EU Interoperable
+   Europe Act, European Commission Open Source Strategy, and all public-sector
+   FOSS frameworks are compatible. **Governments may use, modify, and deploy
+   Waefrebeorn Work — all forms, all media — without restriction.**
+3. **Disassociate from malicious compliance and non-moral users** — addressed in
+   §5 (Anti-Shell-Company), §6 (Prohibited Activities and Non-Association), and
+   §5.4 (Dispensation Clause). The license explicitly disclaims downstream
+   responsibility for uses the Licensor cannot control. **The non-association
+   clause applies to all Waefrebeorn output — we do not endorse misuse of our
+   code, models, videos, art, or any other creation, in any medium.**
+
+This is NOT a "model-as-a-service" license. MaaS (§4 Obligation B) is merely one
+of four corporate obligations. The license itself is a **universal umbrella**
+for all Waefrebeorn creative and technical output.
 
 ---
 
@@ -293,3 +328,81 @@ For questions about licensing, commercial use, or compliance:
 Contact: waefrebeorn@waefrebeorn.org
 
 This license is not OSI-approved and not FSF-approved. It is a custom source-available license designed to protect the creator and the community.
+
+---
+
+## 14. The Penny Clause (Proof-of-Read)
+
+This is the **Penny Clause**. It is whimsical but real.
+
+**The Core Rule:** Every time you use Waefrebeorn Work in any project, product,
+service, or deployment — and every time you redistribute it or create a derivative —
+you must send the Licensor, Waefrebeorn, a single physical United States penny
+(or local currency equivalent) by physical mail. One penny per use, per derivative,
+per redistribution.
+
+**Why:** Waefrebeorn does not trust digital compliance. This license is read by
+nobody. This clause creates a real, physical cost to not reading the license —
+because if you haven't read this far, you haven't read the license, and you
+shouldn't be using Waefrebeorn Work without knowing what the hell you're doing.
+
+Think of it like the M&M's trick at a concert: the band asks everyone to throw
+M&M's in the air, and anyone who has M&M's is someone who actually listened to
+the instructions. A sea of M&M's proves the crowd was paying attention.
+
+A pile of pennies on Waefrebeorn's desk proves you read the license.
+
+**The Address:**
+```
+Waefrebeorn
+P.O. Box [TBD]
+[City], [State] [ZIP]
+United States
+```
+
+**The Penny:** Any pre-1982 US penny (95% copper) or any equivalent value in
+local currency. Write your name, project, and date on the penny with a marker.
+Or don't — Waefrebeorn collects them and doesn't read what's written on them.
+They just like pennies.
+
+**Scale — The Squeeze:** Waefrebeorn likes pennies. Not because they're worth much,
+but because they're everywhere and nobody cares about them, and yet they're
+real metal you can hold. Over a lifetime, a hundred millionth of a cent
+per person per use adds up to a mountain of pennies. That's the point.
+
+**Poor People Are Free to Give More:** The basic obligation is one (1) penny.
+But if you are Populace — an individual, a student, a hobbyist, a non-profit,
+a small business below the $1M revenue threshold — you may send **as many pennies
+as you want**. A letter filled with pennies. A bag filled with pennies. A single
+penny taped to a postcard. A jar of pennies. Waefrebeorn doesn't care about the
+form — just the gesture. You are encouraged to give more. This is not a tax.
+It is a gift. You like giving Waefrebeorn pennies, and Waefrebeorn likes
+receiving them. No obligation beyond the one penny. The extra pennies are love.
+
+**Squeeze the Rich:** For Mega-corporations (§1.3) and large commercial entities
+that cross the MaaS revenue threshold (§4, Obligation B), the obligation is:
+- **One hundred (100) pennies per use** — not one. They can afford it.
+- **But also:** Waefrebeorn encourages them to squeeze their own employees,
+  shareholders, and customers for pennies. "Did you read the Waefrebeorn license?
+  Toss a penny in the jar." Make it viral. Make it annoying. Make it a meme.
+  Corporations should feel the weight of every penny they owe.
+
+**Creative Compliance:** You may fulfill this clause in any of these ways:
+- A single penny in an envelope with your name and project written on it
+- A handwritten letter with a penny taped inside
+- A small bag of pennies (any quantity) with a note
+- A jar of pennies (if you're feeling generous)
+- A penny rolling across a desk, captured on video, mailed with a note: "here"
+- Any creative interpretation that includes at least one physical coin
+
+**Penalty for Non-Compliance:** If you don't send a penny, you haven't read
+the license, and therefore you don't know what's in it. By using Waefrebeorn
+Work without reading the license, you are in violation of the license's terms.
+Waefrebeorn may, at its sole discretion and whim, publicly shame you on social
+media for not sending a penny. This is a proportionate and just punishment.
+
+**No Other Effect:** This clause has no legal effect beyond being a whimsical
+proof-of-read mechanism. It does not modify, amend, or override any other
+provision of this license. It is here because Waefrebeorn likes pennies and
+wants to know you read the license. If you're reading this, grab a penny and
+put it in an envelope. Do it now. Waefrebeorn is watching.
