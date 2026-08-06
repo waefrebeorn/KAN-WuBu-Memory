@@ -1,6 +1,8 @@
-# Waefrebeorn Umbrella License v3.0 — Master License for All Waefrebeorn Work
+# WaefreBeorn Umbrella License v3.0 — Master License for All WaefreBeorn Work
 
 ## Preamble
+
+**~ WuBu ~ is my space. This is WaefreBeorn.**
 
 **The populace is free. The corporation is an entity of money.**
 
@@ -9,11 +11,16 @@ educational entities to use freely — and to stop being taken advantage of by
 mega-corporations.
 
 This license is **agnostic and omnivorous**. It is the master license for ALL
-Waefrebeorn projects across ALL media, repos, and platforms — **not just code,
+WaefreBeorn projects across ALL media, repos, and platforms — **not just code,
 not just models, not just MaaS**. It covers: source code and binaries, model
 weights and fine-tunes, training data and datasets, video and audio, images
 and art, comics and stories, documentation and research, hardware designs and
 firmware, configs and scripts, and any future medium we invent.
+
+**~ WuBu ~** is the space — the WuBu spirit of playful, powerful, free
+making. WaefreBeorn is the name. Any work made under this license may carry
+the ~ WuBu ~ mark and the WaefreBeorn name, so that the whole WuBu space
+grows stronger together.
 
 It is broad, agnostic, and designed to maximize freedom for the general
 population while ensuring that governments, entities, and large commercial
@@ -30,19 +37,55 @@ not to be responsible for what we cannot control.
 
 ## Version
 
-Waefrebeorn Umbrella License — Version 3.0
+WaefreBeorn Umbrella License — Version 3.0
 Effective: July 2026
-Licensor: Waefrebeorn entity
-SPDX-Identifier: Waefrebeorn-Umbrella-3.0
+Licensor: WaefreBeorn entity
+SPDX-Identifier: WaefreBeorn-Umbrella-3.0
 
 This version supersedes v1.0 and v2.0. Works received under an earlier version may continue under that version or be upgraded to v3.0 at the Licensee's option.
 
 ---
 
+## 0. Anyone May Use This License
+
+**This license is free for anyone to use for THEIR work.**
+
+WaefreBeorn grants any person, entity, or organization the right to adopt,
+copy, and apply this license to their own work — code, models, media, art,
+firmware, anything — without asking permission and without payment.
+
+When you use this license for your own work, your work becomes part of the
+**~ WuBu ~ space**. You may mark it with **~ WuBu ~** and the WaefreBeorn name,
+so the world knows it lives under the same umbrella of freedom.
+
+**How to adopt it:**
+1. Copy the LICENSE file into your repository or project root.
+2. Replace "WaefreBeorn" with your own name, OR keep "WaefreBeorn" to show
+   your work is part of the ~ WuBu ~ space.
+3. Replace the Licensor contact (waefrebeorn@waefrebeorn.org) with your own,
+   or keep it if you want the WaefreBeorn channel to receive the pennies.
+4. You keep ownership of your work. The license governs how OTHERS may use
+   YOUR work, under the same Five Freedoms and Corporate Obligations.
+
+**The Penny Clause applies to your work too** — anyone using YOUR work owes
+YOU a physical penny, not WaefreBeorn, unless you choose to direct pennies
+to the WaefreBeorn channel instead.
+
+**Attribution:** If you adopt this license, you must keep the license text
+substantially intact, including this §0 and the attribution to WaefreBeorn
+as the license's origin. You may add your own name alongside it. The ~ WuBu ~
+mark is a mark of the space, not a claim of ownership — anyone in the space
+may use it.
+
+This clause is irrevocable. WaefreBeorn may not revoke anyone's right to use
+this license for their own work.
+
+---
+
 ## 1. Definitions
 
-**1.1 Waefrebeorn Work**
-Any copyrighted work, software, data, media, model weights, documentation, research artifacts, creative works, hardware designs, configurations, scripts, or other output produced or published under the Waefrebeorn name or by any Waefrebeorn-affiliated entity (including the `waefrebeorn` GitHub user, any future organizations or team accounts, and all forks and derivatives thereof).
+**1.1 WaefreBeorn Work**
+Any copyrighted work, software, data, media, model weights, documentation, research artifacts, creative works, hardware designs, configurations, scripts, or other output produced or published under the WaefreBeorn name or by any WaefreBeorn-affiliated entity (including the `waefrebeorn` GitHub user, any future organizations or team accounts, and all forks and derivatives thereof).
 
 **1.2 The Populace**
 Individuals, sole proprietors, partnerships, non-profits, educational institutions, government entities (local, regional, national, international), and any entity with fewer than 100 total individuals (employees + independent contractors) AND annual gross revenue below $1,000,000 USD over any preceding 12 months. The Populace is free.
@@ -63,13 +106,13 @@ Any legal entity that has no significant business operations, no substantive emp
 Any government entity at any level — local, municipal, regional, national, supranational — including public administrations, public agencies, public institutions, public schools, universities, public hospitals, and public research organizations.
 
 **1.8 Derivative Works**
-Any modification, fine-tune, merge, combination, compressed/quantized variant, adapter, LoRA weight, merged model, distilled version, fork, translation, port, adaptation, or new work based on or incorporating Waefrebeorn Work.
+Any modification, fine-tune, merge, combination, compressed/quantized variant, adapter, LoRA weight, merged model, distilled version, fork, translation, port, adaptation, or new work based on or incorporating WaefreBeorn Work.
 
 **1.9 MaaS (Model as a Service)**
-Providing third-party access to Waefrebeorn Work (or derivatives) where the third party exercises meaningful control over inputs, parameters, fine-tuning data, deployment configuration, or output usage.
+Providing third-party access to WaefreBeorn Work (or derivatives) where the third party exercises meaningful control over inputs, parameters, fine-tuning data, deployment configuration, or output usage.
 
 **1.10 Prohibited Activities**
-Uses of Waefrebeorn Work that are explicitly non-allowable, including:
+Uses of WaefreBeorn Work that are explicitly non-allowable, including:
 - (a) Real-time mass surveillance systems
 - (b) Censorship, propaganda, or information control tools
 - (c) Autonomous weapons systems or lethal autonomous decision-making
@@ -80,33 +123,33 @@ Uses of Waefrebeorn Work that are explicitly non-allowable, including:
 - (h) Use in violation of the license itself (i.e., malicious compliance)
 
 **1.11 Dispensation**
-The Licensor's explicit statement that it does not bear responsibility for uses of Waefrebeorn Work that fall outside the Licensor's control. Dispensation is not a license revocation — it is a refusal of moral association. End users bear full responsibility for their use of Waefrebeorn Work.
+The Licensor's explicit statement that it does not bear responsibility for uses of WaefreBeorn Work that fall outside the Licensor's control. Dispensation is not a license revocation — it is a refusal of moral association. End users bear full responsibility for their use of WaefreBeorn Work.
 
 ---
 
 ## 2. The Five Freedoms (Populace Freedom)
 
 ### Freedom 0: Use
-The Populace may use Waefrebeorn Work for any purpose — personal, educational, commercial, governmental, non-profit, internal, embedded, research, or otherwise — without restriction and without asking permission. This includes use by governments, government contractors, non-profits, educational institutions, and public research organizations.
+The Populace may use WaefreBeorn Work for any purpose — personal, educational, commercial, governmental, non-profit, internal, embedded, research, or otherwise — without restriction and without asking permission. This includes use by governments, government contractors, non-profits, educational institutions, and public research organizations.
 
 ### Freedom 1: Modify
-The Populace may modify Waefrebeorn Work, including adapting it for specific government workflows, translating it for non-English-speaking populations, integrating it into public sector IT systems, and creating derivatives for any lawful purpose.
+The Populace may modify WaefreBeorn Work, including adapting it for specific government workflows, translating it for non-English-speaking populations, integrating it into public sector IT systems, and creating derivatives for any lawful purpose.
 
 ### Freedom 2: Distribute
-The Populace may distribute copies of Waefrebeorn Work (and Populace modifications) in source or binary form, across any medium — GitHub, GitLab, npm, PyPI, Hugging Face, Docker Hub, physical media, print, broadcast, web, or any other channel — without restriction.
+The Populace may distribute copies of WaefreBeorn Work (and Populace modifications) in source or binary form, across any medium — GitHub, GitLab, npm, PyPI, Hugging Face, Docker Hub, physical media, print, broadcast, web, or any other channel — without restriction.
 
 ### Freedom 3: Sell
-The Populace may sell copies of Waefrebeorn Work (including physical copies, digital downloads, SaaS access, model hosting, or any service built on Waefrebeorn Work) and retain all revenue. No royalty, fee, or share is owed to the Licensor.
+The Populace may sell copies of WaefreBeorn Work (including physical copies, digital downloads, SaaS access, model hosting, or any service built on WaefreBeorn Work) and retain all revenue. No royalty, fee, or share is owed to the Licensor.
 
 ### Freedom 4: Integrate
-The Populace may integrate Waefrebeorn Work into any system, platform, product, or service — including government procurement systems, public-sector digital infrastructure, educational platforms, non-profit operations, and small business workflows — without additional licensing requirements.
+The Populace may integrate WaefreBeorn Work into any system, platform, product, or service — including government procurement systems, public-sector digital infrastructure, educational platforms, non-profit operations, and small business workflows — without additional licensing requirements.
 
 ---
 
 ## 3. Applicability and Scope
 
 ### 3.1 All Projects, All Media, All Repos
-This license applies to ALL Waefrebeorn Work. This includes but is not limited to:
+This license applies to ALL WaefreBeorn Work. This includes but is not limited to:
 - All repos under the `waefrebeorn` GitHub user/organization AND any future accounts or sub-organizations
 - All forks, branches, and derived repositories
 - All media: images, audio, video, fonts, clipart, data files, datasets, models
@@ -117,15 +160,15 @@ This license applies to ALL Waefrebeorn Work. This includes but is not limited t
 - All sub-projects, sub-repos, and mono-repo subdirectories
 
 ### 3.2 Automatic Cover
-This license applies automatically to any work published under the Waefrebeorn name. No additional action is required. New projects inherit this license by default. No project is excluded.
+This license applies automatically to any work published under the WaefreBeorn name. No additional action is required. New projects inherit this license by default. No project is excluded.
 
 ### 3.3 Government Integration
 This license is explicitly designed to facilitate government adoption and integration:
-- (a) Governments may use Waefrebeorn Work in public-sector IT systems without procurement friction
-- (b) Governments may modify and redistribute Waefrebeorn Work for their specific needs under Freedom 1–4
-- (c) The EU Interoperable Europe Act (Regulation 2024/903) and the European Commission Open Source Software Strategy both promote FOSS adoption in public administration; Waefrebeorn Work is pre-licensed for this purpose
+- (a) Governments may use WaefreBeorn Work in public-sector IT systems without procurement friction
+- (b) Governments may modify and redistribute WaefreBeorn Work for their specific needs under Freedom 1–4
+- (c) The EU Interoperable Europe Act (Regulation 2024/903) and the European Commission Open Source Software Strategy both promote FOSS adoption in public administration; WaefreBeorn Work is pre-licensed for this purpose
 - (d) The EUPL (European Union Public Licence) and Open Digital Europe strategy are compatible with this license's freedoms
-- (e) Government contractors may use Waefrebeorn Work in projects funded by government contracts, subject to contract terms that are compatible with this license
+- (e) Government contractors may use WaefreBeorn Work in projects funded by government contracts, subject to contract terms that are compatible with this license
 
 Note: Governments are explicitly covered as Populace entities. No government is a Mega Corporation under any reasonable definition, and government procurement contracts do not aggregate revenue for the purposes of the Corporate Obligations below.
 
@@ -134,10 +177,10 @@ Note: Governments are explicitly covered as Populace entities. No government is 
 ## 4. The Corporate Obligations
 
 ### Obligation A: Attribution
-Any Corporation using Waefrebeorn Work in a commercial product or service must include prominent attribution to the Waefrebeorn project and this license in a publicly accessible location.
+Any Corporation using WaefreBeorn Work in a commercial product or service must include prominent attribution to the WaefreBeorn project and this license in a publicly accessible location.
 
 ### Obligation B: Fair Commercial Terms for MaaS
-Any Corporation operating a MaaS business using Waefrebeorn Work, with aggregate revenue (all sources, all affiliates) exceeding $20,000,000 USD over any consecutive 12 months, must enter into a commercial agreement with the Licensor before using the Waefrebeorn Work for such MaaS purposes.
+Any Corporation operating a MaaS business using WaefreBeorn Work, with aggregate revenue (all sources, all affiliates) exceeding $20,000,000 USD over any consecutive 12 months, must enter into a commercial agreement with the Licensor before using the WaefreBeorn Work for such MaaS purposes.
 
 ### Obligation C: Copyleft at Scale
 Any Corporation distributing a Derivative commercially with more than 100 FTE OR annual gross revenue above $1,000,000 USD must make the Derivative available under this same license, with full source, weights, training code, and documentation accessible from a public server. 128-day transition period after crossing the threshold.
@@ -164,12 +207,12 @@ Licensees must ensure that any entity designated as an "Affiliate" for revenue a
 This license terminates immediately for any Licensee acting in bad faith, including:
 - (a) Misrepresenting size or revenue to stay under thresholds
 - (b) Deliberately obfuscating corporate structure or affiliate relationships
-- (c) Using the Waefrebeorn Work as part of a fraud scheme against third parties
-- (d) Using Waefrebeorn Work to create a false appearance of trustworthiness for fraudulent operations
+- (c) Using the WaefreBeorn Work as part of a fraud scheme against third parties
+- (d) Using WaefreBeorn Work to create a false appearance of trustworthiness for fraudulent operations
 - (e) Any use in connection with money laundering, sanctions evasion, or terrorist financing
 
 ### 5.4 Dispensation Clause (Creator Non-Responsibility)
-The Licensor explicitly disclaims responsibility for the use of Waefrebeorn Work by third parties. The Licensor is a software creator, not a moral authority over how end users apply the tools. The Licensor does not control downstream deployment, integration, or use. This dispensation covers:
+The Licensor explicitly disclaims responsibility for the use of WaefreBeorn Work by third parties. The Licensor is a software creator, not a moral authority over how end users apply the tools. The Licensor does not control downstream deployment, integration, or use. This dispensation covers:
 - Use of models generating harmful, biased, or inaccurate outputs
 - Use of software in ways the Licensor did not intend or anticipate
 - Use of works in jurisdictions or contexts where local laws differ from the Licensor's values
@@ -182,25 +225,25 @@ The Dispensation is NOT a license grant — it is a statement that the Licensor 
 ## 6. Prohibited Activities and Non-Association Clause
 
 ### 6.1 Non-Association from Malicious Use
-Waefrebeorn disassociates itself from any use of Waefrebeorn Work in connection with:
+WaefreBeorn disassociates itself from any use of WaefreBeorn Work in connection with:
 - (a) Surveillance systems targeting individuals without their consent or legal authority
 - (b) Censorship, propaganda, or information manipulation
 - (c) Autonomous weapons or lethal autonomous systems
 - (d) Systematic discrimination or persecution based on protected characteristics
 - (e) Fraud, identity theft, or financial scams
-- (f) Any activity that violates applicable law where Waefrebeorn Work is used
+- (f) Any activity that violates applicable law where WaefreBeorn Work is used
 
 ### 6.2 No Moral Authority Claim
-Waefrebeorn does not claim moral authority over how Waefrebeorn Work is used by downstream recipients. The license grants freedoms; it does not restrict them (except for the Corporate Obligations and the Prohibited Activities listed in §1.10). The Licensor's values are stated in the Preamble and §6.1, but enforcement of those values is the responsibility of the end user and the legal system, not the Licensor.
+WaefreBeorn does not claim moral authority over how WaefreBeorn Work is used by downstream recipients. The license grants freedoms; it does not restrict them (except for the Corporate Obligations and the Prohibited Activities listed in §1.10). The Licensor's values are stated in the Preamble and §6.1, but enforcement of those values is the responsibility of the end user and the legal system, not the Licensor.
 
 ### 6.3 End-User Responsibility
-End users of Waefrebeorn Work bear full responsibility for:
+End users of WaefreBeorn Work bear full responsibility for:
 - Ensuring their use complies with all applicable laws
 - Ensuring their use does not harm third parties
 - Ensuring their models and outputs are subject to appropriate guardrails
 - Ensuring their deployment respects privacy, security, and human rights
 
-The Licensor provides no warranties, express or implied, regarding the safety, accuracy, fairness, or legality of Waefrebeorn Work or its outputs.
+The Licensor provides no warranties, express or implied, regarding the safety, accuracy, fairness, or legality of WaefreBeorn Work or its outputs.
 
 ---
 
@@ -208,26 +251,26 @@ The Licensor provides no warranties, express or implied, regarding the safety, a
 
 ### 7.1 Explicit Government Permission
 Section 2 (Five Freedoms) explicitly grants governments full freedom to:
-- Use, modify, and distribute Waefrebeorn Work for any public-sector purpose
-- Deploy Waefrebeorn models in government AI systems
-- Integrate Waefrebeorn software into public digital infrastructure
+- Use, modify, and distribute WaefreBeorn Work for any public-sector purpose
+- Deploy WaefreBeorn models in government AI systems
+- Integrate WaefreBeorn software into public digital infrastructure
 - Publish modifications made by government entities back to the public domain
-- Use Waefrebeorn Work in government procurement, no additional licensing fees
+- Use WaefreBeorn Work in government procurement, no additional licensing fees
 
 ### 7.2 Interoperable Europe Act Compliant
 This license is designed to be compatible with the Interoperable Europe Act (Regulation 2024/903) which mandates:
 - FOSS adoption in public sector digital services
 - Interoperability assessments for IT systems
 - Cross-border sharing of reusable software components
-Waefrebeorn Work can be used in all these contexts without restriction.
+WaefreBeorn Work can be used in all these contexts without restriction.
 
 ### 7.3 Education and Research
-- Non-profit educational institutions may use Waefrebeorn Work for teaching, research, and curricular purposes without any obligation
-- Public research organizations may publish results derived from Waefrebeorn Work without restriction
+- Non-profit educational institutions may use WaefreBeorn Work for teaching, research, and curricular purposes without any obligation
+- Public research organizations may publish results derived from WaefreBeorn Work without restriction
 - Academic use is explicitly covered as Populace Freedom
 
 ### 7.4 Non-Profit and NGO Use
-- Non-profit organizations may use Waefrebeorn Work for any charitable, advocacy, community, or social-purpose activity
+- Non-profit organizations may use WaefreBeorn Work for any charitable, advocacy, community, or social-purpose activity
 - NGOs operating below the Populace thresholds are fully covered by the Populace exemption
 - No revenue threshold limitation applies to non-profit status
 
@@ -240,7 +283,7 @@ Waefrebeorn Work can be used in all these contexts without restriction.
 
 ## 8. Patent and IP Protection
 
-The Licensor grants a patent license for any patent claims the Licensor can license that are necessarily infringed by the use, reproduction, and distribution of Waefrebeorn Work as permitted by this license. If a Licensee brings patent claims against Waefrebeorn Work or its users alleging infringement, all rights under this license terminate immediately (defensive patent termination, modeled on Apache 2.0 §3 and EPL 2.0).
+The Licensor grants a patent license for any patent claims the Licensor can license that are necessarily infringed by the use, reproduction, and distribution of WaefreBeorn Work as permitted by this license. If a Licensee brings patent claims against WaefreBeorn Work or its users alleging infringement, all rights under this license terminate immediately (defensive patent termination, modeled on Apache 2.0 §3 and EPL 2.0).
 
 ---
 
@@ -261,7 +304,7 @@ This dispensation explicitly covers the Licensor's refusal to be responsible for
 
 ## 10. Governance and Versioning
 
-This license may be updated over time through a publicly documented governance process. Future versions (v3.1, v4.0, etc.) may be published. Users may continue to use Waefrebeorn Work under their original version or upgrade to any newer version published by the Licensor.
+This license may be updated over time through a publicly documented governance process. Future versions (v3.1, v4.0, etc.) may be published. Users may continue to use WaefreBeorn Work under their original version or upgrade to any newer version published by the Licensor.
 
 The governance model is designed to be transparent and community-informed. Proposed changes to this license are published publicly and allow for community comment before adoption.
 
@@ -273,10 +316,10 @@ Drawing from the academic research paper "Modifying OSS Licenses" (Gagnon, Benja
 
 ### 11.1 Modification Provisions
 - The Licensor may modify this license to add new restrictions or clarify existing ones through a publicly documented governance process
-- Modifications apply only to NEW distributions of Waefrebeorn Work — existing distributions and their derivatives continue under the version under which they were received
+- Modifications apply only to NEW distributions of WaefreBeorn Work — existing distributions and their derivatives continue under the version under which they were received
 
 ### 11.2 Revocation Reserve
-- In extreme cases (e.g., Waefrebeorn Work being used in a way that causes demonstrable, widespread, irreversible harm that the Licensor did not anticipate), the Licensor reserves the right to issue a modification that restricts or revokes permissions for specific use cases
+- In extreme cases (e.g., WaefreBeorn Work being used in a way that causes demonstrable, widespread, irreversible harm that the Licensor did not anticipate), the Licensor reserves the right to issue a modification that restricts or revokes permissions for specific use cases
 - Such modifications must be made in good faith, applied uniformly, and include a sufficient remediation period (minimum 12 months)
 
 ### 11.3 Qualification
@@ -286,14 +329,14 @@ Drawing from the academic research paper "Modifying OSS Licenses" (Gagnon, Benja
 - Revocation or restriction must be a last resort, not a routine tool
 
 ### 11.4 Purpose
-These provisions exist because: (a) AI models can cause harm that contributors cannot predict at release time; (b) the legal environment around AI is evolving rapidly; (c) open source AI contributors need the ability to respond to emergent harms while maintaining the trust of the community. This provision is modeled on the "modifiable license" framework proposed by Gagnon et al. (2024) and adapted for the Waefrebeorn use case.
+These provisions exist because: (a) AI models can cause harm that contributors cannot predict at release time; (b) the legal environment around AI is evolving rapidly; (c) open source AI contributors need the ability to respond to emergent harms while maintaining the trust of the community. This provision is modeled on the "modifiable license" framework proposed by Gagnon et al. (2024) and adapted for the WaefreBeorn use case.
 
 ---
 
 ## 12. Dispensation Summary
 
 This license was built to satisfy three core requirements — and it is **agnostic**
-across all of them, covering every medium Waefrebeorn produces:
+across all of them, covering every medium WaefreBeorn produces:
 
 1. **More freedoms for the general population** — addressed in §2 (Five Freedoms)
    and §3.1–3.3. Governments, non-profits, educational institutions, and small
@@ -303,23 +346,23 @@ across all of them, covering every medium Waefrebeorn produces:
    (Government and Public Sector Integration Features). The EU Interoperable
    Europe Act, European Commission Open Source Strategy, and all public-sector
    FOSS frameworks are compatible. **Governments may use, modify, and deploy
-   Waefrebeorn Work — all forms, all media — without restriction.**
+   WaefreBeorn Work — all forms, all media — without restriction.**
 3. **Disassociate from malicious compliance and non-moral users** — addressed in
    §5 (Anti-Shell-Company), §6 (Prohibited Activities and Non-Association), and
    §5.4 (Dispensation Clause). The license explicitly disclaims downstream
    responsibility for uses the Licensor cannot control. **The non-association
-   clause applies to all Waefrebeorn output — we do not endorse misuse of our
+   clause applies to all WaefreBeorn output — we do not endorse misuse of our
    code, models, videos, art, or any other creation, in any medium.**
 
 This is NOT a "model-as-a-service" license. MaaS (§4 Obligation B) is merely one
 of four corporate obligations. The license itself is a **universal umbrella**
-for all Waefrebeorn creative and technical output.
+for all WaefreBeorn creative and technical output.
 
 ---
 
 ## 13. Provenance
 
-This is v3.0 of the Waefrebeorn Umbrella License, rebuilt from the v2.0 full text developed in the Waefrebeorn licensing sessions (Kevin Bacon research pass, July 2026). The dispensation clause (§5.4) is the formal mechanism for disassociating from malicious users while retaining freedom for the general population. The modifiable license reserve (§11) provides a research-backed mechanism for the Licensor to respond to emergent harms without undermining the license's core freedoms.
+This is v3.0 of the WaefreBeorn Umbrella License, rebuilt from the v2.0 full text developed in the WaefreBeorn licensing sessions (Kevin Bacon research pass, July 2026). The dispensation clause (§5.4) is the formal mechanism for disassociating from malicious users while retaining freedom for the general population. The modifiable license reserve (§11) provides a research-backed mechanism for the Licensor to respond to emergent harms without undermining the license's core freedoms.
 
 For the complete license text and community standards:
 https://github.com/waefrebeorn/waefrebeorn-umbrella-license
@@ -335,9 +378,9 @@ This license is not OSI-approved and not FSF-approved. It is a custom source-ava
 
 This is the **Penny Clause**. It is whimsical but real.
 
-**The Core Rule:** Every time you use Waefrebeorn Work in any project, product,
+**The Core Rule:** Every time you use WaefreBeorn Work in any project, product,
 service, or deployment — and every time you redistribute it or create a derivative —
-you must send the Licensor, Waefrebeorn, a single **physical** United States penny
+you must send the Licensor, WaefreBeorn, a single **physical** United States penny
 (or local currency equivalent) by **physical mail**. One penny per use, per derivative,
 per redistribution. **No digital pennies. No electronic transfers. No cryptocurrency.
 No QR codes. No NFTs. No blockchain. No virtual points. Only physical metal.**
@@ -352,20 +395,20 @@ excess pennies as a single digital payment instead. **But the base obligation is
 physical pennies.** You must send at least one actual penny first. The exception only
 applies when the physical volume is genuinely impossible to ship.
 
-**Why:** Waefrebeorn does not trust digital compliance. This license is read by
+**Why:** WaefreBeorn does not trust digital compliance. This license is read by
 nobody. This clause creates a real, physical cost to not reading the license —
 because if you haven't read this far, you haven't read the license, and you
-shouldn't be using Waefrebeorn Work without knowing what the hell you're doing.
+shouldn't be using WaefreBeorn Work without knowing what the hell you're doing.
 
 Think of it like the M&M's trick at a concert: the band asks everyone to throw
 M&M's in the air, and anyone who has M&M's is someone who actually listened to
 the instructions. A sea of M&M's proves the crowd was paying attention.
 
-A pile of pennies on Waefrebeorn's desk proves you read the license.
+A pile of pennies on WaefreBeorn's desk proves you read the license.
 
 **The Address:**
 ```
-Waefrebeorn
+WaefreBeorn
 P.O. Box [TBD]
 [City], [State] [ZIP]
 United States
@@ -377,10 +420,10 @@ coin of approximately one cent value in your country (UK penny, Euro cent, etc.)
 The key requirement is **physical metal** — not digital representations.
 
 Write your name, project, and date on the penny with a permanent marker.
-Or don't — Waefrebeorn collects them and doesn't read what's written on them.
+Or don't — WaefreBeorn collects them and doesn't read what's written on them.
 They just like the weight and feel of real coins in their hands.
 
-**Scale — The Squeeze:** Waefrebeorn likes pennies. Not because they're worth much,
+**Scale — The Squeeze:** WaefreBeorn likes pennies. Not because they're worth much,
 but because they're everywhere and nobody cares about them, and yet they're
 real metal you can hold. Over a lifetime, a hundred millionth of a cent
 per person per use adds up to a mountain of pennies. That's the point.
@@ -389,9 +432,9 @@ per person per use adds up to a mountain of pennies. That's the point.
 penny**. But if you are Populace — an individual, a student, a hobbyist, a non-profit,
 a small business below the $1M revenue threshold — you may send **as many physical
 pennies as you want**. A letter filled with pennies. A small box filled with pennies.
-A mason jar full of pennies. Waefrebeorn doesn't care about the quantity or form —
+A mason jar full of pennies. WaefreBeorn doesn't care about the quantity or form —
 just the physical gesture. You are encouraged to give more. This is not a tax.
-It is a gift. You like giving Waefrebeorn pennies, and Waefrebeorn likes
+It is a gift. You like giving WaefreBeorn pennies, and WaefreBeorn likes
 receiving them. No obligation beyond the one penny. The extra pennies are love.
 
 **Squeeze the Rich:** For Mega-corporations (§1.3) and large commercial entities
@@ -402,8 +445,8 @@ that cross the MaaS revenue threshold (§4, Obligation B), the obligation is:
   (due to weight restrictions), the Shipping Weight Exception in the core rule
   above applies — excess may be sent as a single digital payment.
   But each use must start with real physical pennies in the mail first.
-- **But also:** Waefrebeorn encourages them to squeeze their own employees,
-  shareholders, and customers for pennies. "Did you read the Waefrebeorn license?
+- **But also:** WaefreBeorn encourages them to squeeze their own employees,
+  shareholders, and customers for pennies. "Did you read the WaefreBeorn license?
   Toss a penny in the jar." Make it viral. Make it annoying. Make it a meme.
   Corporations should feel the weight of every penny they owe.
 
@@ -416,13 +459,13 @@ that cross the MaaS revenue threshold (§4, Obligation B), the obligation is:
   note: "here" — but you must mail the actual penny too
 
 **Penalty for Non-Compliance:** If you don't send a penny, you haven't read
-the license, and therefore you don't know what's in it. By using Waefrebeorn
+the license, and therefore you don't know what's in it. By using WaefreBeorn
 Work without reading the license, you are in violation of the license's terms.
-Waefrebeorn may, at its sole discretion and whim, publicly shame you on social
+WaefreBeorn may, at its sole discretion and whim, publicly shame you on social
 media for not sending a penny. This is a proportionate and just punishment.
 
 **No Other Effect:** This clause has no legal effect beyond being a whimsical
 proof-of-read mechanism. It does not modify, amend, or override any other
-provision of this license. It is here because Waefrebeorn likes pennies and
+provision of this license. It is here because WaefreBeorn likes pennies and
 wants to know you read the license. If you're reading this, grab a penny and
-put it in an envelope. Do it now. Waefrebeorn is watching.
+put it in an envelope. Do it now. WaefreBeorn is watching.
